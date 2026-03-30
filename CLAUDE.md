@@ -1,7 +1,7 @@
 # Claude Discord Bot
 
-Discord bot using Claude Code as an MCP Channel plugin.
-Claude Code runs as the main process; our code is an MCP server bridging Discord.
+Multi-platform chat bot (Discord + Slack) using Claude Code as MCP Channel plugins.
+Claude Code runs as the main process; our code is MCP servers bridging each platform.
 Uses Claude Max subscription auth — no API key needed.
 
 ## Quick Start
@@ -31,14 +31,16 @@ npx tsc --noEmit       # type-check only
 
 ```
 src/
-  wrapper.ts            — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
-  mcp-server.ts         — MCP Channel server: Discord client, channel notifications, tool handlers
-  ipc.ts                — Unix domain socket IPC protocol between wrapper and MCP server
-  config.ts             — Env-based configuration, compact prompt, allowed tools list, system prompt loader
-  logger.ts             — Structured, chalk-colored console logger
-  message-router.ts     — Classifies messages as commands (/compact, /clear, /new, …) or chat
-  messages.ts           — Customisable bot messages with JSON file overrides (data/messages.json)
-  attachment-handler.ts — Downloads Discord attachments to data/attachments/, builds prompt prefix
+  wrapper.ts                — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
+  mcp-server.ts             — MCP Channel server: Discord client, channel notifications, tool handlers
+  slack-mcp-server.ts       — MCP Channel server: Slack client (Socket Mode + Web API), channel notifications, tool handlers
+  ipc.ts                    — Unix domain socket IPC protocol between wrapper and MCP servers
+  config.ts                 — Env-based configuration, compact prompt, allowed tools list, system prompt loader
+  logger.ts                 — Structured, chalk-colored console logger
+  message-router.ts         — Classifies messages as commands (/compact, /clear, /new, …) or chat
+  messages.ts               — Customisable bot messages with JSON file overrides (data/messages.json)
+  attachment-handler.ts     — Downloads Discord attachments to data/attachments/, builds prompt prefix
+  slack-attachment-handler.ts — Downloads Slack attachments (Bearer auth) to data/attachments/, builds prompt prefix
 
   # Legacy (subprocess-per-message mode)
   index.ts              — Legacy entrypoint
@@ -56,23 +58,41 @@ tests/
 
 ```
 wrapper.ts (npm start)
-  ├─ IPC socket server (data/wrapper.sock)
+  ├─ IPC socket server (data/wrapper.sock) — multi-client
   ├─ Claude Code spawned via node-pty (interactive mode)
-  │   └─ MCP server (spawned by Claude Code as subprocess)
-  │       ├─ Discord.js client (Gateway connection)
+  │   ├─ Discord MCP server (conditional: DISCORD_BOT_TOKEN)
+  │   │   ├─ Discord.js client (Gateway connection)
+  │   │   ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
+  │   │   ├─ Command routing: /new, /clear, /compact, /model, /cwd, /help
+  │   │   └─ Channel notifications (source="discord")
+  │   └─ Slack MCP server (conditional: SLACK_BOT_TOKEN)
+  │       ├─ Slack Socket Mode client (WebSocket connection)
+  │       ├─ Slack Web API client (chat, reactions, files, etc.)
   │       ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
   │       ├─ Command routing: /new, /clear, /compact, /model, /cwd, /help
-  │       └─ Channel notifications (chat messages → Claude)
+  │       └─ Channel notifications (source="slack")
   └─ Restart on IPC signal (kill + respawn Claude Code) or PTY command forwarding
 ```
 
-- **MCP Channel**: Discord messages arrive as `<channel source="discord" ...>` tags in Claude's context
+- **Multi-platform**: Discord and Slack run as separate MCP Channel plugins, conditionally enabled by token presence
+- **Shared session**: Both platforms share the same Claude Code context — `/new` from either side restarts everything
+- **MCP Channel**: Messages arrive as `<channel source="discord" ...>` or `<channel source="slack" ...>` tags
 - **Tools**: Claude responds via MCP tool calls (reply, react, edit_message, etc.)
 - **Hard restart**: `/new` kills and respawns Claude Code (fresh session)
 - **PTY commands**: `/compact`, `/clear` forwarded to CLI via PTY write (no restart, MCP connection preserved)
 - **Model/CWD change**: `/model`, `/cwd` trigger restart with new settings
-- **IPC**: Wrapper ↔ MCP server communicate via Unix domain socket (JSON-line protocol)
+- **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
+
+### Platform Differences
+
+| Aspect | Discord | Slack |
+|--------|---------|-------|
+| Message limit | 2000 chars | 4000 chars |
+| Threading | message reference (reply_to) | thread_ts |
+| Attachments | Public CDN | url_private + Bearer auth |
+| Emoji | Unicode or `<:name:id>` | Name only (no colons) |
+| Markdown | `**bold**` | `*bold*` (mrkdwn) |
 
 ## Commands
 
@@ -85,6 +105,22 @@ wrapper.ts (npm start)
 | `/cwd <path>` | Change working directory | Restart with new CWD |
 | `/help` | Show commands | Direct Discord reply |
 
+## Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DISCORD_BOT_TOKEN` | One of Discord/Slack | Discord bot token |
+| `SLACK_BOT_TOKEN` | One of Discord/Slack | Slack Bot OAuth Token (`xoxb-...`) |
+| `SLACK_APP_TOKEN` | With SLACK_BOT_TOKEN | Slack App-Level Token (`xapp-...`, Socket Mode) |
+| `ALLOWED_CHANNEL_IDS` | No | Comma-separated Discord channel IDs |
+| `SLACK_ALLOWED_CHANNEL_IDS` | No | Comma-separated Slack channel IDs |
+| `DEFAULT_MODEL` | No | Claude model (default: claude-sonnet-4-6) |
+| `DEFAULT_CWD` | No | Working directory (default: cwd) |
+| `MAX_TURNS` | No | Max turns per session (default: 50) |
+| `FETCH_MESSAGE_LIMIT` | No | Default message fetch count (default: 20) |
+| `CLAUDE_PATH` | No | Path to Claude CLI (default: ~/.local/bin/claude) |
+| `VERBOSE` | No | Enable verbose logging (default: false) |
+
 ## Key Conventions
 
 - ESM (`"type": "module"` in package.json), `.js` extensions in imports
@@ -92,3 +128,4 @@ wrapper.ts (npm start)
 - Environment variables loaded via `dotenv/config` in `config.ts` (wrapper) and via MCP config env (MCP server)
 - All user-facing strings in Korean
 - MCP server logs to stderr (stdout reserved for MCP protocol)
+- At least one platform token (Discord or Slack) must be configured

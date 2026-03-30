@@ -23,6 +23,10 @@ export interface Config {
   fetchMessageLimit: number;
   allowedChannelIds: string[];
 
+  slackBotToken: string;
+  slackAppToken: string;
+  slackAllowedChannelIds: string[];
+
   systemPromptPath: string;
 }
 
@@ -55,9 +59,9 @@ function expandTilde(path: string): string {
   return path;
 }
 
-export const config: Config = Object.freeze({
+const _config: Config = {
   verbose: optionalEnv("VERBOSE", "false") === "true",
-  discordBotToken: requireEnv("DISCORD_BOT_TOKEN"),
+  discordBotToken: optionalEnv("DISCORD_BOT_TOKEN", ""),
   claudePath: expandTilde(optionalEnv("CLAUDE_PATH", "~/.local/bin/claude")),
   defaultModel: optionalEnv("DEFAULT_MODEL", "claude-sonnet-4-6"),
   defaultCwd: expandTilde(optionalEnv("DEFAULT_CWD", process.cwd())),
@@ -68,8 +72,23 @@ export const config: Config = Object.freeze({
     .map((s) => s.trim())
     .filter(Boolean),
 
+  slackBotToken: optionalEnv("SLACK_BOT_TOKEN", ""),
+  slackAppToken: optionalEnv("SLACK_APP_TOKEN", ""),
+  slackAllowedChannelIds: optionalEnv("SLACK_ALLOWED_CHANNEL_IDS", "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+
   systemPromptPath: optionalEnv("SYSTEM_PROMPT_PATH", "data/system-prompt.txt"),
-});
+};
+
+if (!_config.discordBotToken && !_config.slackBotToken) {
+  throw new Error(
+    "At least one platform token is required: DISCORD_BOT_TOKEN or SLACK_BOT_TOKEN",
+  );
+}
+
+export const config: Config = Object.freeze(_config);
 
 /**
  * Load system prompt from the configured file path.

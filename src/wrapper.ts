@@ -2,8 +2,9 @@
  * Wrapper: manages Claude Code lifecycle with node-pty.
  *
  * Spawns Claude Code in interactive mode with a pseudo-terminal,
- * registers the MCP channel plugin, and handles restart signals
- * from the MCP server for /new, /clear, /compact, /model, /cwd.
+ * registers MCP channel plugins (Discord and/or Slack, based on
+ * configured tokens), and handles restart signals from any MCP
+ * server for /new, /clear, /compact, /model, /cwd.
  *
  * Exports:
  *   None (side-effect: starts wrapper process).
@@ -51,7 +52,7 @@ const state: WrapperState = {
 };
 
 let claudeProcess: pty.IPty | null = null;
-let mcpClient: JsonLineSocket | null = null;
+const mcpClients = new Set<JsonLineSocket>();
 let restarting = false;
 
 // ── MCP config generation ─────────────────────────────────────────────
@@ -59,34 +60,53 @@ let restarting = false;
 function generateMcpConfig(): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
-  const mcpConfig = {
-    mcpServers: {
-      "discord-bot": {
-        command: "node",
-        args: [join(process.cwd(), "dist", "mcp-server.js")],
-        env: {
-          DISCORD_BOT_TOKEN: config.discordBotToken,
-          WRAPPER_SOCKET: SOCKET_PATH,
-          ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
-          FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
-          VERBOSE: String(config.verbose),
-        },
-      },
-    },
-  };
+  const mcpServers: Record<string, unknown> = {};
 
-  writeFileSync(MCP_CONFIG_PATH, JSON.stringify(mcpConfig, null, 2));
+  if (config.discordBotToken) {
+    mcpServers["discord-bot"] = {
+      command: "node",
+      args: [join(process.cwd(), "dist", "mcp-server.js")],
+      env: {
+        DISCORD_BOT_TOKEN: config.discordBotToken,
+        WRAPPER_SOCKET: SOCKET_PATH,
+        ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
+        FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
+        VERBOSE: String(config.verbose),
+      },
+    };
+  }
+
+  if (config.slackBotToken) {
+    mcpServers["slack-bot"] = {
+      command: "node",
+      args: [join(process.cwd(), "dist", "slack-mcp-server.js")],
+      env: {
+        SLACK_BOT_TOKEN: config.slackBotToken,
+        SLACK_APP_TOKEN: config.slackAppToken,
+        WRAPPER_SOCKET: SOCKET_PATH,
+        SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
+        FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
+        VERBOSE: String(config.verbose),
+      },
+    };
+  }
+
+  writeFileSync(MCP_CONFIG_PATH, JSON.stringify({ mcpServers }, null, 2));
 }
 
 // ── Claude Code lifecycle ─────────────────────────────────────────────
 
 function buildArgs(): string[] {
+  const channels: string[] = [];
+  if (config.discordBotToken) channels.push("server:discord-bot");
+  if (config.slackBotToken) channels.push("server:slack-bot");
+
   const args = [
     "--dangerously-skip-permissions",
     "--mcp-config",
     MCP_CONFIG_PATH,
     "--dangerously-load-development-channels",
-    "server:discord-bot",
+    ...channels,
     "--model",
     state.model,
   ];
@@ -206,7 +226,7 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   );
 
   await killClaude();
-  mcpClient = null;
+  mcpClients.clear();
 
   // Brief pause for cleanup
   await new Promise((r) => setTimeout(r, 1000));
@@ -225,7 +245,7 @@ function writeToPty(text: string): void {
   claudeProcess.write(text);
 }
 
-function handleIpcMessage(msg: McpToWrapper): void {
+function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
   switch (msg.type) {
     case "restart":
       log.debug(`Restart requested: ${msg.reason}`);
@@ -251,7 +271,7 @@ function handleIpcMessage(msg: McpToWrapper): void {
       break;
     case "ready":
       log.debug("MCP server connected");
-      mcpClient?.send({
+      sender.send({
         type: "config",
         model: state.model,
         cwd: state.cwd,
@@ -263,13 +283,13 @@ function handleIpcMessage(msg: McpToWrapper): void {
 // ── IPC server ────────────────────────────────────────────────────────
 
 createIpcServer(SOCKET_PATH, (client) => {
-  mcpClient = client;
-  client.on("message", (msg: McpToWrapper) => handleIpcMessage(msg));
+  mcpClients.add(client);
+  client.on("message", (msg: McpToWrapper) => handleIpcMessage(msg, client));
   client.on("close", () => {
-    mcpClient = null;
+    mcpClients.delete(client);
   });
   client.on("error", () => {
-    mcpClient = null;
+    mcpClients.delete(client);
   });
 });
 
