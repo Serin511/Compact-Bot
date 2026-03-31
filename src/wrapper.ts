@@ -13,7 +13,6 @@
  *   >>> npx tsx src/wrapper.ts
  */
 
-import "dotenv/config";
 import pty from "node-pty";
 import xtermHeadless from "@xterm/headless";
 const { Terminal } = xtermHeadless;
@@ -27,6 +26,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, loadSystemPrompt } from "./config.js";
 import { log, setVerbose } from "./logger.js";
+import { DATA_DIR } from "./paths.js";
 import {
   createIpcServer,
   type McpToWrapper,
@@ -43,7 +43,6 @@ const __dirname = dirname(__filename);
 /** dist/ directory inside the installed package */
 const DIST_DIR = __dirname.endsWith("src") ? join(__dirname, "..", "dist") : __dirname;
 
-const DATA_DIR = join(process.cwd(), "data");
 const SOCKET_PATH = join(DATA_DIR, "wrapper.sock");
 const MCP_CONFIG_PATH = join(DATA_DIR, "mcp-config.json");
 

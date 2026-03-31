@@ -20,10 +20,11 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { msg } from "./messages.js";
+import { DATA_DIR } from "./paths.js";
 
-const ATTACHMENTS_DIR = resolve(process.cwd(), "data", "attachments");
+const ATTACHMENTS_DIR = join(DATA_DIR, "attachments");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
 
 export interface AttachmentResult {

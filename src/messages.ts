@@ -15,10 +15,8 @@
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+import { join } from "node:path";
+import { CONFIG_HOME } from "./paths.js";
 
 const DEFAULTS: Record<string, string> = {
   processing: "⏳ 처리 중...",
@@ -60,13 +58,20 @@ const DEFAULTS: Record<string, string> = {
 };
 
 function loadCustomMessages(): Record<string, string> {
-  const filePath = resolve(__dirname, "..", "data", "messages.json");
-  if (!existsSync(filePath)) return {};
-  try {
-    return JSON.parse(readFileSync(filePath, "utf-8"));
-  } catch {
-    return {};
+  // Check CONFIG_HOME first, then CWD for backwards compatibility
+  for (const candidate of [
+    join(CONFIG_HOME, "messages.json"),
+    join(process.cwd(), "data", "messages.json"),
+  ]) {
+    if (existsSync(candidate)) {
+      try {
+        return JSON.parse(readFileSync(candidate, "utf-8"));
+      } catch {
+        continue;
+      }
+    }
   }
+  return {};
 }
 
 const custom = loadCustomMessages();

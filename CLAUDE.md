@@ -9,7 +9,8 @@ Published as `@serin511/compact-bot` on npm. CLI binary: `compact-bot`.
 ## Quick Start
 
 ```bash
-npx @serin511/compact-bot     # run via npx (reads .env from cwd)
+npx @serin511/compact-bot init  # interactive setup → ~/.config/compact-bot/.env
+npx @serin511/compact-bot       # run from anywhere (CWD .env overrides global)
 npm install
 npm run build      # compile TypeScript
 npm run dev        # development (tsx → wrapper.ts)
@@ -34,7 +35,9 @@ npx tsc --noEmit       # type-check only
 
 ```
 src/
-  cli.ts                    — CLI entry point (shebang, delegates to wrapper)
+  cli.ts                    — CLI entry point (shebang, routes init/start subcommands)
+  init.ts                   — Interactive setup: generates .env in ~/.config/compact-bot/
+  paths.ts                  — Shared XDG path constants (CONFIG_HOME, DATA_DIR)
   wrapper.ts                — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
   mcp-server.ts             — MCP Channel server: Discord client, channel notifications, tool handlers
   slack-mcp-server.ts       — MCP Channel server: Slack client (Socket Mode + Web API), channel notifications, tool handlers
@@ -131,7 +134,9 @@ wrapper.ts (npm start)
 
 - ESM (`"type": "module"` in package.json), `.js` extensions in imports
 - TypeScript strict mode, target ES2022, module Node16
-- Environment variables loaded via `dotenv/config` in `config.ts` (wrapper) and via MCP config env (MCP server)
+- Config stored in `~/.config/compact-bot/` (XDG): `.env`, `messages.json`, `system-prompt.txt`
+- Runtime data in `~/.config/compact-bot/data/`: sockets, MCP config, attachments
+- Env loading order: CWD `.env` (higher priority) → `~/.config/compact-bot/.env` (fills missing vars)
 - All user-facing strings in Korean
 - MCP server logs to stderr (stdout reserved for MCP protocol)
 - At least one platform token (Discord or Slack) must be configured

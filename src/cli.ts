@@ -2,7 +2,19 @@
 /**
  * CLI entry point for npx / global install.
  *
- * Simply delegates to the wrapper module which manages the
- * Claude Code lifecycle.
+ * Routes subcommands:
+ *   (no args)  — start the bot (delegates to wrapper)
+ *   init       — interactive .env setup
+ *
+ * Exports:
+ *   None (side-effect: runs CLI).
  */
-import "./wrapper.js";
+
+const command = process.argv[2];
+
+if (command === "init") {
+  const { runInit } = await import("./init.js");
+  await runInit();
+} else {
+  await import("./wrapper.js");
+}

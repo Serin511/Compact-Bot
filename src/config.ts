@@ -9,9 +9,14 @@
  *   >>> console.log(config.defaultModel);
  */
 
-import "dotenv/config";
+import dotenv from "dotenv";
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
+import { CONFIG_HOME } from "./paths.js";
+
+// CWD .env first (higher priority), then global .env (fills missing vars)
+dotenv.config();
+dotenv.config({ path: join(CONFIG_HOME, ".env") });
 
 export interface Config {
   verbose: boolean;
@@ -79,7 +84,12 @@ const _config: Config = {
     .map((s) => s.trim())
     .filter(Boolean),
 
-  systemPromptPath: optionalEnv("SYSTEM_PROMPT_PATH", "data/system-prompt.txt"),
+  systemPromptPath: optionalEnv(
+    "SYSTEM_PROMPT_PATH",
+    existsSync(join(CONFIG_HOME, "system-prompt.txt"))
+      ? join(CONFIG_HOME, "system-prompt.txt")
+      : "data/system-prompt.txt",
+  ),
 };
 
 if (!_config.discordBotToken && !_config.slackBotToken) {

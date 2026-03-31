@@ -67,10 +67,8 @@ The wrapper can restart Claude Code on command (`/new`, `/model`), forward CLI c
 ### Via npx (recommended)
 
 ```bash
-# Create a project directory with your .env file
-mkdir my-bot && cd my-bot
-cp .env.example .env   # edit with your tokens
-npx @serin511/compact-bot
+npx @serin511/compact-bot init   # interactive setup → ~/.config/compact-bot/.env
+npx @serin511/compact-bot        # run from anywhere
 ```
 
 ### From source
