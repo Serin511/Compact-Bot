@@ -15,6 +15,8 @@
 
 import "dotenv/config";
 import pty from "node-pty";
+import xtermHeadless from "@xterm/headless";
+const { Terminal } = xtermHeadless;
 import {
   existsSync,
   mkdirSync,
@@ -51,9 +53,35 @@ const state: WrapperState = {
   cwd: config.defaultCwd,
 };
 
+const PTY_COLS = 200;
+const PTY_ROWS = 50;
+
 let claudeProcess: pty.IPty | null = null;
 const mcpClients = new Set<JsonLineSocket>();
 let restarting = false;
+
+// ── virtual terminal (screen buffer) ─────────────────────────────────
+
+let vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS });
+
+/**
+ * Capture current screen content from the virtual terminal.
+ *
+ * Reads the active buffer and returns non-empty lines as plain text.
+ */
+function captureScreen(): string {
+  const buf = vterm.buffer.active;
+  const lines: string[] = [];
+  for (let i = 0; i < buf.length; i++) {
+    const line = buf.getLine(i);
+    if (line) lines.push(line.translateToString(true));
+  }
+  // Trim trailing empty lines
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
+    lines.pop();
+  }
+  return lines.join("\n");
+}
 
 // ── MCP config generation ─────────────────────────────────────────────
 
@@ -158,13 +186,16 @@ function spawnClaude(): void {
 
   claudeProcess = pty.spawn(config.claudePath, args, {
     name: "xterm-256color",
-    cols: 200,
-    rows: 50,
+    cols: PTY_COLS,
+    rows: PTY_ROWS,
     cwd: state.cwd,
     env: process.env as Record<string, string>,
   });
 
   claudeProcess.onData((data) => {
+    // Feed raw data to virtual terminal for accurate screen capture
+    vterm.write(data);
+
     const clean = ptyToText(data);
 
     // Auto-confirm development channels prompt
@@ -228,6 +259,10 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   await killClaude();
   mcpClients.clear();
 
+  // Reset virtual terminal for fresh session
+  vterm.dispose();
+  vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS });
+
   // Brief pause for cleanup
   await new Promise((r) => setTimeout(r, 1000));
 
@@ -269,6 +304,12 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
       log.debug(`CWD change: ${msg.cwd}`);
       restart({ cwd: msg.cwd });
       break;
+    case "capture": {
+      const screen = captureScreen();
+      log.debug(`Screen capture requested (${screen.length} chars)`);
+      sender.send({ type: "capture_result", text: screen } satisfies WrapperToMcp);
+      break;
+    }
     case "ready":
       log.debug("MCP server connected");
       sender.send({

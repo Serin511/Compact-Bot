@@ -48,6 +48,31 @@ let currentModel = "";
 let currentCwd = "";
 let botUserId = "";
 
+/**
+ * Request a screen capture from the wrapper via IPC.
+ *
+ * Returns:
+ *   The captured screen text, or null on timeout / no connection.
+ */
+function requestCapture(): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (!ipc) {
+      resolve(null);
+      return;
+    }
+    const timeout = setTimeout(() => resolve(null), 5000);
+    const handler = (msg: WrapperToMcp) => {
+      if (msg.type === "capture_result") {
+        clearTimeout(timeout);
+        ipc?.removeListener("message", handler);
+        resolve(msg.text);
+      }
+    };
+    ipc.on("message", handler);
+    ipc.send({ type: "capture" } satisfies McpToWrapper);
+  });
+}
+
 function isAllowed(channelId: string): boolean {
   if (ALLOWED_CHANNEL_IDS.length === 0) return true;
   return ALLOWED_CHANNEL_IDS.includes(channelId);
@@ -399,6 +424,24 @@ async function handleSlackMessage(event: {
       }
       await replyText(msg("cwdChanged", { path: route.args }));
       ipc?.send({ type: "cwd", cwd: route.args } satisfies McpToWrapper);
+      return;
+    }
+
+    case "capture": {
+      await replyText(msg("captureRequested"));
+      const screen = await requestCapture();
+      if (!screen) {
+        await replyText(msg("captureEmpty"));
+        return;
+      }
+      const chunks = splitMessage(`\`\`\`\n${screen}\n\`\`\``);
+      for (const chunk of chunks) {
+        await web.chat.postMessage({
+          channel: event.channel,
+          text: chunk,
+          ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+        });
+      }
       return;
     }
 

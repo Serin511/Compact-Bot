@@ -40,10 +40,15 @@ const DEFAULTS: Record<string, string> = {
     "`/compact [힌트]` — 컨텍스트 압축",
     "`/model <name>` — 모델 변경 (sonnet, opus, haiku)",
     "`/cwd <path>` — 작업 디렉토리 변경",
+    "`/capture` — CLI 화면 캡처",
     "`/help` — 이 도움말",
     "",
     "그 외 메시지는 Claude에게 전달됩니다.",
   ].join("\n"),
+
+  // Capture
+  captureRequested: "📸 CLI 화면 캡처 중...",
+  captureEmpty: "⚠️ 캡처할 화면이 없습니다.",
 
   // Attachment messages
   attachmentTooLarge:

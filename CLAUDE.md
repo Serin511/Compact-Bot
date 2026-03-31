@@ -63,13 +63,13 @@ wrapper.ts (npm start)
   │   ├─ Discord MCP server (conditional: DISCORD_BOT_TOKEN)
   │   │   ├─ Discord.js client (Gateway connection)
   │   │   ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
-  │   │   ├─ Command routing: /new, /clear, /compact, /model, /cwd, /help
+  │   │   ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /help
   │   │   └─ Channel notifications (source="discord")
   │   └─ Slack MCP server (conditional: SLACK_BOT_TOKEN)
   │       ├─ Slack Socket Mode client (WebSocket connection)
   │       ├─ Slack Web API client (chat, reactions, files, etc.)
   │       ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
-  │       ├─ Command routing: /new, /clear, /compact, /model, /cwd, /help
+  │       ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /help
   │       └─ Channel notifications (source="slack")
   └─ Restart on IPC signal (kill + respawn Claude Code) or PTY command forwarding
 ```
@@ -81,6 +81,7 @@ wrapper.ts (npm start)
 - **Hard restart**: `/new` kills and respawns Claude Code (fresh session)
 - **PTY commands**: `/compact`, `/clear` forwarded to CLI via PTY write (no restart, MCP connection preserved)
 - **Model/CWD change**: `/model`, `/cwd` trigger restart with new settings
+- **Screen capture**: `/capture` sends IPC request to wrapper → `@xterm/headless` virtual terminal reads PTY buffer → text returned as code block
 - **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
 
@@ -103,6 +104,7 @@ wrapper.ts (npm start)
 | `/compact [hint]` | Compress context | CLI `/compact` via PTY |
 | `/model <name>` | Change model | Restart with new `--model` flag |
 | `/cwd <path>` | Change working directory | Restart with new CWD |
+| `/capture` | Capture CLI screen | IPC request → code block reply |
 | `/help` | Show commands | Direct Discord reply |
 
 ## Environment Variables

@@ -72,6 +72,10 @@ describe("routeMessage", () => {
     });
   });
 
+  it("routes /capture", () => {
+    expect(routeMessage("/capture")).toEqual({ type: "capture" });
+  });
+
   it("does not match partial command names", () => {
     expect(routeMessage("/compacting")).toEqual({
       type: "message",

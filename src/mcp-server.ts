@@ -45,6 +45,31 @@ let ipc: JsonLineSocket | null = null;
 let currentModel = "";
 let currentCwd = "";
 
+/**
+ * Request a screen capture from the wrapper via IPC.
+ *
+ * Returns:
+ *   The captured screen text, or null on timeout / no connection.
+ */
+function requestCapture(): Promise<string | null> {
+  return new Promise((resolve) => {
+    if (!ipc) {
+      resolve(null);
+      return;
+    }
+    const timeout = setTimeout(() => resolve(null), 5000);
+    const handler = (msg: WrapperToMcp) => {
+      if (msg.type === "capture_result") {
+        clearTimeout(timeout);
+        ipc?.removeListener("message", handler);
+        resolve(msg.text);
+      }
+    };
+    ipc.on("message", handler);
+    ipc.send({ type: "capture" } satisfies McpToWrapper);
+  });
+}
+
 function isAllowed(channelId: string): boolean {
   if (ALLOWED_CHANNEL_IDS.length === 0) return true;
   return ALLOWED_CHANNEL_IDS.includes(channelId);
@@ -339,6 +364,20 @@ async function handleDiscordMessage(message: Message): Promise<void> {
       }
       await message.reply(msg("cwdChanged", { path: route.args }));
       ipc?.send({ type: "cwd", cwd: route.args } satisfies McpToWrapper);
+      return;
+    }
+
+    case "capture": {
+      await message.reply(msg("captureRequested"));
+      const screen = await requestCapture();
+      if (!screen) {
+        await message.reply(msg("captureEmpty"));
+        return;
+      }
+      const chunks = splitMessage(`\`\`\`ansi\n${screen}\n\`\`\``);
+      for (const chunk of chunks) {
+        await (message.channel as TextChannel).send(chunk);
+      }
       return;
     }
 
