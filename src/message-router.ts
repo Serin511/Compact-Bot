@@ -1,5 +1,5 @@
 /**
- * Command classification and routing for incoming Discord messages.
+ * Command classification and routing for incoming chat messages.
  *
  * Exports:
  *   routeMessage, RouteResult, RouteType.
@@ -12,13 +12,10 @@
 export type RouteType =
   | "compact"
   | "clear"
-  | "cost"
-  | "status"
   | "model"
   | "cwd"
   | "help"
   | "new"
-  | "resume"
   | "capture"
   | "message";
 
@@ -30,13 +27,10 @@ export interface RouteResult {
 const COMMAND_MAP: Record<string, RouteType> = {
   "/compact": "compact",
   "/clear": "clear",
-  "/cost": "cost",
-  "/status": "status",
   "/model": "model",
   "/cwd": "cwd",
   "/help": "help",
   "/new": "new",
-  "/resume": "resume",
   "/capture": "capture",
 };
 

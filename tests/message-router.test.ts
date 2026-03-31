@@ -24,14 +24,6 @@ describe("routeMessage", () => {
     expect(routeMessage("/clear")).toEqual({ type: "clear" });
   });
 
-  it("routes /cost", () => {
-    expect(routeMessage("/cost")).toEqual({ type: "cost" });
-  });
-
-  it("routes /status", () => {
-    expect(routeMessage("/status")).toEqual({ type: "status" });
-  });
-
   it("routes /model with arg", () => {
     expect(routeMessage("/model sonnet")).toEqual({
       type: "model",

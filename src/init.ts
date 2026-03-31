@@ -1,16 +1,17 @@
 /**
  * Interactive init command that generates a .env file.
  *
- * Prompts the user for platform tokens and optional settings,
- * then writes a .env file to ~/.config/compact-bot/.
+ * Prompts the user for platform tokens, optional settings, and
+ * custom file paths (messages.json, system-prompt.txt). Copies
+ * custom files into ~/.config/compact-bot/ and writes a .env file.
  *
  * Exports:
  *   runInit — execute the interactive setup flow.
  */
 
 import { createInterface } from "node:readline/promises";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { CONFIG_HOME } from "./paths.js";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -27,7 +28,11 @@ async function askSecret(question: string): Promise<string> {
 }
 
 /**
- * Run the interactive init flow and write .env to CONFIG_HOME.
+ * Run the interactive init flow.
+ *
+ * Prompts for platform tokens, optional settings, and custom file paths.
+ * Copies custom files (messages.json, system-prompt.txt) into CONFIG_HOME
+ * and writes the generated .env file.
  */
 export async function runInit(): Promise<void> {
   const envPath = join(CONFIG_HOME, ".env");
@@ -73,9 +78,17 @@ export async function runInit(): Promise<void> {
   console.log("  \x1b[36m[선택 설정]\x1b[0m Enter를 누르면 기본값이 사용됩니다.");
   console.log();
 
-  const model = await ask("기본 모델", "claude-sonnet-4-6");
-  const cwd = await ask("작업 디렉토리", "~/");
+  const model = await ask("기본 모델 (비우면 CLI 기본값)", "");
+  const cwd = await ask("작업 디렉토리 (비우면 현재 폴더)", "");
   const maxTurns = await ask("최대 턴 수 (0=무제한)", "50");
+  const skipPerms = await ask("--dangerously-skip-permissions 사용? (y/N)", "N");
+
+  console.log();
+  console.log("  \x1b[36m[커스텀 파일]\x1b[0m 경로를 입력하면 설정 폴더로 복사합니다.");
+  console.log();
+
+  const messagesPath = await ask("messages.json 경로 (없으면 Enter)", "");
+  const systemPromptPath = await ask("system-prompt.txt 경로 (없으면 Enter)", "");
 
   let allowedChannelIds = "";
   if (discordToken) {
@@ -89,9 +102,26 @@ export async function runInit(): Promise<void> {
 
   rl.close();
 
-  // ── Write .env ─────────────────────────────────────────────────────
+  // ── Copy custom files ───────────────────────────────────────────────
 
   if (!existsSync(CONFIG_HOME)) mkdirSync(CONFIG_HOME, { recursive: true });
+
+  for (const [inputPath, destName] of [
+    [messagesPath, "messages.json"],
+    [systemPromptPath, "system-prompt.txt"],
+  ] as const) {
+    if (!inputPath) continue;
+    const src = resolve(inputPath.replace(/^~/, process.env.HOME ?? ""));
+    if (!existsSync(src)) {
+      console.log(`  \x1b[33m⚠ 파일을 찾을 수 없습니다: ${src}\x1b[0m`);
+      continue;
+    }
+    const dest = join(CONFIG_HOME, destName);
+    copyFileSync(src, dest);
+    console.log(`  \x1b[32m✔\x1b[0m ${basename(src)} → ${dest}`);
+  }
+
+  // ── Write .env ─────────────────────────────────────────────────────
 
   const lines: string[] = [
     "# [플랫폼 토큰] Discord / Slack 중 최소 하나는 필수",
@@ -113,9 +143,22 @@ export async function runInit(): Promise<void> {
 
   lines.push("");
   lines.push("# Defaults");
-  lines.push(`DEFAULT_MODEL=${model}`);
-  lines.push(`DEFAULT_CWD=${cwd}`);
+  if (model) {
+    lines.push(`DEFAULT_MODEL=${model}`);
+  } else {
+    lines.push("# DEFAULT_MODEL=");
+  }
+  if (cwd) {
+    lines.push(`DEFAULT_CWD=${cwd}`);
+  } else {
+    lines.push("# DEFAULT_CWD=");
+  }
   lines.push(`MAX_TURNS=${maxTurns}`);
+  if (skipPerms.toLowerCase() === "y") {
+    lines.push("DANGEROUSLY_SKIP_PERMISSIONS=true");
+  } else {
+    lines.push("# DANGEROUSLY_SKIP_PERMISSIONS=false");
+  }
 
   if (allowedChannelIds) {
     lines.push(`ALLOWED_CHANNEL_IDS=${allowedChannelIds}`);

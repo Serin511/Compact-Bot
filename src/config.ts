@@ -2,11 +2,11 @@
  * Bot configuration loaded from environment variables.
  *
  * Exports:
- *   config — frozen configuration object with all bot settings.
+ *   config, Config, loadSystemPrompt, systemPrompt.
  *
  * Example:
  *   >>> import { config } from "./config.js";
- *   >>> console.log(config.defaultModel);
+ *   >>> console.log(config.claudePath);
  */
 
 import dotenv from "dotenv";
@@ -20,6 +20,7 @@ dotenv.config({ path: join(CONFIG_HOME, ".env") });
 
 export interface Config {
   verbose: boolean;
+  dangerouslySkipPermissions: boolean;
   discordBotToken: string;
   claudePath: string;
   defaultModel: string;
@@ -35,15 +36,6 @@ export interface Config {
   systemPromptPath: string;
 }
 
-/**
- * @deprecated Use `log.*` methods from `./logger.js` instead.
- * Kept temporarily for any transient imports.
- */
-export function debugLog(...args: unknown[]): void {
-  if (config.verbose) {
-    console.log("[DEBUG]", ...args);
-  }
-}
 
 function requireEnv(key: string): string {
   const value = process.env[key];
@@ -66,9 +58,11 @@ function expandTilde(path: string): string {
 
 const _config: Config = {
   verbose: optionalEnv("VERBOSE", "false") === "true",
+  dangerouslySkipPermissions:
+    optionalEnv("DANGEROUSLY_SKIP_PERMISSIONS", "false") === "true",
   discordBotToken: optionalEnv("DISCORD_BOT_TOKEN", ""),
   claudePath: expandTilde(optionalEnv("CLAUDE_PATH", "claude")),
-  defaultModel: optionalEnv("DEFAULT_MODEL", "claude-sonnet-4-6"),
+  defaultModel: optionalEnv("DEFAULT_MODEL", ""),
   defaultCwd: expandTilde(optionalEnv("DEFAULT_CWD", process.cwd())),
   maxTurns: Number(optionalEnv("MAX_TURNS", "50")),
   fetchMessageLimit: Number(optionalEnv("FETCH_MESSAGE_LIMIT", "20")),
@@ -117,50 +111,3 @@ export function loadSystemPrompt(): string {
 }
 
 export const systemPrompt = loadSystemPrompt();
-
-export const COMPACT_PROMPT = `You have been working on the task described above but have not yet \
-completed it. Write a continuation summary that will allow you (or \
-another instance of yourself) to resume work efficiently in a future \
-context window where the conversation history will be replaced with \
-this summary. Your summary should be structured, concise, and \
-actionable. Include:
-
-1. Task Overview
-The user's core request and success criteria
-Any clarifications or constraints they specified
-
-2. Current State
-What has been completed so far
-Files created, modified, or analyzed (with paths if relevant)
-Key outputs or artifacts produced
-
-3. Important Discoveries
-Technical constraints or requirements uncovered
-Decisions made and their rationale
-Errors encountered and how they were resolved
-What approaches were tried that didn't work (and why)
-
-4. Next Steps
-Specific actions needed to complete the task
-Any blockers or open questions to resolve
-Priority order if multiple steps remain
-
-5. Context to Preserve
-User preferences or style requirements
-Domain-specific details that aren't obvious
-Any promises made to the user
-
-Be concise but complete—err on the side of including information that \
-would prevent duplicate work or repeated mistakes. Write in a way that \
-enables immediate resumption of the task.
-
-Wrap your summary in <summary></summary> tags.`;
-
-export const DEFAULT_ALLOWED_TOOLS = [
-  "Read",
-  "Glob",
-  "Grep",
-  "Bash",
-  "Write",
-  "Edit",
-];

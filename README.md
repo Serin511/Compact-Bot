@@ -122,12 +122,13 @@ SLACK_BOT_TOKEN=xoxb-...
 SLACK_APP_TOKEN=xapp-...
 
 # Optional
-DEFAULT_MODEL=claude-sonnet-4-6       # claude-opus-4-6, claude-haiku-4-5-20251001
-DEFAULT_CWD=~/projects
+# DEFAULT_MODEL=claude-sonnet-4-6     # empty = CLI default
+# DEFAULT_CWD=~/projects              # empty = current directory
 MAX_TURNS=50                           # 0 = unlimited
 ALLOWED_CHANNEL_IDS=                   # comma-separated, empty = all
 SLACK_ALLOWED_CHANNEL_IDS=
-# CLAUDE_PATH=claude                    # defaults to "claude" from PATH
+# CLAUDE_PATH=claude                   # defaults to "claude" from PATH
+# DANGEROUSLY_SKIP_PERMISSIONS=true    # pass --dangerously-skip-permissions
 SYSTEM_PROMPT_PATH=data/system-prompt.txt
 VERBOSE=false
 ```

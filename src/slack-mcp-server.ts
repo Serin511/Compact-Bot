@@ -403,7 +403,7 @@ async function handleSlackMessage(event: {
 
     case "model": {
       if (!route.args) {
-        await replyText(msg("modelCurrent", { model: currentModel }));
+        await replyText(msg("modelCurrent", { model: currentModel || "(CLI default)" }));
         return;
       }
       const modelMap: Record<string, string> = {

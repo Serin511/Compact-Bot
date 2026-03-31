@@ -138,13 +138,14 @@ function buildArgs(): string[] {
   if (config.slackBotToken) channels.push("server:slack-bot");
 
   const args = [
-    "--dangerously-skip-permissions",
+    ...(config.dangerouslySkipPermissions
+      ? ["--dangerously-skip-permissions"]
+      : []),
     "--mcp-config",
     MCP_CONFIG_PATH,
     "--dangerously-load-development-channels",
     ...channels,
-    "--model",
-    state.model,
+    ...(state.model ? ["--model", state.model] : []),
   ];
 
   const systemPrompt = loadSystemPrompt();
@@ -247,7 +248,7 @@ function spawnClaude(): void {
     config.allowedChannelIds.length > 0
       ? config.allowedChannelIds.join(", ")
       : "all";
-  log.ready("wrapper", state.model, state.cwd, channels);
+  log.ready("wrapper", state.model || "(CLI default)", state.cwd, channels);
 
   const ptyOpts = {
     name: "xterm-256color" as const,

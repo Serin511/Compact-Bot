@@ -17,12 +17,6 @@ npm run dev        # development (tsx → wrapper.ts)
 npm start          # run compiled JS (wrapper.js)
 ```
 
-Legacy mode (subprocess-per-message, without MCP):
-```bash
-npm run dev:legacy    # tsx src/index.ts
-npm run start:legacy  # node dist/index.js
-```
-
 ## Test / Lint
 
 ```bash
@@ -36,7 +30,7 @@ npx tsc --noEmit       # type-check only
 ```
 src/
   cli.ts                    — CLI entry point (shebang, routes init/start subcommands)
-  init.ts                   — Interactive setup: generates .env in ~/.config/compact-bot/
+  init.ts                   — Interactive setup: generates .env, copies custom files to ~/.config/compact-bot/
   paths.ts                  — Shared XDG path constants (CONFIG_HOME, DATA_DIR)
   wrapper.ts                — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
   mcp-server.ts             — MCP Channel server: Discord client, channel notifications, tool handlers
@@ -48,15 +42,6 @@ src/
   messages.ts               — Customisable bot messages with JSON file overrides (data/messages.json)
   attachment-handler.ts     — Downloads Discord attachments to data/attachments/, builds prompt prefix
   slack-attachment-handler.ts — Downloads Slack attachments (Bearer auth) to data/attachments/, builds prompt prefix
-
-  # Legacy (subprocess-per-message mode)
-  index.ts              — Legacy entrypoint
-  bot.ts                — Legacy message/reaction handler
-  claude-cli.ts         — Legacy CLI subprocess spawner
-  discord-sender.ts     — Legacy message delivery
-  session-manager.ts    — Legacy session CRUD with JSON persistence
-  compact.ts            — Legacy compact implementation
-  process-tracker.ts    — Legacy cancel/retry tracking
 tests/
   *.test.ts             — Unit tests (vitest)
 ```
@@ -109,7 +94,7 @@ wrapper.ts (npm start)
 | `/new` | New session | Hard restart (no resume) |
 | `/clear` | Clear session | CLI `/clear` via PTY |
 | `/compact [hint]` | Compress context | CLI `/compact` via PTY |
-| `/model <name>` | Change model | Restart with new `--model` flag |
+| `/model <name>` | Change model (sonnet/opus/haiku or full ID) | Restart with new `--model` flag |
 | `/cwd <path>` | Change working directory | Restart with new CWD |
 | `/capture` | Capture CLI screen | IPC request → code block reply |
 | `/help` | Show commands | Direct Discord reply |
@@ -123,11 +108,12 @@ wrapper.ts (npm start)
 | `SLACK_APP_TOKEN` | With SLACK_BOT_TOKEN | Slack App-Level Token (`xapp-...`, Socket Mode) |
 | `ALLOWED_CHANNEL_IDS` | No | Comma-separated Discord channel IDs |
 | `SLACK_ALLOWED_CHANNEL_IDS` | No | Comma-separated Slack channel IDs |
-| `DEFAULT_MODEL` | No | Claude model (default: claude-sonnet-4-6) |
-| `DEFAULT_CWD` | No | Working directory (default: cwd) |
+| `DEFAULT_MODEL` | No | Claude model (default: CLI default) |
+| `DEFAULT_CWD` | No | Working directory (default: current directory) |
 | `MAX_TURNS` | No | Max turns per session (default: 50) |
 | `FETCH_MESSAGE_LIMIT` | No | Default message fetch count (default: 20) |
 | `CLAUDE_PATH` | No | Path to Claude CLI (default: `claude` from PATH) |
+| `DANGEROUSLY_SKIP_PERMISSIONS` | No | Pass `--dangerously-skip-permissions` to CLI (default: false) |
 | `VERBOSE` | No | Enable verbose logging (default: false) |
 
 ## Key Conventions

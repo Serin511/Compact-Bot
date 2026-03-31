@@ -343,7 +343,7 @@ async function handleDiscordMessage(message: Message): Promise<void> {
 
     case "model": {
       if (!route.args) {
-        await message.reply(msg("modelCurrent", { model: currentModel }));
+        await message.reply(msg("modelCurrent", { model: currentModel || "(CLI default)" }));
         return;
       }
       const modelMap: Record<string, string> = {
