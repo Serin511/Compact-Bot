@@ -24,6 +24,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { config, loadSystemPrompt } from "./config.js";
 import { log, setVerbose } from "./logger.js";
 import {
@@ -36,6 +37,11 @@ import {
 setVerbose(config.verbose);
 
 // ── paths ─────────────────────────────────────────────────────────────
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+/** dist/ directory inside the installed package */
+const DIST_DIR = __dirname.endsWith("src") ? join(__dirname, "..", "dist") : __dirname;
 
 const DATA_DIR = join(process.cwd(), "data");
 const SOCKET_PATH = join(DATA_DIR, "wrapper.sock");
@@ -93,7 +99,7 @@ function generateMcpConfig(): void {
   if (config.discordBotToken) {
     mcpServers["discord-bot"] = {
       command: "node",
-      args: [join(process.cwd(), "dist", "mcp-server.js")],
+      args: [join(DIST_DIR, "mcp-server.js")],
       env: {
         DISCORD_BOT_TOKEN: config.discordBotToken,
         WRAPPER_SOCKET: SOCKET_PATH,
@@ -107,7 +113,7 @@ function generateMcpConfig(): void {
   if (config.slackBotToken) {
     mcpServers["slack-bot"] = {
       command: "node",
-      args: [join(process.cwd(), "dist", "slack-mcp-server.js")],
+      args: [join(DIST_DIR, "slack-mcp-server.js")],
       env: {
         SLACK_BOT_TOKEN: config.slackBotToken,
         SLACK_APP_TOKEN: config.slackAppToken,

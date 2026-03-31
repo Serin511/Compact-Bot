@@ -1,17 +1,39 @@
 {
-  "name": "claude-discord-bot",
-  "version": "0.1.0",
-  "description": "Discord bot powered by Claude Code CLI subprocess",
+  "name": "@serin511/compact-bot",
+  "version": "1.0.0",
+  "description": "Multi-platform chat bot (Discord + Slack) powered by Claude Code MCP channels",
   "type": "module",
   "main": "dist/wrapper.js",
+  "bin": {
+    "compact-bot": "dist/cli.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "dist/**/*.js.map"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "start": "node dist/wrapper.js",
     "start:legacy": "node dist/index.js",
     "dev": "tsx src/wrapper.ts",
     "dev:legacy": "tsx src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest"
+  },
+  "keywords": [
+    "claude",
+    "discord",
+    "slack",
+    "chatbot",
+    "mcp",
+    "claude-code"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Serin511/Claude-Discord-Bot.git"
   },
   "engines": {
     "node": ">=20"

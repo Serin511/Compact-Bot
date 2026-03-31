@@ -1,12 +1,15 @@
-# Claude Discord Bot
+# Compact Bot (`@serin511/compact-bot`)
 
 Multi-platform chat bot (Discord + Slack) using Claude Code as MCP Channel plugins.
 Claude Code runs as the main process; our code is MCP servers bridging each platform.
 Uses Claude Max subscription auth — no API key needed.
 
+Published as `@serin511/compact-bot` on npm. CLI binary: `compact-bot`.
+
 ## Quick Start
 
 ```bash
+npx @serin511/compact-bot     # run via npx (reads .env from cwd)
 npm install
 npm run build      # compile TypeScript
 npm run dev        # development (tsx → wrapper.ts)
@@ -31,6 +34,7 @@ npx tsc --noEmit       # type-check only
 
 ```
 src/
+  cli.ts                    — CLI entry point (shebang, delegates to wrapper)
   wrapper.ts                — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
   mcp-server.ts             — MCP Channel server: Discord client, channel notifications, tool handlers
   slack-mcp-server.ts       — MCP Channel server: Slack client (Socket Mode + Web API), channel notifications, tool handlers

@@ -45,7 +45,8 @@ describe("downloadSlackAttachments", () => {
   it("skips files exceeding size limit", async () => {
     const file = makeFile({ size: 11 * 1024 * 1024 });
     const result = await downloadSlackAttachments([file], "1234567890.123456", "xoxb-test");
-    expect(result.promptPrefix).toContain("크기 제한");
+    expect(result.promptPrefix).toContain("test.txt");
+    expect(result.promptPrefix).toMatch(/10\s*MB|크기 제한/);
     expect(result.paths).toEqual([]);
   });
 
@@ -55,7 +56,8 @@ describe("downloadSlackAttachments", () => {
       url_private_download: undefined,
     });
     const result = await downloadSlackAttachments([file], "1234567890.123456", "xoxb-test");
-    expect(result.promptPrefix).toContain("URL 없음");
+    expect(result.promptPrefix).toContain("test.txt");
+    expect(result.promptPrefix).toMatch(/URL/i);
     expect(result.paths).toEqual([]);
   });
 
