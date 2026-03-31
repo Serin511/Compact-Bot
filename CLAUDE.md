@@ -127,7 +127,7 @@ wrapper.ts (npm start)
 | `DEFAULT_CWD` | No | Working directory (default: cwd) |
 | `MAX_TURNS` | No | Max turns per session (default: 50) |
 | `FETCH_MESSAGE_LIMIT` | No | Default message fetch count (default: 20) |
-| `CLAUDE_PATH` | No | Path to Claude CLI (default: ~/.local/bin/claude) |
+| `CLAUDE_PATH` | No | Path to Claude CLI (default: `claude` from PATH) |
 | `VERBOSE` | No | Enable verbose logging (default: false) |
 
 ## Key Conventions

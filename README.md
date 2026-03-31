@@ -127,7 +127,7 @@ DEFAULT_CWD=~/projects
 MAX_TURNS=50                           # 0 = unlimited
 ALLOWED_CHANNEL_IDS=                   # comma-separated, empty = all
 SLACK_ALLOWED_CHANNEL_IDS=
-CLAUDE_PATH=~/.local/bin/claude
+# CLAUDE_PATH=claude                    # defaults to "claude" from PATH
 SYSTEM_PROMPT_PATH=data/system-prompt.txt
 VERBOSE=false
 ```

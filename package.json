@@ -1,6 +1,6 @@
 {
   "name": "@serin511/compact-bot",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Multi-platform chat bot (Discord + Slack) powered by Claude Code MCP channels",
   "type": "module",
   "main": "dist/wrapper.js",
@@ -13,7 +13,7 @@
     "dist/**/*.js.map"
   ],
   "scripts": {
-    "build": "tsc && chmod +x dist/cli.js",
+    "build": "tsc",
     "prepublishOnly": "npm run build",
     "start": "node dist/wrapper.js",
     "start:legacy": "node dist/index.js",

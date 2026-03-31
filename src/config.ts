@@ -67,7 +67,7 @@ function expandTilde(path: string): string {
 const _config: Config = {
   verbose: optionalEnv("VERBOSE", "false") === "true",
   discordBotToken: optionalEnv("DISCORD_BOT_TOKEN", ""),
-  claudePath: expandTilde(optionalEnv("CLAUDE_PATH", "~/.local/bin/claude")),
+  claudePath: expandTilde(optionalEnv("CLAUDE_PATH", "claude")),
   defaultModel: optionalEnv("DEFAULT_MODEL", "claude-sonnet-4-6"),
   defaultCwd: expandTilde(optionalEnv("DEFAULT_CWD", process.cwd())),
   maxTurns: Number(optionalEnv("MAX_TURNS", "50")),
