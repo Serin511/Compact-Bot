@@ -183,49 +183,59 @@ function ptyToText(data: string): string {
   );
 }
 
-function validateExecutable(resolved: string): void {
-  if (!existsSync(resolved)) {
-    log.error(`Claude CLI not found at resolved path: ${resolved}`, new Error("not found"));
-    console.error(
-      `\n  Claude CLI를 찾을 수 없습니다: ${resolved}\n` +
-      `  설치: https://docs.anthropic.com/en/docs/claude-code\n` +
-      `  또는 CLAUDE_PATH 환경변수에 전체 경로를 설정하세요.\n`,
-    );
-    process.exit(1);
-  }
+/**
+ * Escape a string for safe inclusion in a shell command.
+ *
+ * Wraps the value in single quotes, escaping embedded single quotes.
+ * Safe characters are passed through unquoted for readability.
+ */
+function shellEscape(arg: string): string {
+  if (!/[^a-zA-Z0-9_\-./=:,@]/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Validate that a file exists and is executable.
+ *
+ * Returns true if the file is a valid executable, false otherwise.
+ */
+function isExecutable(resolved: string): boolean {
+  if (!existsSync(resolved)) return false;
   try {
     accessSync(resolved, fsConstants.X_OK);
+    return true;
   } catch {
-    log.error(`Claude CLI is not executable: ${resolved}`, new Error("permission denied"));
-    console.error(
-      `\n  Claude CLI에 실행 권한이 없습니다: ${resolved}\n` +
-      `  실행 권한 부여: chmod +x ${resolved}\n`,
-    );
-    process.exit(1);
+    return false;
   }
 }
 
-function resolveClaudePath(): string {
+/**
+ * Try to resolve the Claude CLI to an absolute executable path.
+ *
+ * Returns the resolved path if found and executable, null otherwise.
+ * Does NOT exit the process — callers should fall back to shell-based
+ * spawning when this returns null.
+ */
+function resolveClaudePath(): string | null {
   const p = config.claudePath;
+
+  // Explicit path (contains separator) — validate directly
   if (p.includes("/") || p.includes("\\")) {
-    validateExecutable(p);
-    return p;
+    if (isExecutable(p)) return p;
+    log.debug(`Explicit path not executable: ${p}`);
+    return null;
   }
+
+  // Command name — try to resolve via `which`
   try {
     const resolved = execSync(`which ${p}`, { encoding: "utf-8" }).trim();
-    if (!resolved) throw new Error("empty path");
-    validateExecutable(resolved);
-    return resolved;
-  } catch (err) {
-    if (err instanceof Error && err.message === "permission denied") throw err;
-    log.error(`Claude CLI not found in PATH: ${p}`, new Error("not found"));
-    console.error(
-      `\n  Claude CLI를 찾을 수 없습니다: "${p}"\n` +
-      `  설치: https://docs.anthropic.com/en/docs/claude-code\n` +
-      `  또는 CLAUDE_PATH 환경변수에 전체 경로를 설정하세요.\n`,
-    );
-    process.exit(1);
-  }
+    if (resolved && resolved.startsWith("/") && isExecutable(resolved)) {
+      return resolved;
+    }
+  } catch { /* which failed — fall through */ }
+
+  log.debug(`Could not resolve "${p}" to executable path, will try shell spawn`);
+  return null;
 }
 
 const resolvedClaudePath = resolveClaudePath();
@@ -239,27 +249,45 @@ function spawnClaude(): void {
       : "all";
   log.ready("wrapper", state.model, state.cwd, channels);
 
+  const ptyOpts = {
+    name: "xterm-256color" as const,
+    cols: PTY_COLS,
+    rows: PTY_ROWS,
+    cwd: state.cwd,
+    env: process.env as Record<string, string>,
+  };
+
+  // Strategy 1: Spawn via user's shell (handles aliases, scripts, PATH)
+  const shell = process.env.SHELL || "/bin/bash";
+  const cmdLine = [config.claudePath, ...args].map(shellEscape).join(" ");
   try {
-    claudeProcess = pty.spawn(resolvedClaudePath, args, {
-      name: "xterm-256color",
-      cols: PTY_COLS,
-      rows: PTY_ROWS,
-      cwd: state.cwd,
-      env: process.env as Record<string, string>,
-    });
-  } catch (err) {
-    log.error(`Failed to spawn Claude CLI: ${resolvedClaudePath}`, err);
-    console.error(
-      `\n  Claude CLI 실행에 실패했습니다.\n` +
-      `  경로: ${resolvedClaudePath}\n` +
-      `  인수: ${args.join(" ")}\n` +
-      `  CWD:  ${state.cwd}\n\n` +
-      `  가능한 원인:\n` +
-      `  - claude CLI가 올바르게 설치되지 않았을 수 있습니다\n` +
-      `  - Node.js ${process.version}과 node-pty 호환성 문제일 수 있습니다\n` +
-      `  - CLAUDE_PATH 환경변수로 정확한 경로를 지정해보세요\n`,
-    );
-    process.exit(1);
+    claudeProcess = pty.spawn(shell, ["-ic", cmdLine], ptyOpts);
+    log.debug(`Spawned Claude via ${shell}`);
+  } catch (shellErr) {
+    // Strategy 2: Direct spawn with resolved path
+    if (resolvedClaudePath) {
+      try {
+        claudeProcess = pty.spawn(resolvedClaudePath, args, ptyOpts);
+        log.debug(`Spawned Claude directly: ${resolvedClaudePath}`);
+      } catch (directErr) {
+        log.error(`Failed to spawn Claude CLI`, directErr);
+      }
+    }
+    if (!claudeProcess) {
+      const displayPath = resolvedClaudePath || config.claudePath;
+      log.error(`Failed to spawn Claude CLI: ${displayPath}`, shellErr);
+      console.error(
+        `\n  Claude CLI 실행에 실패했습니다.\n` +
+        `  경로: ${displayPath}\n` +
+        `  인수: ${args.join(" ")}\n` +
+        `  CWD:  ${state.cwd}\n\n` +
+        `  가능한 원인:\n` +
+        `  - claude CLI가 올바르게 설치되지 않았을 수 있습니다\n` +
+        `  - shell alias 설정을 확인하세요 (SHELL=${shell})\n` +
+        `  - CLAUDE_PATH 환경변수로 정확한 경로를 지정해보세요\n`,
+      );
+      process.exit(1);
+    }
   }
 
   claudeProcess.onData((data) => {
