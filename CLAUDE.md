@@ -2,7 +2,7 @@
 
 Multi-platform chat bot (Discord + Slack) using Claude Code as MCP Channel plugins.
 Claude Code runs as the main process; our code is MCP servers bridging each platform.
-Uses Claude Max subscription auth — no API key needed.
+Uses Claude Pro or Max subscription auth (Max recommended for higher usage limits) — no API key needed.
 
 Published as `@serin511/compact-bot` on npm. CLI binary: `compact-bot`.
 
