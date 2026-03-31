@@ -27,6 +27,7 @@ import {
 } from "./ipc.js";
 import { routeMessage } from "./message-router.js";
 import { downloadAttachments } from "./attachment-handler.js";
+import { msg } from "./messages.js";
 
 // ── env (injected by wrapper via mcp-config.json) ─────────────────────
 
@@ -298,17 +299,17 @@ async function handleDiscordMessage(message: Message): Promise<void> {
 
   switch (route.type) {
     case "new":
-      await message.reply("✅ 새 세션을 시작합니다. 재시작 중...");
+      await message.reply(msg("newSession"));
       ipc?.send({ type: "restart", reason: "new" } satisfies McpToWrapper);
       return;
 
     case "clear":
-      await message.reply("✅ 세션 초기화 완료.");
+      await message.reply(msg("clearSession"));
       ipc?.send({ type: "clear" } satisfies McpToWrapper);
       return;
 
     case "compact":
-      await message.reply("🔄 컨텍스트 압축 중...");
+      await message.reply(msg("compacting"));
       ipc?.send({
         type: "compact",
         ...(route.args ? { hint: route.args } : {}),
@@ -317,7 +318,7 @@ async function handleDiscordMessage(message: Message): Promise<void> {
 
     case "model": {
       if (!route.args) {
-        await message.reply(`현재 모델: \`${currentModel}\``);
+        await message.reply(msg("modelCurrent", { model: currentModel }));
         return;
       }
       const modelMap: Record<string, string> = {
@@ -326,38 +327,23 @@ async function handleDiscordMessage(message: Message): Promise<void> {
         haiku: "claude-haiku-4-5-20251001",
       };
       const resolved = modelMap[route.args] ?? route.args;
-      await message.reply(`✅ 모델 변경: \`${resolved}\`. 재시작 중...`);
+      await message.reply(msg("modelChanged", { model: resolved }));
       ipc?.send({ type: "model", model: resolved } satisfies McpToWrapper);
       return;
     }
 
     case "cwd": {
       if (!route.args) {
-        await message.reply(`현재 작업 디렉토리: \`${currentCwd}\``);
+        await message.reply(msg("cwdCurrent", { cwd: currentCwd }));
         return;
       }
-      await message.reply(
-        `✅ 작업 디렉토리 변경: \`${route.args}\`. 재시작 중...`,
-      );
+      await message.reply(msg("cwdChanged", { path: route.args }));
       ipc?.send({ type: "cwd", cwd: route.args } satisfies McpToWrapper);
       return;
     }
 
     case "help":
-      await message.reply(
-        [
-          "📖 **사용 가능한 명령어**",
-          "",
-          "`/new` — 새 세션 시작",
-          "`/clear` — 세션 초기화",
-          "`/compact [힌트]` — 컨텍스트 압축",
-          "`/model <name>` — 모델 변경 (sonnet, opus, haiku)",
-          "`/cwd <path>` — 작업 디렉토리 변경",
-          "`/help` — 이 도움말",
-          "",
-          "그 외 메시지는 Claude에게 전달됩니다.",
-        ].join("\n"),
-      );
+      await message.reply(msg("help"));
       return;
 
     default: {

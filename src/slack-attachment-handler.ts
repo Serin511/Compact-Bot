@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { msg } from "./messages.js";
 
 const ATTACHMENTS_DIR = resolve(process.cwd(), "data", "attachments");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -71,14 +72,17 @@ export async function downloadSlackAttachments(
 
     if (file.size > MAX_FILE_SIZE) {
       lines.push(
-        `[첨부파일 "${name}" 은 ${Math.round(file.size / 1024 / 1024)}MB로 크기 제한(10MB)을 초과하여 건너뜀]`,
+        msg("attachmentTooLarge", {
+          name,
+          size: String(Math.round(file.size / 1024 / 1024)),
+        }),
       );
       continue;
     }
 
     const downloadUrl = file.url_private_download ?? file.url_private;
     if (!downloadUrl) {
-      lines.push(`[첨부파일 "${name}" 다운로드 URL 없음]`);
+      lines.push(msg("attachmentNoUrl", { name }));
       continue;
     }
 
@@ -89,7 +93,7 @@ export async function downloadSlackAttachments(
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) {
-        lines.push(`[첨부파일 "${name}" 다운로드 실패]`);
+        lines.push(msg("attachmentFailed", { name }));
         continue;
       }
       const buffer = Buffer.from(await res.arrayBuffer());
@@ -98,12 +102,12 @@ export async function downloadSlackAttachments(
 
       const isImage = file.mimetype?.startsWith("image/") ?? false;
       if (isImage) {
-        lines.push(`[첨부 이미지: ${filePath}]`);
+        lines.push(msg("attachmentImage", { path: filePath }));
       } else {
-        lines.push(`[첨부 파일: ${filePath}]`);
+        lines.push(msg("attachmentFile", { path: filePath }));
       }
     } catch {
-      lines.push(`[첨부파일 "${name}" 다운로드 실패]`);
+      lines.push(msg("attachmentFailed", { name }));
     }
   }
 

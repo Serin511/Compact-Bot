@@ -21,6 +21,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { msg } from "./messages.js";
 
 const ATTACHMENTS_DIR = resolve(process.cwd(), "data", "attachments");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -57,7 +58,10 @@ export async function downloadAttachments(
   for (const attachment of message.attachments.values()) {
     if (attachment.size > MAX_FILE_SIZE) {
       lines.push(
-        `[첨부파일 "${attachment.name}" 은 ${Math.round(attachment.size / 1024 / 1024)}MB로 크기 제한(10MB)을 초과하여 건너뜀]`,
+        msg("attachmentTooLarge", {
+          name: attachment.name,
+          size: String(Math.round(attachment.size / 1024 / 1024)),
+        }),
       );
       continue;
     }
@@ -72,7 +76,7 @@ export async function downloadAttachments(
     try {
       const res = await fetch(attachment.url);
       if (!res.ok) {
-        lines.push(`[첨부파일 "${attachment.name}" 다운로드 실패]`);
+        lines.push(msg("attachmentFailed", { name: attachment.name }));
         continue;
       }
       const buffer = Buffer.from(await res.arrayBuffer());
@@ -81,12 +85,12 @@ export async function downloadAttachments(
 
       const isImage = attachment.contentType?.startsWith("image/") ?? false;
       if (isImage) {
-        lines.push(`[첨부 이미지: ${filePath}]`);
+        lines.push(msg("attachmentImage", { path: filePath }));
       } else {
-        lines.push(`[첨부 파일: ${filePath}]`);
+        lines.push(msg("attachmentFile", { path: filePath }));
       }
     } catch {
-      lines.push(`[첨부파일 "${attachment.name}" 다운로드 실패]`);
+      lines.push(msg("attachmentFailed", { name: attachment.name }));
     }
   }
 
@@ -123,7 +127,7 @@ export async function redownloadAttachments(
     try {
       const res = await fetch(att.url);
       if (!res.ok) {
-        lines.push(`[첨부파일 "${att.name}" 다운로드 실패]`);
+        lines.push(msg("attachmentFailed", { name: att.name }));
         continue;
       }
       const buffer = Buffer.from(await res.arrayBuffer());
@@ -132,12 +136,12 @@ export async function redownloadAttachments(
 
       const isImage = att.contentType?.startsWith("image/") ?? false;
       if (isImage) {
-        lines.push(`[첨부 이미지: ${filePath}]`);
+        lines.push(msg("attachmentImage", { path: filePath }));
       } else {
-        lines.push(`[첨부 파일: ${filePath}]`);
+        lines.push(msg("attachmentFile", { path: filePath }));
       }
     } catch {
-      lines.push(`[첨부파일 "${att.name}" 다운로드 실패]`);
+      lines.push(msg("attachmentFailed", { name: att.name }));
     }
   }
 
