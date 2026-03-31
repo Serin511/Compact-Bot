@@ -70,25 +70,34 @@ let restarting = false;
 
 // ── virtual terminal (screen buffer) ─────────────────────────────────
 
-let vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS });
+let vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS, allowProposedApi: true });
 
 /**
  * Capture current screen content from the virtual terminal.
  *
- * Reads the active buffer and returns non-empty lines as plain text.
+ * Flushes pending writes first, then reads the active buffer
+ * and returns non-empty lines as plain text.
  */
-function captureScreen(): string {
-  const buf = vterm.buffer.active;
-  const lines: string[] = [];
-  for (let i = 0; i < buf.length; i++) {
-    const line = buf.getLine(i);
-    if (line) lines.push(line.translateToString(true));
-  }
-  // Trim trailing empty lines
-  while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
-    lines.pop();
-  }
-  return lines.join("\n");
+function captureScreen(): Promise<string> {
+  return new Promise((resolve) => {
+    // Flush pending async writes before reading the buffer
+    vterm.write("", () => {
+      const buf = vterm.buffer.active;
+      const lines: string[] = [];
+      for (let i = 0; i < buf.length; i++) {
+        const line = buf.getLine(i);
+        if (line) lines.push(line.translateToString(false));
+      }
+      // Trim trailing empty lines
+      while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
+        lines.pop();
+      }
+      // Uniform width: find rightmost content column, then slice all lines
+      // to that width so right-aligned elements stay at the same column
+      const maxLen = lines.reduce((m, l) => Math.max(m, l.trimEnd().length), 0);
+      resolve(lines.map((l) => l.slice(0, maxLen)).join("\n"));
+    });
+  });
 }
 
 // ── MCP config generation ─────────────────────────────────────────────
@@ -360,7 +369,7 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
 
   // Reset virtual terminal for fresh session
   vterm.dispose();
-  vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS });
+  vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS, allowProposedApi: true });
 
   // Brief pause for cleanup
   await new Promise((r) => setTimeout(r, 1000));
@@ -404,9 +413,10 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
       restart({ cwd: msg.cwd });
       break;
     case "capture": {
-      const screen = captureScreen();
-      log.debug(`Screen capture requested (${screen.length} chars)`);
-      sender.send({ type: "capture_result", text: screen } satisfies WrapperToMcp);
+      captureScreen().then((screen) => {
+        log.debug(`Screen capture requested (${screen.length} chars)`);
+        sender.send({ type: "capture_result", text: screen } satisfies WrapperToMcp);
+      });
       break;
     }
     case "ready":
