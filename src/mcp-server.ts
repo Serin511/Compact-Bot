@@ -16,6 +16,9 @@ import {
   Client,
   GatewayIntentBits,
   Partials,
+  ButtonBuilder,
+  ButtonStyle,
+  ActionRowBuilder,
   type TextChannel,
   type Message,
 } from "discord.js";
@@ -44,6 +47,7 @@ const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
 let ipc: JsonLineSocket | null = null;
 let currentModel = "";
 let currentCwd = "";
+let lastActiveChannelId: string | null = null;
 
 /**
  * Request a screen capture from the wrapper via IPC.
@@ -101,7 +105,10 @@ const mcp = new McpServer(
   {
     capabilities: {
       tools: {},
-      experimental: { "claude/channel": {} },
+      experimental: {
+        "claude/channel": {},
+        "claude/channel/permission": {},
+      },
     },
     instructions: [
       "The sender reads Discord, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
@@ -123,6 +130,27 @@ const mcp = new McpServer(
       "",
       "All user-facing messages should be in Korean.",
     ].join("\n"),
+  },
+);
+
+// ── MCP permission request handler ──────────────────────────────────
+
+const PermissionRequestSchema = z.object({
+  method: z.literal("notifications/claude/channel/permission_request"),
+  params: z.object({
+    request_id: z.string(),
+    tool_name: z.string(),
+    description: z.string(),
+    input_preview: z.string(),
+  }),
+});
+
+mcp.server.setNotificationHandler(
+  PermissionRequestSchema,
+  async (notification) => {
+    handlePermissionRequest(notification.params).catch((err) => {
+      stderr(`Permission request handler error: ${err}`);
+    });
   },
 );
 
@@ -304,6 +332,162 @@ mcp.tool(
   },
 );
 
+// ── permission prompt handling (MCP Channel protocol) ───────────────
+
+/**
+ * Extract a JSON string value by key using regex.
+ *
+ * Works on truncated/incomplete JSON where JSON.parse would fail.
+ * If the value is truncated (no closing quote), captures until the
+ * next key or end of string.
+ */
+function extractJsonField(text: string, key: string): string | null {
+  // Try complete value first: "key":"value"
+  const complete = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
+  const cm = text.match(complete);
+  if (cm) return cm[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "\t");
+
+  // Truncated value: "key":"value... (no closing quote — capture to end)
+  const truncated = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
+  const tm = text.match(truncated);
+  if (tm) return tm[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "\t") + "…";
+
+  return null;
+}
+
+/**
+ * Format tool input preview for Discord markdown display.
+ *
+ * Handles both complete and truncated JSON from Claude Code's
+ * input_preview field by extracting fields via regex.
+ */
+function formatPreview(
+  toolName: string,
+  inputPreview: string,
+  description: string,
+): string {
+  if (!inputPreview && !description) return "(상세 정보 없음)";
+
+  const src = inputPreview || description;
+  const lines: string[] = [];
+
+  switch (toolName) {
+    case "Bash": {
+      const cmd = extractJsonField(src, "command");
+      const desc = extractJsonField(src, "description");
+      if (cmd) lines.push(`\`\`\`bash\n${cmd}\n\`\`\``);
+      if (desc) lines.push(`> ${desc}`);
+      break;
+    }
+    case "Edit": {
+      const fp = extractJsonField(src, "file_path");
+      const old = extractJsonField(src, "old_string");
+      const nw = extractJsonField(src, "new_string");
+      if (fp) lines.push(`📄 \`${fp}\``);
+      if (old) lines.push(`\`\`\`diff\n- ${old}\n\`\`\``);
+      if (nw) lines.push(`\`\`\`diff\n+ ${nw}\n\`\`\``);
+      break;
+    }
+    case "Write": {
+      const fp = extractJsonField(src, "file_path");
+      const content = extractJsonField(src, "content");
+      if (fp) lines.push(`📄 \`${fp}\``);
+      if (content) lines.push(`\`\`\`\n${content}\n\`\`\``);
+      break;
+    }
+    case "Read": {
+      const fp = extractJsonField(src, "file_path");
+      if (fp) lines.push(`📄 \`${fp}\``);
+      break;
+    }
+    default: {
+      const pairs = src.matchAll(/"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
+      for (const m of pairs) {
+        lines.push(`**${m[1]}**: \`${m[2]}\``);
+      }
+    }
+  }
+
+  if (lines.length > 0) return lines.join("\n");
+
+  // Fallback: description or raw
+  if (description && description !== inputPreview) return description;
+  return `\`\`\`\n${src}\n\`\`\``;
+}
+
+/**
+ * Handle a permission request from Claude Code via MCP notification.
+ *
+ * Sends a Discord message with buttons and waits for user click.
+ * When the user clicks, sends the verdict back via MCP notification.
+ */
+async function handlePermissionRequest(params: {
+  request_id: string;
+  tool_name: string;
+  description: string;
+  input_preview: string;
+}): Promise<void> {
+  stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
+
+  if (!lastActiveChannelId) {
+    stderr("No active channel for permission request, ignoring (CLI prompt remains)");
+    return;
+  }
+
+  try {
+    const channel = await discord.channels.fetch(lastActiveChannelId);
+    if (!channel?.isTextBased()) {
+      stderr("Active channel is not text-based, ignoring");
+      return;
+    }
+
+    const action = formatPreview(
+      params.tool_name,
+      params.input_preview,
+      params.description,
+    );
+    const text = msg("permissionPrompt", {
+      tool: params.tool_name,
+      action,
+    });
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`perm:allow:${params.request_id}`)
+        .setLabel("허용")
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`perm:deny:${params.request_id}`)
+        .setLabel("거부")
+        .setEmoji("❌")
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    await (channel as TextChannel).send({ content: text, components: [row] });
+  } catch (err) {
+    stderr(`Failed to send permission request to Discord: ${err}`);
+  }
+}
+
+/**
+ * Send a permission verdict back to Claude Code via MCP notification.
+ */
+async function sendPermissionVerdict(
+  requestId: string,
+  behavior: "allow" | "deny",
+): Promise<void> {
+  try {
+    await mcp.server.notification({
+      method: "notifications/claude/channel/permission",
+      params: { request_id: requestId, behavior },
+    });
+    stderr(`Permission verdict sent: ${requestId} → ${behavior}`);
+  } catch (err) {
+    stderr(`Failed to send permission verdict: ${err}`);
+  }
+}
+
 // ── Discord message handler ───────────────────────────────────────────
 
 async function sendChannelNotification(
@@ -320,6 +504,7 @@ async function handleDiscordMessage(message: Message): Promise<void> {
   if (message.author.bot) return;
   if (!isAllowed(message.channelId)) return;
 
+  lastActiveChannelId = message.channelId;
   const route = routeMessage(message.content);
 
   switch (route.type) {
@@ -430,6 +615,31 @@ discord.on("messageCreate", (message) => {
   });
 });
 
+discord.on("interactionCreate", async (interaction) => {
+  if (!interaction.isButton()) return;
+
+  const parts = interaction.customId.split(":");
+  if (parts[0] !== "perm") return;
+
+  const [, behavior, requestId] = parts as [string, string, string];
+  if (!requestId || (behavior !== "allow" && behavior !== "deny")) return;
+
+  const allow = behavior === "allow";
+  stderr(`Button clicked: ${behavior} for request_id=${requestId}`);
+
+  await sendPermissionVerdict(requestId, behavior as "allow" | "deny");
+
+  const label = allow
+    ? msg("permissionAllowed", { tool: "" })
+    : msg("permissionDenied", { tool: "" });
+  await interaction
+    .update({
+      content: `${interaction.message.content}\n\n${label}`,
+      components: [],
+    })
+    .catch(() => {});
+});
+
 discord.once("ready", (c) => {
   stderr(`Discord connected as ${c.user.tag}`);
 });
@@ -440,11 +650,11 @@ async function main(): Promise<void> {
   // Connect IPC to wrapper
   try {
     ipc = await connectToWrapper(WRAPPER_SOCKET);
-    ipc.on("message", (msg: WrapperToMcp) => {
-      if (msg.type === "config") {
-        currentModel = msg.model;
-        currentCwd = msg.cwd;
-        stderr(`Config received: model=${msg.model} cwd=${msg.cwd}`);
+    ipc.on("message", (ipcMsg: WrapperToMcp) => {
+      if (ipcMsg.type === "config") {
+        currentModel = ipcMsg.model;
+        currentCwd = ipcMsg.cwd;
+        stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
       }
     });
     ipc.on("close", () => {

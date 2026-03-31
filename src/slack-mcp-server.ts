@@ -47,6 +47,8 @@ let ipc: JsonLineSocket | null = null;
 let currentModel = "";
 let currentCwd = "";
 let botUserId = "";
+let lastActiveChannelId: string | null = null;
+let lastActiveThreadTs: string | undefined = undefined;
 
 /**
  * Request a screen capture from the wrapper via IPC.
@@ -117,7 +119,10 @@ const mcp = new McpServer(
   {
     capabilities: {
       tools: {},
-      experimental: { "claude/channel": {} },
+      experimental: {
+        "claude/channel": {},
+        "claude/channel/permission": {},
+      },
     },
     instructions: [
       "The sender reads Slack, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
@@ -139,6 +144,27 @@ const mcp = new McpServer(
       "",
       "All user-facing messages should be in Korean.",
     ].join("\n"),
+  },
+);
+
+// ── MCP permission request handler ──────────────────────────────────
+
+const PermissionRequestSchema = z.object({
+  method: z.literal("notifications/claude/channel/permission_request"),
+  params: z.object({
+    request_id: z.string(),
+    tool_name: z.string(),
+    description: z.string(),
+    input_preview: z.string(),
+  }),
+});
+
+mcp.server.setNotificationHandler(
+  PermissionRequestSchema,
+  async (notification) => {
+    handlePermissionRequest(notification.params).catch((err) => {
+      stderr(`Permission request handler error: ${err}`);
+    });
   },
 );
 
@@ -344,6 +370,163 @@ mcp.tool(
   },
 );
 
+// ── permission prompt handling (MCP Channel protocol) ───────────────
+
+/**
+ * Extract a JSON string value by key using regex.
+ *
+ * Works on truncated/incomplete JSON where JSON.parse would fail.
+ * If the value is truncated (no closing quote), captures until end of string.
+ */
+function extractJsonField(text: string, key: string): string | null {
+  const complete = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"`);
+  const cm = text.match(complete);
+  if (cm) return cm[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "\t");
+
+  const truncated = new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`);
+  const tm = text.match(truncated);
+  if (tm) return tm[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\t/g, "\t") + "…";
+
+  return null;
+}
+
+/**
+ * Format tool input preview for Slack mrkdwn display.
+ *
+ * Handles both complete and truncated JSON from Claude Code's
+ * input_preview field by extracting fields via regex.
+ */
+function formatPreview(
+  toolName: string,
+  inputPreview: string,
+  description: string,
+): string {
+  if (!inputPreview && !description) return "(상세 정보 없음)";
+
+  const src = inputPreview || description;
+  const lines: string[] = [];
+
+  switch (toolName) {
+    case "Bash": {
+      const cmd = extractJsonField(src, "command");
+      const desc = extractJsonField(src, "description");
+      if (cmd) lines.push(`\`\`\`${cmd}\`\`\``);
+      if (desc) lines.push(`> ${desc}`);
+      break;
+    }
+    case "Edit": {
+      const fp = extractJsonField(src, "file_path");
+      const old = extractJsonField(src, "old_string");
+      const nw = extractJsonField(src, "new_string");
+      if (fp) lines.push(`:page_facing_up: \`${fp}\``);
+      if (old) lines.push(`\`\`\`- ${old}\`\`\``);
+      if (nw) lines.push(`\`\`\`+ ${nw}\`\`\``);
+      break;
+    }
+    case "Write": {
+      const fp = extractJsonField(src, "file_path");
+      const content = extractJsonField(src, "content");
+      if (fp) lines.push(`:page_facing_up: \`${fp}\``);
+      if (content) lines.push(`\`\`\`${content}\`\`\``);
+      break;
+    }
+    case "Read": {
+      const fp = extractJsonField(src, "file_path");
+      if (fp) lines.push(`:page_facing_up: \`${fp}\``);
+      break;
+    }
+    default: {
+      const pairs = src.matchAll(/"(\w+)"\s*:\s*"((?:[^"\\]|\\.)*)"/g);
+      for (const m of pairs) {
+        lines.push(`*${m[1]}*: \`${m[2]}\``);
+      }
+    }
+  }
+
+  if (lines.length > 0) return lines.join("\n");
+
+  if (description && description !== inputPreview) return description;
+  return `\`\`\`${src}\`\`\``;
+}
+
+/**
+ * Handle a permission request from Claude Code via MCP notification.
+ *
+ * Sends a Slack message with Block Kit buttons and waits for user click.
+ * When the user clicks, sends the verdict back via MCP notification.
+ */
+async function handlePermissionRequest(params: {
+  request_id: string;
+  tool_name: string;
+  description: string;
+  input_preview: string;
+}): Promise<void> {
+  stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
+
+  if (!lastActiveChannelId) {
+    stderr("No active channel for permission request, ignoring (CLI prompt remains)");
+    return;
+  }
+
+  try {
+    const action = formatPreview(
+      params.tool_name,
+      params.input_preview,
+      params.description,
+    );
+    const text = `:lock: *권한 요청*: \`${params.tool_name}\`\n${action}`;
+
+    await web.chat.postMessage({
+      channel: lastActiveChannelId,
+      text,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "✅ 허용" },
+              action_id: `perm:allow:${params.request_id}`,
+              style: "primary",
+            },
+            {
+              type: "button",
+              text: { type: "plain_text", text: "❌ 거부" },
+              action_id: `perm:deny:${params.request_id}`,
+              style: "danger",
+            },
+          ],
+        },
+      ],
+      ...(lastActiveThreadTs ? { thread_ts: lastActiveThreadTs } : {}),
+    });
+  } catch (err) {
+    stderr(`Failed to send permission request to Slack: ${err}`);
+  }
+}
+
+/**
+ * Send a permission verdict back to Claude Code via MCP notification.
+ */
+async function sendPermissionVerdict(
+  requestId: string,
+  behavior: "allow" | "deny",
+): Promise<void> {
+  try {
+    await mcp.server.notification({
+      method: "notifications/claude/channel/permission",
+      params: { request_id: requestId, behavior },
+    });
+    stderr(`Permission verdict sent: ${requestId} → ${behavior}`);
+  } catch (err) {
+    stderr(`Failed to send permission verdict: ${err}`);
+  }
+}
+
 // ── Slack message handler ────────────────────────────────────────────
 
 async function sendChannelNotification(
@@ -369,6 +552,9 @@ async function handleSlackMessage(event: {
   if (event.user === botUserId) return;
   if (!event.user) return;
   if (!isAllowed(event.channel)) return;
+
+  lastActiveChannelId = event.channel;
+  lastActiveThreadTs = event.thread_ts;
 
   const route = routeMessage(event.text ?? "");
   const displayName = await getUserDisplayName(event.user);
@@ -492,6 +678,44 @@ socketMode.on("message", async ({ event, ack }) => {
   });
 });
 
+socketMode.on("interactive", async ({ body, ack }) => {
+  await ack();
+
+  if (body.type !== "block_actions" || !body.actions?.length) return;
+
+  const action = body.actions[0];
+  if (!action.action_id?.startsWith("perm:")) return;
+
+  const parts = action.action_id.split(":");
+  const [, behavior, requestId] = parts as [string, string, string];
+  if (!requestId || (behavior !== "allow" && behavior !== "deny")) return;
+
+  const allow = behavior === "allow";
+  stderr(`Button clicked: ${behavior} for request_id=${requestId}`);
+
+  await sendPermissionVerdict(requestId, behavior as "allow" | "deny");
+
+  // Update message: remove buttons, show result
+  try {
+    const channel = body.channel?.id;
+    const ts = body.message?.ts;
+    if (channel && ts) {
+      const original = body.message?.text ?? "";
+      const result = allow
+        ? ":white_check_mark: 권한 허용됨"
+        : ":x: 권한 거부됨";
+      await web.chat.update({
+        channel,
+        ts,
+        text: original + "\n\n" + result,
+        blocks: [],
+      });
+    }
+  } catch {
+    // ignore update failure
+  }
+});
+
 socketMode.on("connected", () => {
   stderr("Slack Socket Mode connected");
 });
@@ -502,11 +726,11 @@ async function main(): Promise<void> {
   // Connect IPC to wrapper
   try {
     ipc = await connectToWrapper(WRAPPER_SOCKET);
-    ipc.on("message", (msg: WrapperToMcp) => {
-      if (msg.type === "config") {
-        currentModel = msg.model;
-        currentCwd = msg.cwd;
-        stderr(`Config received: model=${msg.model} cwd=${msg.cwd}`);
+    ipc.on("message", (ipcMsg: WrapperToMcp) => {
+      if (ipcMsg.type === "config") {
+        currentModel = ipcMsg.model;
+        currentCwd = ipcMsg.cwd;
+        stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
       }
     });
     ipc.on("close", () => {

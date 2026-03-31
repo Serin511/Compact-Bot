@@ -55,6 +55,12 @@ const DEFAULTS: Record<string, string> = {
   attachmentNoUrl: "[첨부파일 \"{name}\" 다운로드 URL 없음]",
   attachmentImage: "[첨부 이미지: {path}]",
   attachmentFile: "[첨부 파일: {path}]",
+
+  // Permission prompts
+  permissionPrompt: "🔐 **권한 요청**: `{tool}`\n{action}",
+  permissionAllowed: "✅ 허용됨",
+  permissionDenied: "❌ 거부됨",
+  permissionTimeout: "⏰ 시간 초과 (자동 거부)",
 };
 
 function loadCustomMessages(): Record<string, string> {
