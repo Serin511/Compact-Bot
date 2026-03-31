@@ -1,6 +1,6 @@
 {
   "name": "@serin511/compact-bot",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Multi-platform chat bot (Discord + Slack) powered by Claude Code MCP channels",
   "type": "module",
   "main": "dist/wrapper.js",

@@ -22,6 +22,7 @@ import {
   writeFileSync,
   unlinkSync,
 } from "node:fs";
+import { execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, loadSystemPrompt } from "./config.js";
@@ -180,6 +181,35 @@ function ptyToText(data: string): string {
   );
 }
 
+function resolveClaudePath(): string {
+  const p = config.claudePath;
+  if (p.includes("/") || p.includes("\\")) {
+    if (!existsSync(p)) {
+      log.error(`Claude CLI not found at: ${p}`, new Error("not found"));
+      console.error(
+        `\n  Claude CLI를 찾을 수 없습니다: ${p}\n` +
+        `  설치: https://docs.anthropic.com/en/docs/claude-code\n` +
+        `  또는 CLAUDE_PATH 환경변수를 설정하세요.\n`,
+      );
+      process.exit(1);
+    }
+    return p;
+  }
+  try {
+    return execSync(`which ${p}`, { encoding: "utf-8" }).trim();
+  } catch {
+    log.error(`Claude CLI not found in PATH: ${p}`, new Error("not found"));
+    console.error(
+      `\n  Claude CLI를 찾을 수 없습니다: "${p}"\n` +
+      `  설치: https://docs.anthropic.com/en/docs/claude-code\n` +
+      `  또는 CLAUDE_PATH 환경변수에 전체 경로를 설정하세요.\n`,
+    );
+    process.exit(1);
+  }
+}
+
+const resolvedClaudePath = resolveClaudePath();
+
 function spawnClaude(): void {
   const args = buildArgs();
 
@@ -189,7 +219,7 @@ function spawnClaude(): void {
       : "all";
   log.ready("wrapper", state.model, state.cwd, channels);
 
-  claudeProcess = pty.spawn(config.claudePath, args, {
+  claudeProcess = pty.spawn(resolvedClaudePath, args, {
     name: "xterm-256color",
     cols: PTY_COLS,
     rows: PTY_ROWS,
