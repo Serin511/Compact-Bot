@@ -68,6 +68,7 @@ const PTY_ROWS = 50;
 let claudeProcess: pty.IPty | null = null;
 const mcpClients = new Set<JsonLineSocket>();
 let expectedExit = false;
+let spawnGrace = false;
 
 // ── user input detection state ───────────────────────────────────────
 
@@ -393,8 +394,16 @@ function spawnClaude(): void {
     log.debug(`Claude Code exited (code ${exitCode})`);
     claudeProcess = null;
 
-    if (expectedExit) {
-      // Killed by restart() — it handles the respawn
+    if (expectedExit || spawnGrace) {
+      // Killed by restart() or transient startup failure — restart() handles respawn
+      if (spawnGrace) {
+        log.debug(`Claude Code exited during startup (code ${exitCode}), retrying...`);
+        spawnGrace = false;
+        setTimeout(() => {
+          log.debug("Auto-respawning Claude Code...");
+          spawnClaude();
+        }, 2000);
+      }
       expectedExit = false;
       return;
     }
@@ -454,7 +463,10 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   // Brief pause for cleanup
   await new Promise((r) => setTimeout(r, 1000));
 
+  spawnGrace = true;
   spawnClaude();
+  // Clear grace period after process has had time to initialize
+  setTimeout(() => { spawnGrace = false; }, 5000);
 }
 
 // ── IPC message handling ──────────────────────────────────────────────
