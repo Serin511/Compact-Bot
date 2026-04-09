@@ -67,7 +67,7 @@ const PTY_ROWS = 50;
 
 let claudeProcess: pty.IPty | null = null;
 const mcpClients = new Set<JsonLineSocket>();
-let restarting = false;
+let expectedExit = false;
 
 // ── user input detection state ───────────────────────────────────────
 
@@ -393,14 +393,17 @@ function spawnClaude(): void {
     log.debug(`Claude Code exited (code ${exitCode})`);
     claudeProcess = null;
 
-    // Auto-respawn if not intentionally restarting
-    if (!restarting) {
-      log.error("Claude Code exited unexpectedly", new Error(`exit ${exitCode}`));
-      setTimeout(() => {
-        log.debug("Auto-respawning Claude Code...");
-        spawnClaude();
-      }, 2000);
+    if (expectedExit) {
+      // Killed by restart() — it handles the respawn
+      expectedExit = false;
+      return;
     }
+
+    log.error("Claude Code exited unexpectedly", new Error(`exit ${exitCode}`));
+    setTimeout(() => {
+      log.debug("Auto-respawning Claude Code...");
+      spawnClaude();
+    }, 2000);
   });
 }
 
@@ -410,6 +413,7 @@ function killClaude(): Promise<void> {
       resolve();
       return;
     }
+    expectedExit = true;
     const onExit = claudeProcess.onExit(() => {
       onExit.dispose();
       resolve();
@@ -430,7 +434,6 @@ function killClaude(): Promise<void> {
 }
 
 async function restart(updates?: Partial<WrapperState>): Promise<void> {
-  restarting = true;
   if (updates) Object.assign(state, updates);
 
   log.debug(
@@ -451,7 +454,6 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   // Brief pause for cleanup
   await new Promise((r) => setTimeout(r, 1000));
 
-  restarting = false;
   spawnClaude();
 }
 
