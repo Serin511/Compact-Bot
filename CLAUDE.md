@@ -40,6 +40,7 @@ src/
   logger.ts                 — Structured, chalk-colored console logger
   message-router.ts         — Classifies messages as commands (/compact, /clear, /new, …) or chat
   messages.ts               — Customisable bot messages with JSON file overrides (data/messages.json)
+  prompt-detector.ts        — Detects interactive user prompts from PTY screen buffer
   attachment-handler.ts     — Downloads Discord attachments to data/attachments/, builds prompt prefix
   slack-attachment-handler.ts — Downloads Slack attachments (Bearer auth) to data/attachments/, builds prompt prefix
 tests/
@@ -77,6 +78,7 @@ wrapper.ts (npm start)
 - **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
 - **Permission relay**: When `DANGEROUSLY_SKIP_PERMISSIONS=false`, MCP servers declare `claude/channel/permission` capability. Claude Code sends `permission_request` notifications instead of PTY prompts; MCP servers show interactive buttons (Discord: ButtonBuilder, Slack: Block Kit) and relay the verdict back via `permission` notification
+- **User input relay**: When Claude Code asks the user a question via PTY prompt, the wrapper detects it after 3s idle using screen buffer analysis (prompt-detector.ts), broadcasts `input_request` via IPC to MCP servers, which display the question in Discord/Slack; the next user message is captured as the answer and relayed back to the PTY
 
 ### Platform Differences
 

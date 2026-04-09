@@ -49,6 +49,9 @@ let currentModel = "";
 let currentCwd = "";
 let lastActiveChannelId: string | null = null;
 
+/** Pending user input request — when set, the next user message is treated as the answer. */
+let pendingInputRequest: { request_id: string; channelId: string } | null = null;
+
 /**
  * Request a screen capture from the wrapper via IPC.
  *
@@ -488,6 +491,45 @@ async function sendPermissionVerdict(
   }
 }
 
+// ── user input request handling (PTY prompt relay) ───────────────────
+
+/**
+ * Handle a user input request relayed from the wrapper.
+ *
+ * Displays the question in Discord and sets a pending flag so the next
+ * user message is captured as the answer.
+ */
+async function handleInputRequest(
+  requestId: string,
+  question: string,
+): Promise<void> {
+  stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
+
+  if (!lastActiveChannelId) {
+    stderr("No active channel for input request, ignoring");
+    return;
+  }
+
+  try {
+    const channel = await discord.channels.fetch(lastActiveChannelId);
+    if (!channel?.isTextBased()) {
+      stderr("Active channel is not text-based, ignoring");
+      return;
+    }
+
+    pendingInputRequest = { request_id: requestId, channelId: lastActiveChannelId };
+
+    const text = msg("inputRequest", { question });
+    const chunks = splitMessage(text);
+    for (const chunk of chunks) {
+      await (channel as TextChannel).send(chunk);
+    }
+  } catch (err) {
+    stderr(`Failed to send input request to Discord: ${err}`);
+    pendingInputRequest = null;
+  }
+}
+
 // ── Discord message handler ───────────────────────────────────────────
 
 async function sendChannelNotification(
@@ -505,6 +547,17 @@ async function handleDiscordMessage(message: Message): Promise<void> {
   if (!isAllowed(message.channelId)) return;
 
   lastActiveChannelId = message.channelId;
+
+  // If there is a pending input request, treat this message as the answer
+  if (pendingInputRequest && message.channelId === pendingInputRequest.channelId) {
+    const { request_id } = pendingInputRequest;
+    pendingInputRequest = null;
+    stderr(`Input response from user: ${message.content.slice(0, 100)}`);
+    ipc?.send({ type: "input_response", request_id, answer: message.content } satisfies McpToWrapper);
+    await message.reply(msg("inputResponseSent"));
+    return;
+  }
+
   const route = routeMessage(message.content);
 
   switch (route.type) {
@@ -655,6 +708,10 @@ async function main(): Promise<void> {
         currentModel = ipcMsg.model;
         currentCwd = ipcMsg.cwd;
         stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
+      } else if (ipcMsg.type === "input_request") {
+        handleInputRequest(ipcMsg.request_id, ipcMsg.question).catch((err) => {
+          stderr(`Input request handler error: ${err}`);
+        });
       }
     });
     ipc.on("close", () => {

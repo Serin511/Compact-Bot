@@ -25,12 +25,14 @@ export type McpToWrapper =
   | { type: "model"; model: string }
   | { type: "cwd"; cwd: string }
   | { type: "ready" }
-  | { type: "capture" };
+  | { type: "capture" }
+  | { type: "input_response"; request_id: string; answer: string };
 
 /** Messages from wrapper → MCP server. */
 export type WrapperToMcp =
   | { type: "config"; model: string; cwd: string }
-  | { type: "capture_result"; text: string };
+  | { type: "capture_result"; text: string }
+  | { type: "input_request"; request_id: string; question: string };
 
 /**
  * Bidirectional JSON-line protocol over a raw socket.

@@ -50,6 +50,9 @@ let botUserId = "";
 let lastActiveChannelId: string | null = null;
 let lastActiveThreadTs: string | undefined = undefined;
 
+/** Pending user input request — when set, the next user message is treated as the answer. */
+let pendingInputRequest: { request_id: string; channelId: string; threadTs?: string } | null = null;
+
 /**
  * Request a screen capture from the wrapper via IPC.
  *
@@ -527,6 +530,48 @@ async function sendPermissionVerdict(
   }
 }
 
+// ── user input request handling (PTY prompt relay) ───────────────────
+
+/**
+ * Handle a user input request relayed from the wrapper.
+ *
+ * Displays the question in Slack and sets a pending flag so the next
+ * user message is captured as the answer.
+ */
+async function handleInputRequest(
+  requestId: string,
+  question: string,
+): Promise<void> {
+  stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
+
+  if (!lastActiveChannelId) {
+    stderr("No active channel for input request, ignoring");
+    return;
+  }
+
+  try {
+    pendingInputRequest = {
+      request_id: requestId,
+      channelId: lastActiveChannelId,
+      threadTs: lastActiveThreadTs,
+    };
+
+    // Convert Discord-style markdown to Slack mrkdwn for the question
+    const text = `:question: *Claude의 질문*\n\n${question}\n\n:speech_balloon: 다음 메시지로 답변해주세요.`;
+    const chunks = splitMessage(text);
+    for (const chunk of chunks) {
+      await web.chat.postMessage({
+        channel: lastActiveChannelId,
+        text: chunk,
+        ...(lastActiveThreadTs ? { thread_ts: lastActiveThreadTs } : {}),
+      });
+    }
+  } catch (err) {
+    stderr(`Failed to send input request to Slack: ${err}`);
+    pendingInputRequest = null;
+  }
+}
+
 // ── Slack message handler ────────────────────────────────────────────
 
 async function sendChannelNotification(
@@ -555,6 +600,20 @@ async function handleSlackMessage(event: {
 
   lastActiveChannelId = event.channel;
   lastActiveThreadTs = event.thread_ts;
+
+  // If there is a pending input request, treat this message as the answer
+  if (pendingInputRequest && event.channel === pendingInputRequest.channelId) {
+    const { request_id } = pendingInputRequest;
+    pendingInputRequest = null;
+    stderr(`Input response from user: ${(event.text ?? "").slice(0, 100)}`);
+    ipc?.send({ type: "input_response", request_id, answer: event.text ?? "" } satisfies McpToWrapper);
+    await web.chat.postMessage({
+      channel: event.channel,
+      text: msg("inputResponseSent"),
+      ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+    });
+    return;
+  }
 
   const route = routeMessage(event.text ?? "");
   const displayName = await getUserDisplayName(event.user);
@@ -731,6 +790,10 @@ async function main(): Promise<void> {
         currentModel = ipcMsg.model;
         currentCwd = ipcMsg.cwd;
         stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
+      } else if (ipcMsg.type === "input_request") {
+        handleInputRequest(ipcMsg.request_id, ipcMsg.question).catch((err) => {
+          stderr(`Input request handler error: ${err}`);
+        });
       }
     });
     ipc.on("close", () => {

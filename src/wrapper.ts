@@ -30,6 +30,7 @@ import { fileURLToPath } from "node:url";
 import { config, loadSystemPrompt } from "./config.js";
 import { log, setVerbose } from "./logger.js";
 import { DATA_DIR } from "./paths.js";
+import { detectUserPrompt } from "./prompt-detector.js";
 import {
   createIpcServer,
   type McpToWrapper,
@@ -68,6 +69,13 @@ let claudeProcess: pty.IPty | null = null;
 const mcpClients = new Set<JsonLineSocket>();
 let restarting = false;
 
+// ── user input detection state ───────────────────────────────────────
+
+let inputIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let activeInputRequestId: string | null = null;
+const INPUT_IDLE_MS = 3000;
+let inputRequestCounter = 0;
+
 // ── virtual terminal (screen buffer) ─────────────────────────────────
 
 let vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS, allowProposedApi: true });
@@ -98,6 +106,68 @@ function captureScreen(): Promise<string> {
       resolve(lines.map((l) => l.slice(0, maxLen)).join("\n"));
     });
   });
+}
+
+// ── user input detection ─────────────────────────────────────────────
+
+/**
+ * Generate a short unique request ID for input requests.
+ */
+function nextInputRequestId(): string {
+  inputRequestCounter += 1;
+  return `inp_${inputRequestCounter}_${Date.now().toString(36)}`;
+}
+
+/**
+ * Check the terminal for a user prompt and broadcast to MCP servers.
+ */
+async function checkAndRelayUserPrompt(): Promise<void> {
+  if (activeInputRequestId) return;
+  if (mcpClients.size === 0) return;
+
+  const screen = await captureScreen();
+  const question = detectUserPrompt(screen);
+  if (!question) return;
+
+  const requestId = nextInputRequestId();
+  activeInputRequestId = requestId;
+
+  log.debug(`User prompt detected (id=${requestId}): ${question.slice(0, 100)}`);
+
+  const msg: WrapperToMcp = {
+    type: "input_request",
+    request_id: requestId,
+    question,
+  };
+  for (const client of mcpClients) {
+    client.send(msg);
+  }
+}
+
+/**
+ * Reset the idle timer. Called on each PTY data event.
+ */
+function resetInputIdleTimer(): void {
+  if (inputIdleTimer) clearTimeout(inputIdleTimer);
+  inputIdleTimer = setTimeout(() => {
+    checkAndRelayUserPrompt();
+  }, INPUT_IDLE_MS);
+}
+
+/**
+ * Handle a user's answer relayed from an MCP server.
+ */
+function handleInputResponse(requestId: string, answer: string): void {
+  if (activeInputRequestId !== requestId) {
+    log.debug(`Ignoring stale input response (expected=${activeInputRequestId}, got=${requestId})`);
+    return;
+  }
+
+  log.debug(`Input response received (id=${requestId}): ${answer.slice(0, 100)}`);
+  activeInputRequestId = null;
+
+  // Write the answer to PTY — Claude Code reads from stdin
+  writeToPty(`${answer}\r`);
 }
 
 // ── MCP config generation ─────────────────────────────────────────────
@@ -311,6 +381,9 @@ function spawnClaude(): void {
       claudeProcess!.write("\r");
     }
 
+    // Reset idle timer for user input detection
+    resetInputIdleTimer();
+
     if (config.verbose && clean) {
       log.debug(clean);
     }
@@ -366,6 +439,10 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
 
   await killClaude();
   mcpClients.clear();
+
+  // Reset input detection state
+  if (inputIdleTimer) clearTimeout(inputIdleTimer);
+  activeInputRequestId = null;
 
   // Reset virtual terminal for fresh session
   vterm.dispose();
@@ -426,6 +503,9 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
         model: state.model,
         cwd: state.cwd,
       } satisfies WrapperToMcp);
+      break;
+    case "input_response":
+      handleInputResponse(msg.request_id, msg.answer);
       break;
   }
 }

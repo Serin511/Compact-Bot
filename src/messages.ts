@@ -61,6 +61,10 @@ const DEFAULTS: Record<string, string> = {
   permissionAllowed: "✅ 허용됨",
   permissionDenied: "❌ 거부됨",
   permissionTimeout: "⏰ 시간 초과 (자동 거부)",
+
+  // User input prompts (AskUserQuestion relay)
+  inputRequest: "❓ **Claude의 질문**\n\n{question}\n\n💬 다음 메시지로 답변해주세요.",
+  inputResponseSent: "✅ 답변이 전달되었습니다.",
 };
 
 function loadCustomMessages(): Record<string, string> {
