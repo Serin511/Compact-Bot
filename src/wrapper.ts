@@ -235,11 +235,22 @@ function getMcpServerSpecs(): McpServerSpec[] {
  *
  * Tries the resolved Claude path first, then falls back to invoking via the
  * user's shell so aliases continue to work. Returns true on success.
+ *
+ * Detaches the child into its own process group and discards stdin so any
+ * interactive prompt (workspace trust, auth) can't suspend the wrapper via
+ * SIGTTIN/SIGTTOU.
  */
 function runClaudeMcpCommand(args: string[], cwd: string): boolean {
+  const opts = {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"] as ("ignore" | "pipe")[],
+    detached: true,
+    timeout: 30_000,
+  };
+
   if (resolvedClaudePath) {
     try {
-      execFileSync(resolvedClaudePath, args, { cwd, stdio: "pipe" });
+      execFileSync(resolvedClaudePath, args, opts);
       return true;
     } catch {
       // fall through to shell invocation
@@ -249,7 +260,7 @@ function runClaudeMcpCommand(args: string[], cwd: string): boolean {
   const shell = process.env.SHELL || "/bin/bash";
   const cmdLine = [config.claudePath, ...args].map(shellEscape).join(" ");
   try {
-    execSync(`${shell} -ic ${shellEscape(cmdLine)}`, { cwd, stdio: "pipe" });
+    execSync(`${shell} -ic ${shellEscape(cmdLine)}`, opts);
     return true;
   } catch {
     return false;
