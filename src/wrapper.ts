@@ -21,10 +21,9 @@ import {
   constants as fsConstants,
   existsSync,
   mkdirSync,
-  writeFileSync,
   unlinkSync,
 } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { config, loadSystemPrompt } from "./config.js";
@@ -48,7 +47,8 @@ const __dirname = dirname(__filename);
 const DIST_DIR = __dirname.endsWith("src") ? join(__dirname, "..", "dist") : __dirname;
 
 const SOCKET_PATH = join(DATA_DIR, "wrapper.sock");
-const MCP_CONFIG_PATH = join(DATA_DIR, "mcp-config.json");
+
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
 
 // ── state ─────────────────────────────────────────────────────────────
 
@@ -171,43 +171,130 @@ function handleInputResponse(requestId: string, answer: string): void {
   writeToPty(`${answer}\r`);
 }
 
-// ── MCP config generation ─────────────────────────────────────────────
+// ── MCP server registration ───────────────────────────────────────────
+//
+// Claude Code 2.1.x has a regression where MCP servers loaded via
+// `--mcp-config` are not visible to `--dangerously-load-development-channels`
+// at startup, producing "no MCP server configured with that name" errors.
+// Workaround: register each server in the project's local scope via
+// `claude mcp add-json` before spawning, so it's resolvable when channels
+// initialize. Entries are removed at shutdown; any leftovers from a previous
+// crash are cleared before each registration.
 
-function generateMcpConfig(): void {
-  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+interface McpServerSpec {
+  name: string;
+  json: string;
+}
 
-  const mcpServers: Record<string, unknown> = {};
+/** Track cwds where we have registered MCP servers, for shutdown cleanup. */
+const registeredCwds = new Set<string>();
+
+function getMcpServerSpecs(): McpServerSpec[] {
+  const specs: McpServerSpec[] = [];
 
   if (config.discordBotToken) {
-    mcpServers["discord-bot"] = {
-      command: "node",
-      args: [join(DIST_DIR, "mcp-server.js")],
-      env: {
-        DISCORD_BOT_TOKEN: config.discordBotToken,
-        WRAPPER_SOCKET: SOCKET_PATH,
-        ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
-        FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
-        VERBOSE: String(config.verbose),
-      },
-    };
+    specs.push({
+      name: "discord-bot",
+      json: JSON.stringify({
+        command: "node",
+        args: [join(DIST_DIR, "mcp-server.js")],
+        env: {
+          DISCORD_BOT_TOKEN: config.discordBotToken,
+          WRAPPER_SOCKET: SOCKET_PATH,
+          ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
+          FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
+          VERBOSE: String(config.verbose),
+        },
+      }),
+    });
   }
 
   if (config.slackBotToken) {
-    mcpServers["slack-bot"] = {
-      command: "node",
-      args: [join(DIST_DIR, "slack-mcp-server.js")],
-      env: {
-        SLACK_BOT_TOKEN: config.slackBotToken,
-        SLACK_APP_TOKEN: config.slackAppToken,
-        WRAPPER_SOCKET: SOCKET_PATH,
-        SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
-        FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
-        VERBOSE: String(config.verbose),
-      },
-    };
+    specs.push({
+      name: "slack-bot",
+      json: JSON.stringify({
+        command: "node",
+        args: [join(DIST_DIR, "slack-mcp-server.js")],
+        env: {
+          SLACK_BOT_TOKEN: config.slackBotToken,
+          SLACK_APP_TOKEN: config.slackAppToken,
+          WRAPPER_SOCKET: SOCKET_PATH,
+          SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
+          FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
+          VERBOSE: String(config.verbose),
+        },
+      }),
+    });
   }
 
-  writeFileSync(MCP_CONFIG_PATH, JSON.stringify({ mcpServers }, null, 2));
+  return specs;
+}
+
+/**
+ * Run a `claude mcp ...` subcommand in the given cwd.
+ *
+ * Tries the resolved Claude path first, then falls back to invoking via the
+ * user's shell so aliases continue to work. Returns true on success.
+ */
+function runClaudeMcpCommand(args: string[], cwd: string): boolean {
+  if (resolvedClaudePath) {
+    try {
+      execFileSync(resolvedClaudePath, args, { cwd, stdio: "pipe" });
+      return true;
+    } catch {
+      // fall through to shell invocation
+    }
+  }
+
+  const shell = process.env.SHELL || "/bin/bash";
+  const cmdLine = [config.claudePath, ...args].map(shellEscape).join(" ");
+  try {
+    execSync(`${shell} -ic ${shellEscape(cmdLine)}`, { cwd, stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function registerMcpServers(cwd: string): void {
+  const specs = getMcpServerSpecs();
+  if (specs.length === 0) return;
+
+  // Remove any stale entries (e.g. from a previous crash) before re-adding.
+  for (const { name } of specs) {
+    runClaudeMcpCommand(["mcp", "remove", "-s", "local", name], cwd);
+  }
+
+  for (const { name, json } of specs) {
+    const ok = runClaudeMcpCommand(
+      ["mcp", "add-json", "-s", "local", name, json],
+      cwd,
+    );
+    if (!ok) {
+      log.error(
+        `Failed to register MCP server "${name}" in ${cwd}`,
+        new Error("claude mcp add-json failed"),
+      );
+    } else {
+      log.debug(`Registered MCP server "${name}" in ${cwd}`);
+    }
+  }
+
+  registeredCwds.add(cwd);
+}
+
+function unregisterMcpServers(cwd: string): void {
+  const specs = getMcpServerSpecs();
+  for (const { name } of specs) {
+    runClaudeMcpCommand(["mcp", "remove", "-s", "local", name], cwd);
+  }
+}
+
+function unregisterAllMcpServers(): void {
+  for (const cwd of registeredCwds) {
+    unregisterMcpServers(cwd);
+  }
+  registeredCwds.clear();
 }
 
 // ── Claude Code lifecycle ─────────────────────────────────────────────
@@ -221,8 +308,6 @@ function buildArgs(): string[] {
     ...(config.dangerouslySkipPermissions
       ? ["--dangerously-skip-permissions"]
       : []),
-    "--mcp-config",
-    MCP_CONFIG_PATH,
     "--dangerously-load-development-channels",
     ...channels,
     ...(state.model ? ["--model", state.model] : []),
@@ -322,6 +407,7 @@ function resolveClaudePath(): string | null {
 const resolvedClaudePath = resolveClaudePath();
 
 function spawnClaude(): void {
+  registerMcpServers(state.cwd);
   const args = buildArgs();
 
   const channels =
@@ -539,7 +625,6 @@ createIpcServer(SOCKET_PATH, (client) => {
 
 // ── main ──────────────────────────────────────────────────────────────
 
-generateMcpConfig();
 spawnClaude();
 
 // Graceful shutdown
@@ -548,6 +633,7 @@ function cleanup(): void {
   if (claudeProcess) {
     claudeProcess.kill();
   }
+  unregisterAllMcpServers();
   try {
     unlinkSync(SOCKET_PATH);
   } catch {
