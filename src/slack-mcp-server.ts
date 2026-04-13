@@ -106,6 +106,23 @@ function isAllowed(channelId: string): boolean {
   return ALLOWED_CHANNEL_IDS.includes(channelId);
 }
 
+/**
+ * Resolve a target channel for prompts that didn't originate from a user message.
+ *
+ * Permission and input prompts normally reuse ``lastActiveChannelId``.
+ * Before the first inbound message arrives that value is null — fall
+ * back to the sole allowlisted channel when there's exactly one.
+ */
+function resolveDefaultChannel(): { channelId: string; threadTs?: string } | null {
+  if (lastActiveChannelId) {
+    return { channelId: lastActiveChannelId, threadTs: lastActiveThreadTs };
+  }
+  if (ALLOWED_CHANNEL_IDS.length === 1) {
+    return { channelId: ALLOWED_CHANNEL_IDS[0] };
+  }
+  return null;
+}
+
 /** Log to stderr (stdout is reserved for MCP protocol). */
 function stderr(msg: string): void {
   process.stderr.write(`[slack-mcp] ${msg}\n`);
@@ -549,8 +566,10 @@ async function handlePermissionRequest(params: {
 }): Promise<void> {
   stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
 
-  if (!lastActiveChannelId) {
-    stderr("No active channel for permission request, ignoring (CLI prompt remains)");
+  const target = resolveDefaultChannel();
+  if (!target) {
+    stderr("No active channel for permission request — auto-denying");
+    await sendPermissionVerdict(params.request_id, "deny");
     return;
   }
 
@@ -563,7 +582,7 @@ async function handlePermissionRequest(params: {
     const text = `:lock: *권한 요청*: \`${params.tool_name}\`\n${action}`;
 
     await web.chat.postMessage({
-      channel: lastActiveChannelId,
+      channel: target.channelId,
       text,
       blocks: [
         {
@@ -588,10 +607,11 @@ async function handlePermissionRequest(params: {
           ],
         },
       ],
-      ...(lastActiveThreadTs ? { thread_ts: lastActiveThreadTs } : {}),
+      ...(target.threadTs ? { thread_ts: target.threadTs } : {}),
     });
   } catch (err) {
-    stderr(`Failed to send permission request to Slack: ${err}`);
+    stderr(`Failed to send permission request to Slack: ${err} — auto-denying`);
+    await sendPermissionVerdict(params.request_id, "deny");
   }
 }
 
@@ -627,31 +647,41 @@ async function handleInputRequest(
 ): Promise<void> {
   stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
 
-  if (!lastActiveChannelId) {
-    stderr("No active channel for input request, ignoring");
+  const target = resolveDefaultChannel();
+  if (!target) {
+    stderr("No active channel for input request — notifying wrapper");
+    ipc?.send({
+      type: "input_request_failed",
+      request_id: requestId,
+      reason: "no active channel",
+    } satisfies McpToWrapper);
     return;
   }
 
   try {
     pendingInputRequest = {
       request_id: requestId,
-      channelId: lastActiveChannelId,
-      threadTs: lastActiveThreadTs,
+      channelId: target.channelId,
+      threadTs: target.threadTs,
     };
 
-    // Convert Discord-style markdown to Slack mrkdwn for the question
     const text = `:question: *Claude의 질문*\n\n${question}\n\n:speech_balloon: 다음 메시지로 답변해주세요.`;
     const chunks = splitMessage(text);
     for (const chunk of chunks) {
       await web.chat.postMessage({
-        channel: lastActiveChannelId,
+        channel: target.channelId,
         text: chunk,
-        ...(lastActiveThreadTs ? { thread_ts: lastActiveThreadTs } : {}),
+        ...(target.threadTs ? { thread_ts: target.threadTs } : {}),
       });
     }
   } catch (err) {
     stderr(`Failed to send input request to Slack: ${err}`);
     pendingInputRequest = null;
+    ipc?.send({
+      type: "input_request_failed",
+      request_id: requestId,
+      reason: `send failed: ${err}`,
+    } satisfies McpToWrapper);
   }
 }
 

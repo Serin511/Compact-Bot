@@ -102,6 +102,21 @@ function isAllowed(channelId: string): boolean {
   return ALLOWED_CHANNEL_IDS.includes(channelId);
 }
 
+/**
+ * Resolve a target channel for prompts that didn't originate from a user message.
+ *
+ * Permission and input prompts normally reuse ``lastActiveChannelId`` — the
+ * channel that caused the current turn. Before the first inbound message
+ * arrives (e.g. Claude Code spontaneously asks a question on startup),
+ * that value is null. Fall back to the sole allowlisted channel when
+ * there's exactly one, so the prompt still reaches someone.
+ */
+function resolveDefaultChannelId(): string | null {
+  if (lastActiveChannelId) return lastActiveChannelId;
+  if (ALLOWED_CHANNEL_IDS.length === 1) return ALLOWED_CHANNEL_IDS[0];
+  return null;
+}
+
 /** Log to stderr (stdout is reserved for MCP protocol). */
 function stderr(msg: string): void {
   process.stderr.write(`[mcp] ${msg}\n`);
@@ -514,15 +529,20 @@ async function handlePermissionRequest(params: {
 }): Promise<void> {
   stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
 
-  if (!lastActiveChannelId) {
-    stderr("No active channel for permission request, ignoring (CLI prompt remains)");
+  const channelId = resolveDefaultChannelId();
+  if (!channelId) {
+    // No one to ask. Auto-deny so Claude Code doesn't block forever waiting
+    // for a verdict that can't be produced.
+    stderr("No active channel for permission request — auto-denying");
+    await sendPermissionVerdict(params.request_id, "deny");
     return;
   }
 
   try {
-    const channel = await discord.channels.fetch(lastActiveChannelId);
+    const channel = await discord.channels.fetch(channelId);
     if (!channel?.isTextBased()) {
-      stderr("Active channel is not text-based, ignoring");
+      stderr("Active channel is not text-based — auto-denying");
+      await sendPermissionVerdict(params.request_id, "deny");
       return;
     }
 
@@ -551,7 +571,8 @@ async function handlePermissionRequest(params: {
 
     await (channel as TextChannel).send({ content: text, components: [row] });
   } catch (err) {
-    stderr(`Failed to send permission request to Discord: ${err}`);
+    stderr(`Failed to send permission request to Discord: ${err} — auto-denying`);
+    await sendPermissionVerdict(params.request_id, "deny");
   }
 }
 
@@ -587,19 +608,30 @@ async function handleInputRequest(
 ): Promise<void> {
   stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
 
-  if (!lastActiveChannelId) {
-    stderr("No active channel for input request, ignoring");
+  const channelId = resolveDefaultChannelId();
+  if (!channelId) {
+    stderr("No active channel for input request — notifying wrapper");
+    ipc?.send({
+      type: "input_request_failed",
+      request_id: requestId,
+      reason: "no active channel",
+    } satisfies McpToWrapper);
     return;
   }
 
   try {
-    const channel = await discord.channels.fetch(lastActiveChannelId);
+    const channel = await discord.channels.fetch(channelId);
     if (!channel?.isTextBased()) {
-      stderr("Active channel is not text-based, ignoring");
+      stderr("Active channel is not text-based — notifying wrapper");
+      ipc?.send({
+        type: "input_request_failed",
+        request_id: requestId,
+        reason: "channel is not text-based",
+      } satisfies McpToWrapper);
       return;
     }
 
-    pendingInputRequest = { request_id: requestId, channelId: lastActiveChannelId };
+    pendingInputRequest = { request_id: requestId, channelId };
 
     const text = msg("inputRequest", { question });
     const chunks = splitMessage(text);
@@ -609,6 +641,11 @@ async function handleInputRequest(
   } catch (err) {
     stderr(`Failed to send input request to Discord: ${err}`);
     pendingInputRequest = null;
+    ipc?.send({
+      type: "input_request_failed",
+      request_id: requestId,
+      reason: `send failed: ${err}`,
+    } satisfies McpToWrapper);
   }
 }
 

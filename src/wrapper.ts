@@ -74,7 +74,10 @@ let spawnGrace = false;
 
 let inputIdleTimer: ReturnType<typeof setTimeout> | null = null;
 let activeInputRequestId: string | null = null;
+let inputRequestExpiry: ReturnType<typeof setTimeout> | null = null;
 const INPUT_IDLE_MS = 3000;
+/** How long to hold an active input request before giving up. */
+const INPUT_REQUEST_TTL_MS = 10 * 60 * 1000;
 let inputRequestCounter = 0;
 
 // ── virtual terminal (screen buffer) ─────────────────────────────────
@@ -126,6 +129,24 @@ function nextInputRequestId(): string {
 }
 
 /**
+ * Clear the active input request and cancel any pending TTL timer.
+ *
+ * Called on a successful response, an explicit failure notice from an
+ * MCP server, or when the TTL timer fires. Without this cleanup path
+ * a stuck ``activeInputRequestId`` would silently swallow every future
+ * prompt detection, leaving the user unable to answer anything.
+ */
+function clearActiveInputRequest(reason: string): void {
+  if (activeInputRequestId === null) return;
+  log.debug(`Clearing active input request ${activeInputRequestId}: ${reason}`);
+  activeInputRequestId = null;
+  if (inputRequestExpiry) {
+    clearTimeout(inputRequestExpiry);
+    inputRequestExpiry = null;
+  }
+}
+
+/**
  * Check the terminal for a user prompt and broadcast to MCP servers.
  */
 async function checkAndRelayUserPrompt(): Promise<void> {
@@ -138,6 +159,13 @@ async function checkAndRelayUserPrompt(): Promise<void> {
 
   const requestId = nextInputRequestId();
   activeInputRequestId = requestId;
+  inputRequestExpiry = setTimeout(() => {
+    log.error(
+      `Input request ${requestId} expired without response`,
+      new Error("input request TTL exceeded"),
+    );
+    clearActiveInputRequest("TTL expired");
+  }, INPUT_REQUEST_TTL_MS);
 
   log.debug(`User prompt detected (id=${requestId}): ${question.slice(0, 100)}`);
 
@@ -171,10 +199,26 @@ function handleInputResponse(requestId: string, answer: string): void {
   }
 
   log.debug(`Input response received (id=${requestId}): ${answer.slice(0, 100)}`);
-  activeInputRequestId = null;
+  clearActiveInputRequest("response received");
 
   // Write the answer to PTY — Claude Code reads from stdin
   writeToPty(`${answer}\r`);
+}
+
+/**
+ * Handle an MCP server giving up on an input request.
+ *
+ * Without this, a dropped prompt (e.g. no active channel, send failed)
+ * left ``activeInputRequestId`` set until the TTL expired — blocking
+ * every subsequent prompt detection for 10 minutes.
+ */
+function handleInputRequestFailed(requestId: string, reason: string): void {
+  if (activeInputRequestId !== requestId) {
+    log.debug(`Ignoring stale failure notice (expected=${activeInputRequestId}, got=${requestId})`);
+    return;
+  }
+  log.debug(`Input request ${requestId} failed: ${reason}`);
+  clearActiveInputRequest(`failed: ${reason}`);
 }
 
 // ── MCP server registration ───────────────────────────────────────────
@@ -557,7 +601,7 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
 
   // Reset input detection state
   if (inputIdleTimer) clearTimeout(inputIdleTimer);
-  activeInputRequestId = null;
+  clearActiveInputRequest("restart");
 
   // Reset virtual terminal for fresh session
   vterm.dispose();
@@ -623,6 +667,9 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
       break;
     case "input_response":
       handleInputResponse(msg.request_id, msg.answer);
+      break;
+    case "input_request_failed":
+      handleInputRequestFailed(msg.request_id, msg.reason);
       break;
   }
 }
