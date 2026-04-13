@@ -131,3 +131,9 @@ wrapper.ts (npm start)
 - All user-facing strings in Korean
 - MCP server logs to stderr (stdout reserved for MCP protocol)
 - At least one platform token (Discord or Slack) must be configured
+
+## Discord / Slack Parity Rule
+
+**Every user-facing feature, command, tool, bug fix, or behavior change must be applied to _both_ `src/mcp-server.ts` (Discord) and `src/slack-mcp-server.ts` (Slack) in the same commit.** Do not ship a change to one side only — platform differences belong in the "Platform Differences" table above, not in feature availability.
+
+When touching one MCP server, always grep the other (`grep -n "<symbol>" src/slack-mcp-server.ts`) and port the change over, adapting only for platform-specific APIs (Discord.js vs Slack Web/Socket, Unicode vs mrkdwn, message length caps, etc.). If a feature genuinely cannot be supported on one side, call that out explicitly in the PR description.
