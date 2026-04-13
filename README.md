@@ -144,7 +144,7 @@ All commands work from both Discord and Slack.
 | `/compact [hint]` | Compress context with optional focus hint |
 | `/model <name>` | Switch model — `sonnet`, `opus`, `haiku`, or full model ID |
 | `/cwd <path>` | Change Claude Code's working directory |
-| `/capture` | Capture the current CLI screen as a code block |
+| `/capture [--all]` | Capture the current CLI screen as a code block. Default sends only the visible viewport as one message; add `--all` to dump the full scrollback. Works even while Claude Code is waiting for user input |
 | `/help` | Show available commands |
 
 Any other message is forwarded to Claude as a channel notification.

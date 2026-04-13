@@ -68,6 +68,13 @@ describe("routeMessage", () => {
     expect(routeMessage("/capture")).toEqual({ type: "capture" });
   });
 
+  it("routes /capture --all with flag as args", () => {
+    expect(routeMessage("/capture --all")).toEqual({
+      type: "capture",
+      args: "--all",
+    });
+  });
+
   it("does not match partial command names", () => {
     expect(routeMessage("/compacting")).toEqual({
       type: "message",

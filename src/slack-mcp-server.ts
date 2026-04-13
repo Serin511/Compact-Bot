@@ -59,7 +59,7 @@ let pendingInputRequest: { request_id: string; channelId: string; threadTs?: str
  * Returns:
  *   The captured screen text, or null on timeout / no connection.
  */
-function requestCapture(): Promise<string | null> {
+function requestCapture(all = false): Promise<string | null> {
   return new Promise((resolve) => {
     if (!ipc) {
       resolve(null);
@@ -74,8 +74,16 @@ function requestCapture(): Promise<string | null> {
       }
     };
     ipc.on("message", handler);
-    ipc.send({ type: "capture" } satisfies McpToWrapper);
+    ipc.send({ type: "capture", all } satisfies McpToWrapper);
   });
+}
+
+/**
+ * Check whether /capture args request the full buffer (e.g. "--all", "-a", "all").
+ */
+function isCaptureAll(args: string | undefined): boolean {
+  if (!args) return false;
+  return /(^|\s)(--all|-a|all)(\s|$)/.test(args.trim());
 }
 
 function isAllowed(channelId: string): boolean {
@@ -601,8 +609,17 @@ async function handleSlackMessage(event: {
   lastActiveChannelId = event.channel;
   lastActiveThreadTs = event.thread_ts;
 
-  // If there is a pending input request, treat this message as the answer
-  if (pendingInputRequest && event.channel === pendingInputRequest.channelId) {
+  const route = routeMessage(event.text ?? "");
+  const displayName = await getUserDisplayName(event.user);
+
+  // If there is a pending input request, treat this message as the answer —
+  // except /capture, which should still run so the user can inspect the CLI
+  // state while it is waiting for input.
+  if (
+    pendingInputRequest &&
+    event.channel === pendingInputRequest.channelId &&
+    route.type !== "capture"
+  ) {
     const { request_id } = pendingInputRequest;
     pendingInputRequest = null;
     stderr(`Input response from user: ${(event.text ?? "").slice(0, 100)}`);
@@ -614,9 +631,6 @@ async function handleSlackMessage(event: {
     });
     return;
   }
-
-  const route = routeMessage(event.text ?? "");
-  const displayName = await getUserDisplayName(event.user);
 
   // Helper to reply in the same thread or channel
   const replyText = async (text: string): Promise<void> => {
@@ -673,14 +687,16 @@ async function handleSlackMessage(event: {
     }
 
     case "capture": {
+      const all = isCaptureAll(route.args);
       await replyText(msg("captureRequested"));
-      const screen = await requestCapture();
+      const screen = await requestCapture(all);
       if (!screen) {
         await replyText(msg("captureEmpty"));
         return;
       }
       const chunks = splitMessage(`\`\`\`\n${screen}\n\`\`\``);
-      for (const chunk of chunks) {
+      const toSend = all ? chunks : chunks.slice(-1);
+      for (const chunk of toSend) {
         await web.chat.postMessage({
           channel: event.channel,
           text: chunk,

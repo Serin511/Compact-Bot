@@ -84,16 +84,22 @@ let vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS, allowProposedApi: tru
 /**
  * Capture current screen content from the virtual terminal.
  *
- * Flushes pending writes first, then reads the active buffer
- * and returns non-empty lines as plain text.
+ * Flushes pending writes first, then reads the buffer contents and
+ * returns non-empty lines as plain text.
+ *
+ * Args:
+ *   all: If true, include the full scrollback history. If false
+ *     (default), only the visible viewport.
  */
-function captureScreen(): Promise<string> {
+function captureScreen(all = false): Promise<string> {
   return new Promise((resolve) => {
     // Flush pending async writes before reading the buffer
     vterm.write("", () => {
       const buf = vterm.buffer.active;
       const lines: string[] = [];
-      for (let i = 0; i < buf.length; i++) {
+      const start = all ? 0 : buf.baseY;
+      const end = all ? buf.length : buf.baseY + PTY_ROWS;
+      for (let i = start; i < end; i++) {
         const line = buf.getLine(i);
         if (line) lines.push(line.translateToString(false));
       }
@@ -601,8 +607,8 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
       restart({ cwd: msg.cwd });
       break;
     case "capture": {
-      captureScreen().then((screen) => {
-        log.debug(`Screen capture requested (${screen.length} chars)`);
+      captureScreen(msg.all === true).then((screen) => {
+        log.debug(`Screen capture requested (all=${msg.all === true}, ${screen.length} chars)`);
         sender.send({ type: "capture_result", text: screen } satisfies WrapperToMcp);
       });
       break;

@@ -58,7 +58,7 @@ let pendingInputRequest: { request_id: string; channelId: string } | null = null
  * Returns:
  *   The captured screen text, or null on timeout / no connection.
  */
-function requestCapture(): Promise<string | null> {
+function requestCapture(all = false): Promise<string | null> {
   return new Promise((resolve) => {
     if (!ipc) {
       resolve(null);
@@ -73,8 +73,16 @@ function requestCapture(): Promise<string | null> {
       }
     };
     ipc.on("message", handler);
-    ipc.send({ type: "capture" } satisfies McpToWrapper);
+    ipc.send({ type: "capture", all } satisfies McpToWrapper);
   });
+}
+
+/**
+ * Check whether /capture args request the full buffer (e.g. "--all", "-a", "all").
+ */
+function isCaptureAll(args: string | undefined): boolean {
+  if (!args) return false;
+  return /(^|\s)(--all|-a|all)(\s|$)/.test(args.trim());
 }
 
 function isAllowed(channelId: string): boolean {
@@ -548,8 +556,16 @@ async function handleDiscordMessage(message: Message): Promise<void> {
 
   lastActiveChannelId = message.channelId;
 
-  // If there is a pending input request, treat this message as the answer
-  if (pendingInputRequest && message.channelId === pendingInputRequest.channelId) {
+  const route = routeMessage(message.content);
+
+  // If there is a pending input request, treat this message as the answer —
+  // except /capture, which should still run so the user can inspect the CLI
+  // state while it is waiting for input.
+  if (
+    pendingInputRequest &&
+    message.channelId === pendingInputRequest.channelId &&
+    route.type !== "capture"
+  ) {
     const { request_id } = pendingInputRequest;
     pendingInputRequest = null;
     stderr(`Input response from user: ${message.content.slice(0, 100)}`);
@@ -557,8 +573,6 @@ async function handleDiscordMessage(message: Message): Promise<void> {
     await message.reply(msg("inputResponseSent"));
     return;
   }
-
-  const route = routeMessage(message.content);
 
   switch (route.type) {
     case "new":
@@ -606,15 +620,23 @@ async function handleDiscordMessage(message: Message): Promise<void> {
     }
 
     case "capture": {
+      const all = isCaptureAll(route.args);
       await message.reply(msg("captureRequested"));
-      const screen = await requestCapture();
+      const screen = await requestCapture(all);
       if (!screen) {
         await message.reply(msg("captureEmpty"));
         return;
       }
       const chunks = splitMessage(`\`\`\`ansi\n${screen}\n\`\`\``);
-      for (const chunk of chunks) {
-        await (message.channel as TextChannel).send(chunk);
+      if (all) {
+        for (const chunk of chunks) {
+          await (message.channel as TextChannel).send(chunk);
+        }
+      } else {
+        // Default: one-message output — send only the last chunk
+        // (most recent screen content).
+        const tail = chunks[chunks.length - 1];
+        if (tail) await (message.channel as TextChannel).send(tail);
       }
       return;
     }

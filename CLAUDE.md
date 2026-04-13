@@ -74,7 +74,7 @@ wrapper.ts (npm start)
 - **Hard restart**: `/new` kills and respawns Claude Code (fresh session)
 - **PTY commands**: `/compact`, `/clear` forwarded to CLI via PTY write (no restart, MCP connection preserved)
 - **Model/CWD change**: `/model`, `/cwd` trigger restart with new settings
-- **Screen capture**: `/capture` sends IPC request to wrapper → `@xterm/headless` virtual terminal reads PTY buffer → text returned as code block
+- **Screen capture**: `/capture` sends IPC request to wrapper → `@xterm/headless` virtual terminal reads PTY buffer → text returned as code block. Default captures only the visible viewport and sends a single message; `/capture --all` returns the full scrollback as multiple messages. `/capture` still runs while Claude Code is waiting for user input (bypasses the pending-input answer capture)
 - **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
 - **Permission relay**: When `DANGEROUSLY_SKIP_PERMISSIONS=false`, MCP servers declare `claude/channel/permission` capability. Claude Code sends `permission_request` notifications instead of PTY prompts; MCP servers show interactive buttons (Discord: ButtonBuilder, Slack: Block Kit) and relay the verdict back via `permission` notification
@@ -99,7 +99,7 @@ wrapper.ts (npm start)
 | `/compact [hint]` | Compress context | CLI `/compact` via PTY |
 | `/model <name>` | Change model (sonnet/opus/haiku or full ID) | Restart with new `--model` flag |
 | `/cwd <path>` | Change working directory | Restart with new CWD |
-| `/capture` | Capture CLI screen | IPC request → code block reply |
+| `/capture [--all]` | Capture CLI screen (default: viewport only, single message; `--all` for full scrollback) | IPC request → code block reply |
 | `/help` | Show commands | Direct Discord reply |
 
 ## Environment Variables
