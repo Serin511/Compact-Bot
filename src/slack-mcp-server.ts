@@ -41,6 +41,21 @@ const ALLOWED_CHANNEL_IDS = (process.env.SLACK_ALLOWED_CHANNEL_IDS || "")
   .filter(Boolean);
 const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
 
+/** Max time a tool invocation may take before it is treated as hung. */
+const TOOL_TIMEOUT_MS = 20_000;
+
+// Last-resort safety net — without these the process dies silently on any
+// unhandled rejection, leaving Claude Code waiting for a tool response forever.
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`[slack-mcp] unhandled rejection: ${err}\n`);
+});
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`[slack-mcp] uncaught exception: ${err}\n`);
+});
+
+/** Whether Slack's Socket Mode has finished its initial handshake. */
+let slackReady = false;
+
 // ── state ─────────────────────────────────────────────────────────────
 
 let ipc: JsonLineSocket | null = null;
@@ -179,6 +194,62 @@ mcp.server.setNotificationHandler(
   },
 );
 
+// ── tool invocation helpers ──────────────────────────────────────────
+
+/**
+ * Race a promise against a timeout.
+ *
+ * Throws ``Error("<label> timed out after <ms>ms")`` when the promise
+ * does not settle within ``ms``. Prevents a hung Slack API call from
+ * locking the session.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
+
+type ToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+};
+
+/**
+ * Wrap a tool body so every failure mode becomes an ``isError`` response.
+ *
+ * Catches thrown errors, timeouts, and rejected promises, and refuses to
+ * run tools before Slack Socket Mode has connected — otherwise Claude
+ * Code can block indefinitely on the first tool response.
+ */
+async function runTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
+  if (!slackReady) {
+    return {
+      content: [{ type: "text" as const, text: `${name} failed: Slack not ready` }],
+      isError: true,
+    };
+  }
+  try {
+    return await withTimeout(fn(), TOOL_TIMEOUT_MS, name);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    stderr(`Tool ${name} failed: ${errMsg}`);
+    return {
+      content: [{ type: "text" as const, text: `${name} failed: ${errMsg}` }],
+      isError: true,
+    };
+  }
+}
+
 // ── message splitting (Slack 4000 char limit) ──────────────────────
 
 function splitMessage(text: string, maxLen = 3900): string[] {
@@ -215,49 +286,49 @@ mcp.tool(
       .optional()
       .describe("Absolute file paths to attach (images, logs, etc). Max 10 files."),
   },
-  async ({ chat_id, text, thread_ts, files }) => {
-    const chunks = splitMessage(text);
-    const sentTimestamps: string[] = [];
+  async ({ chat_id, text, thread_ts, files }) =>
+    runTool("reply", async () => {
+      const chunks = splitMessage(text);
+      const sentTimestamps: string[] = [];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const result = await web.chat.postMessage({
-        channel: chat_id,
-        text: chunks[i],
-        ...(thread_ts ? { thread_ts } : {}),
-      });
-      if (result.ts) sentTimestamps.push(result.ts);
-
-      // Use first message's ts as thread_ts for subsequent chunks
-      if (i === 0 && result.ts && !thread_ts) {
-        thread_ts = result.ts;
-      }
-    }
-
-    // Upload files if provided
-    if (files?.length) {
-      try {
-        await web.filesUploadV2({
-          channel_id: chat_id,
-          thread_ts,
-          file_uploads: files.map((f) => ({
-            file: f,
-            filename: f.split("/").pop() ?? "file",
-          })),
+      for (let i = 0; i < chunks.length; i++) {
+        const result = await web.chat.postMessage({
+          channel: chat_id,
+          text: chunks[i],
+          ...(thread_ts ? { thread_ts } : {}),
         });
-      } catch (err) {
-        stderr(`File upload failed: ${err}`);
-      }
-    }
+        if (result.ts) sentTimestamps.push(result.ts);
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Sent ${sentTimestamps.length} message(s): ${sentTimestamps.join(", ")}`,
-        },
-      ],
-    };
-  },
+        // Use first message's ts as thread_ts for subsequent chunks
+        if (i === 0 && result.ts && !thread_ts) {
+          thread_ts = result.ts;
+        }
+      }
+
+      if (files?.length) {
+        try {
+          await web.filesUploadV2({
+            channel_id: chat_id,
+            thread_ts,
+            file_uploads: files.map((f) => ({
+              file: f,
+              filename: f.split("/").pop() ?? "file",
+            })),
+          });
+        } catch (err) {
+          stderr(`File upload failed: ${err}`);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Sent ${sentTimestamps.length} message(s): ${sentTimestamps.join(", ")}`,
+          },
+        ],
+      };
+    }),
 );
 
 mcp.tool(
@@ -268,15 +339,16 @@ mcp.tool(
     message_id: z.string().describe("Message timestamp"),
     emoji: z.string().describe("Emoji name without colons (e.g. 'thumbsup')"),
   },
-  async ({ chat_id, message_id, emoji }) => {
-    const name = emoji.replace(/^:|:$/g, "");
-    await web.reactions.add({
-      channel: chat_id,
-      timestamp: message_id,
-      name,
-    });
-    return { content: [{ type: "text" as const, text: "Reaction added" }] };
-  },
+  async ({ chat_id, message_id, emoji }) =>
+    runTool("react", async () => {
+      const name = emoji.replace(/^:|:$/g, "");
+      await web.reactions.add({
+        channel: chat_id,
+        timestamp: message_id,
+        name,
+      });
+      return { content: [{ type: "text" as const, text: "Reaction added" }] };
+    }),
 );
 
 mcp.tool(
@@ -287,14 +359,15 @@ mcp.tool(
     message_id: z.string().describe("Message timestamp to edit"),
     text: z.string().describe("New message text (Slack mrkdwn format)"),
   },
-  async ({ chat_id, message_id, text }) => {
-    await web.chat.update({
-      channel: chat_id,
-      ts: message_id,
-      text,
-    });
-    return { content: [{ type: "text" as const, text: "Message edited" }] };
-  },
+  async ({ chat_id, message_id, text }) =>
+    runTool("edit_message", async () => {
+      await web.chat.update({
+        channel: chat_id,
+        ts: message_id,
+        text,
+      });
+      return { content: [{ type: "text" as const, text: "Message edited" }] };
+    }),
 );
 
 mcp.tool(
@@ -308,41 +381,42 @@ mcp.tool(
       .default(FETCH_MESSAGE_LIMIT)
       .describe(`Max messages to fetch (default ${FETCH_MESSAGE_LIMIT}, 0 for max 500). Paginates automatically above 100.`),
   },
-  async ({ channel: channelId, limit }) => {
-    const target = limit === 0 ? 500 : limit;
-    const allMessages: Array<{ ts: string; user?: string; text?: string; files?: unknown[] }> = [];
-    let cursor: string | undefined;
+  async ({ channel: channelId, limit }) =>
+    runTool("fetch_messages", async () => {
+      const target = limit === 0 ? 500 : limit;
+      const allMessages: Array<{ ts: string; user?: string; text?: string; files?: unknown[] }> = [];
+      let cursor: string | undefined;
 
-    while (allMessages.length < target) {
-      const result = await web.conversations.history({
-        channel: channelId,
-        limit: Math.min(target - allMessages.length, 100),
-        ...(cursor ? { cursor } : {}),
-      });
-      if (!result.messages || result.messages.length === 0) break;
-      allMessages.push(...(result.messages as typeof allMessages));
-      cursor = result.response_metadata?.next_cursor;
-      if (!cursor) break;
-    }
+      while (allMessages.length < target) {
+        const result = await web.conversations.history({
+          channel: channelId,
+          limit: Math.min(target - allMessages.length, 100),
+          ...(cursor ? { cursor } : {}),
+        });
+        if (!result.messages || result.messages.length === 0) break;
+        allMessages.push(...(result.messages as typeof allMessages));
+        cursor = result.response_metadata?.next_cursor;
+        if (!cursor) break;
+      }
 
-    const lines = await Promise.all(
-      allMessages.reverse().map(async (m) => {
-        const author = m.user
-          ? m.user === botUserId
-            ? "BOT"
-            : await getUserDisplayName(m.user)
-          : "unknown";
-        const att = m.files && (m.files as unknown[]).length > 0
-          ? ` +${(m.files as unknown[]).length}att`
-          : "";
-        return `[${m.ts}] ${author}: ${(m.text ?? "").slice(0, 200)}${att}`;
-      }),
-    );
+      const lines = await Promise.all(
+        allMessages.reverse().map(async (m) => {
+          const author = m.user
+            ? m.user === botUserId
+              ? "BOT"
+              : await getUserDisplayName(m.user)
+            : "unknown";
+          const att = m.files && (m.files as unknown[]).length > 0
+            ? ` +${(m.files as unknown[]).length}att`
+            : "";
+          return `[${m.ts}] ${author}: ${(m.text ?? "").slice(0, 200)}${att}`;
+        }),
+      );
 
-    return {
-      content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
-    };
-  },
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
+      };
+    }),
 );
 
 mcp.tool(
@@ -352,33 +426,34 @@ mcp.tool(
     chat_id: z.string().describe("Slack channel ID"),
     message_id: z.string().describe("Message timestamp with attachments"),
   },
-  async ({ chat_id, message_id }) => {
-    const result = await web.conversations.history({
-      channel: chat_id,
-      latest: message_id,
-      inclusive: true,
-      limit: 1,
-    });
+  async ({ chat_id, message_id }) =>
+    runTool("download_attachment", async () => {
+      const result = await web.conversations.history({
+        channel: chat_id,
+        latest: message_id,
+        inclusive: true,
+        limit: 1,
+      });
 
-    const message = result.messages?.[0];
-    if (!message?.files || message.files.length === 0) {
+      const message = result.messages?.[0];
+      if (!message?.files || message.files.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No attachments found" }],
+        };
+      }
+
+      const { promptPrefix } = await downloadSlackAttachments(
+        message.files as SlackFile[],
+        message_id,
+        SLACK_BOT_TOKEN,
+      );
+
       return {
-        content: [{ type: "text" as const, text: "No attachments found" }],
+        content: [
+          { type: "text" as const, text: promptPrefix || "Attachments downloaded" },
+        ],
       };
-    }
-
-    const { promptPrefix } = await downloadSlackAttachments(
-      message.files as SlackFile[],
-      message_id,
-      SLACK_BOT_TOKEN,
-    );
-
-    return {
-      content: [
-        { type: "text" as const, text: promptPrefix || "Attachments downloaded" },
-      ],
-    };
-  },
+    }),
 );
 
 // ── permission prompt handling (MCP Channel protocol) ───────────────
@@ -792,8 +867,37 @@ socketMode.on("interactive", async ({ body, ack }) => {
 });
 
 socketMode.on("connected", () => {
+  slackReady = true;
   stderr("Slack Socket Mode connected");
 });
+
+socketMode.on("disconnected", () => {
+  slackReady = false;
+  stderr("Slack Socket Mode disconnected");
+});
+
+socketMode.on("error", (err) => {
+  stderr(`Slack Socket Mode error: ${err}`);
+});
+
+// ── graceful shutdown ────────────────────────────────────────────────
+//
+// Claude Code closes the MCP transport by ending our stdin. Without these
+// handlers the Slack websocket keeps the process alive as a zombie.
+
+let shuttingDown = false;
+function shutdown(reason: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  stderr(`Shutting down: ${reason}`);
+  setTimeout(() => process.exit(0), 2000).unref();
+  void Promise.resolve(socketMode.disconnect()).finally(() => process.exit(0));
+}
+
+process.stdin.on("end", () => shutdown("stdin end"));
+process.stdin.on("close", () => shutdown("stdin close"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // ── startup ───────────────────────────────────────────────────────────
 
@@ -830,8 +934,15 @@ async function main(): Promise<void> {
     stderr(`Slack auth.test failed: ${err}`);
   }
 
-  // Connect Slack Socket Mode
-  await socketMode.start();
+  // Connect Slack Socket Mode — wait for the handshake to complete before
+  // starting the MCP transport. Otherwise early tool calls can hit a
+  // half-open websocket and queue forever. The ``connected`` listener
+  // above sets ``slackReady``; runTool rejects tool calls until then as
+  // a belt-and-braces guard.
+  await new Promise<void>((resolve, reject) => {
+    socketMode.once("connected", () => resolve());
+    socketMode.start().catch(reject);
+  });
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();

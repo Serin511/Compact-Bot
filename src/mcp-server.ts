@@ -42,6 +42,18 @@ const ALLOWED_CHANNEL_IDS = (process.env.ALLOWED_CHANNEL_IDS || "")
   .filter(Boolean);
 const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
 
+/** Max time a tool invocation may take before it is treated as hung. */
+const TOOL_TIMEOUT_MS = 20_000;
+
+// Last-resort safety net — without these the process dies silently on any
+// unhandled rejection, leaving Claude Code waiting for a tool response forever.
+process.on("unhandledRejection", (err) => {
+  process.stderr.write(`[mcp] unhandled rejection: ${err}\n`);
+});
+process.on("uncaughtException", (err) => {
+  process.stderr.write(`[mcp] uncaught exception: ${err}\n`);
+});
+
 // ── state ─────────────────────────────────────────────────────────────
 
 let ipc: JsonLineSocket | null = null;
@@ -165,6 +177,63 @@ mcp.server.setNotificationHandler(
   },
 );
 
+// ── tool invocation helpers ──────────────────────────────────────────
+
+/**
+ * Race a promise against a timeout.
+ *
+ * Throws ``Error("<label> timed out after <ms>ms")`` when the promise
+ * does not settle within ``ms``. Used to prevent hung Discord API calls
+ * from locking the session — without this, a never-settling Promise
+ * leaves Claude Code spinning on a tool response forever.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(t);
+        reject(err);
+      },
+    );
+  });
+}
+
+type ToolResult = {
+  content: Array<{ type: "text"; text: string }>;
+  isError?: boolean;
+};
+
+/**
+ * Wrap a tool body so every failure mode becomes an ``isError`` response.
+ *
+ * Catches thrown errors, timeouts, and rejected promises, and refuses to
+ * run tools before the Discord Gateway is ready — the earlier
+ * implementation leaked all three as hung sessions.
+ */
+async function runTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
+  if (!discord.isReady()) {
+    return {
+      content: [{ type: "text" as const, text: `${name} failed: Discord gateway not ready` }],
+      isError: true,
+    };
+  }
+  try {
+    return await withTimeout(fn(), TOOL_TIMEOUT_MS, name);
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    stderr(`Tool ${name} failed: ${errMsg}`);
+    return {
+      content: [{ type: "text" as const, text: `${name} failed: ${errMsg}` }],
+      isError: true,
+    };
+  }
+}
+
 // ── message splitting (Discord 2000 char limit) ──────────────────────
 
 function splitMessage(text: string, maxLen = 1900): string[] {
@@ -201,38 +270,39 @@ mcp.tool(
       .optional()
       .describe("Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each."),
   },
-  async ({ chat_id, text, reply_to, files }) => {
-    const channel = await discord.channels.fetch(chat_id);
-    if (!channel?.isTextBased()) {
-      return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
-    }
+  async ({ chat_id, text, reply_to, files }) =>
+    runTool("reply", async () => {
+      const channel = await discord.channels.fetch(chat_id);
+      if (!channel?.isTextBased()) {
+        return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
+      }
 
-    const ch = channel as TextChannel;
-    const chunks = splitMessage(text);
-    const sentIds: string[] = [];
+      const ch = channel as TextChannel;
+      const chunks = splitMessage(text);
+      const sentIds: string[] = [];
 
-    for (let i = 0; i < chunks.length; i++) {
-      const sent = await ch.send({
-        content: chunks[i],
-        ...(i === 0 && reply_to
-          ? { reply: { messageReference: reply_to } }
-          : {}),
-        ...(i === 0 && files?.length
-          ? { files: files.map((f) => ({ attachment: f })) }
-          : {}),
-      });
-      sentIds.push(sent.id);
-    }
+      for (let i = 0; i < chunks.length; i++) {
+        const sent = await ch.send({
+          content: chunks[i],
+          ...(i === 0 && reply_to
+            ? { reply: { messageReference: reply_to, failIfNotExists: false } }
+            : {}),
+          ...(i === 0 && files?.length
+            ? { files: files.map((f) => ({ attachment: f })) }
+            : {}),
+        });
+        sentIds.push(sent.id);
+      }
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Sent ${sentIds.length} message(s): ${sentIds.join(", ")}`,
-        },
-      ],
-    };
-  },
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Sent ${sentIds.length} message(s): ${sentIds.join(", ")}`,
+          },
+        ],
+      };
+    }),
 );
 
 mcp.tool(
@@ -243,15 +313,16 @@ mcp.tool(
     message_id: z.string().describe("Message ID"),
     emoji: z.string().describe("Emoji to react with"),
   },
-  async ({ chat_id, message_id, emoji }) => {
-    const channel = await discord.channels.fetch(chat_id);
-    if (!channel?.isTextBased()) {
-      return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
-    }
-    const msg = await (channel as TextChannel).messages.fetch(message_id);
-    await msg.react(emoji);
-    return { content: [{ type: "text" as const, text: "Reaction added" }] };
-  },
+  async ({ chat_id, message_id, emoji }) =>
+    runTool("react", async () => {
+      const channel = await discord.channels.fetch(chat_id);
+      if (!channel?.isTextBased()) {
+        return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
+      }
+      const msg = await (channel as TextChannel).messages.fetch(message_id);
+      await msg.react(emoji);
+      return { content: [{ type: "text" as const, text: "Reaction added" }] };
+    }),
 );
 
 mcp.tool(
@@ -262,15 +333,16 @@ mcp.tool(
     message_id: z.string().describe("Message ID to edit"),
     text: z.string().describe("New message text"),
   },
-  async ({ chat_id, message_id, text }) => {
-    const channel = await discord.channels.fetch(chat_id);
-    if (!channel?.isTextBased()) {
-      return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
-    }
-    const msg = await (channel as TextChannel).messages.fetch(message_id);
-    await msg.edit(text);
-    return { content: [{ type: "text" as const, text: "Message edited" }] };
-  },
+  async ({ chat_id, message_id, text }) =>
+    runTool("edit_message", async () => {
+      const channel = await discord.channels.fetch(chat_id);
+      if (!channel?.isTextBased()) {
+        return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
+      }
+      const msg = await (channel as TextChannel).messages.fetch(message_id);
+      await msg.edit(text);
+      return { content: [{ type: "text" as const, text: "Message edited" }] };
+    }),
 );
 
 mcp.tool(
@@ -284,36 +356,37 @@ mcp.tool(
       .default(FETCH_MESSAGE_LIMIT)
       .describe(`Max messages to fetch (default ${FETCH_MESSAGE_LIMIT}, 0 for max 500). Paginates automatically above 100.`),
   },
-  async ({ channel: channelId, limit }) => {
-    const ch = await discord.channels.fetch(channelId);
-    if (!ch?.isTextBased()) {
-      return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
-    }
-    const target = limit === 0 ? 500 : limit;
-    const allMessages: Message[] = [];
-    let before: string | undefined;
+  async ({ channel: channelId, limit }) =>
+    runTool("fetch_messages", async () => {
+      const ch = await discord.channels.fetch(channelId);
+      if (!ch?.isTextBased()) {
+        return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
+      }
+      const target = limit === 0 ? 500 : limit;
+      const allMessages: Message[] = [];
+      let before: string | undefined;
 
-    while (allMessages.length < target) {
-      const batch = await (ch as TextChannel).messages.fetch({
-        limit: Math.min(target - allMessages.length, 100),
-        ...(before ? { before } : {}),
+      while (allMessages.length < target) {
+        const batch = await (ch as TextChannel).messages.fetch({
+          limit: Math.min(target - allMessages.length, 100),
+          ...(before ? { before } : {}),
+        });
+        if (batch.size === 0) break;
+        allMessages.push(...batch.values());
+        before = batch.last()!.id;
+        if (batch.size < 100) break;
+      }
+
+      const lines = allMessages.reverse().map((m) => {
+        const author = m.author.bot ? "BOT" : m.author.displayName;
+        const att =
+          m.attachments.size > 0 ? ` +${m.attachments.size}att` : "";
+        return `[${m.id}] ${author}: ${m.content.slice(0, 200)}${att}`;
       });
-      if (batch.size === 0) break;
-      allMessages.push(...batch.values());
-      before = batch.last()!.id;
-      if (batch.size < 100) break;
-    }
-
-    const lines = allMessages.reverse().map((m) => {
-      const author = m.author.bot ? "BOT" : m.author.displayName;
-      const att =
-        m.attachments.size > 0 ? ` +${m.attachments.size}att` : "";
-      return `[${m.id}] ${author}: ${m.content.slice(0, 200)}${att}`;
-    });
-    return {
-      content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
-    };
-  },
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
+      };
+    }),
 );
 
 mcp.tool(
@@ -323,24 +396,25 @@ mcp.tool(
     chat_id: z.string().describe("Discord channel ID"),
     message_id: z.string().describe("Message ID with attachments"),
   },
-  async ({ chat_id, message_id }) => {
-    const channel = await discord.channels.fetch(chat_id);
-    if (!channel?.isTextBased()) {
-      return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
-    }
-    const message = await (channel as TextChannel).messages.fetch(message_id);
-    if (message.attachments.size === 0) {
+  async ({ chat_id, message_id }) =>
+    runTool("download_attachment", async () => {
+      const channel = await discord.channels.fetch(chat_id);
+      if (!channel?.isTextBased()) {
+        return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
+      }
+      const message = await (channel as TextChannel).messages.fetch(message_id);
+      if (message.attachments.size === 0) {
+        return {
+          content: [{ type: "text" as const, text: "No attachments found" }],
+        };
+      }
+      const { promptPrefix } = await downloadAttachments(message);
       return {
-        content: [{ type: "text" as const, text: "No attachments found" }],
+        content: [
+          { type: "text" as const, text: promptPrefix || "Attachments downloaded" },
+        ],
       };
-    }
-    const { promptPrefix } = await downloadAttachments(message);
-    return {
-      content: [
-        { type: "text" as const, text: promptPrefix || "Attachments downloaded" },
-      ],
-    };
-  },
+    }),
 );
 
 // ── permission prompt handling (MCP Channel protocol) ───────────────
@@ -719,6 +793,30 @@ discord.once("ready", (c) => {
   stderr(`Discord connected as ${c.user.tag}`);
 });
 
+discord.on("error", (err) => {
+  stderr(`Discord client error: ${err}`);
+});
+
+// ── graceful shutdown ────────────────────────────────────────────────
+//
+// Claude Code closes the MCP transport by ending our stdin. Without these
+// handlers the Discord gateway keeps the process alive as a zombie —
+// holding a websocket and a PTY slot the next session can't reclaim.
+
+let shuttingDown = false;
+function shutdown(reason: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  stderr(`Shutting down: ${reason}`);
+  setTimeout(() => process.exit(0), 2000).unref();
+  void Promise.resolve(discord.destroy()).finally(() => process.exit(0));
+}
+
+process.stdin.on("end", () => shutdown("stdin end"));
+process.stdin.on("close", () => shutdown("stdin close"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
 // ── startup ───────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -745,8 +843,15 @@ async function main(): Promise<void> {
     stderr(`IPC connect failed: ${err}`);
   }
 
-  // Connect Discord
-  await discord.login(DISCORD_BOT_TOKEN);
+  // Connect Discord — discord.login() resolves after REST token validation,
+  // not when the Gateway is ready. Block on the "ready" event so that any
+  // tool call arriving on the freshly-connected MCP transport will find a
+  // usable cache and websocket. Without this wait, early calls to
+  // channels.fetch()/send() can queue forever and lock the session.
+  await new Promise<void>((resolve, reject) => {
+    discord.once("ready", () => resolve());
+    discord.login(DISCORD_BOT_TOKEN).catch(reject);
+  });
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();
