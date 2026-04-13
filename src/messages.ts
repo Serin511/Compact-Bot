@@ -39,10 +39,17 @@ const DEFAULTS: Record<string, string> = {
     "`/model <name>` — 모델 변경 (sonnet, opus, haiku)",
     "`/cwd <path>` — 작업 디렉토리 변경",
     "`/capture` — CLI 화면 캡처",
+    "`/esc` — CLI에 ESC 키 전송 (진행 중인 작업 중단)",
+    "`/raw <text>` — CLI에 텍스트를 그대로 입력 (예: `/raw /agents`)",
     "`/help` — 이 도움말",
     "",
     "그 외 메시지는 Claude에게 전달됩니다.",
   ].join("\n"),
+
+  // Passthrough commands
+  escSent: "⎋ ESC 전송됨.",
+  rawSent: "⌨️ CLI에 입력 전송됨: `{text}`",
+  rawMissing: "⚠️ 사용법: `/raw <텍스트>` (예: `/raw /agents`)",
 
   // Capture
   captureRequested: "📸 CLI 화면 캡처 중...",

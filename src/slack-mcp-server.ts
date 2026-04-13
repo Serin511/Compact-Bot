@@ -791,6 +791,21 @@ async function handleSlackMessage(event: {
       return;
     }
 
+    case "esc":
+      await replyText(msg("escSent"));
+      ipc?.send({ type: "esc" } satisfies McpToWrapper);
+      return;
+
+    case "raw": {
+      if (!route.args) {
+        await replyText(msg("rawMissing"));
+        return;
+      }
+      await replyText(msg("rawSent", { text: route.args }));
+      ipc?.send({ type: "raw", text: route.args } satisfies McpToWrapper);
+      return;
+    }
+
     case "capture": {
       const all = isCaptureAll(route.args);
       await replyText(msg("captureRequested"));

@@ -17,6 +17,8 @@ export type RouteType =
   | "help"
   | "new"
   | "capture"
+  | "esc"
+  | "raw"
   | "message";
 
 export interface RouteResult {
@@ -32,6 +34,8 @@ const COMMAND_MAP: Record<string, RouteType> = {
   "/help": "help",
   "/new": "new",
   "/capture": "capture",
+  "/esc": "esc",
+  "/raw": "raw",
 };
 
 /**

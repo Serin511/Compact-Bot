@@ -642,6 +642,20 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
       log.debug("Clear via PTY: /clear");
       writeToPty("/clear\r");
       break;
+    case "esc":
+      // Safety net — sends the ESC key to interrupt whatever Claude Code
+      // is doing. Useful when a tool call or prompt gets stuck and the
+      // user needs to break the session without a full restart.
+      log.debug("ESC via PTY");
+      writeToPty("\x1b");
+      break;
+    case "raw":
+      // Pass-through — type the given text into the CLI verbatim,
+      // followed by Enter. Lets the user run any CLI command that
+      // isn't explicitly wired into the bot (e.g. /agents, /config).
+      log.debug(`Raw PTY input: ${msg.text.slice(0, 80)}`);
+      writeToPty(`${msg.text}\r`);
+      break;
     case "model":
       log.debug(`Model change: ${msg.model}`);
       restart({ model: msg.model });

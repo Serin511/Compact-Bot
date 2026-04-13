@@ -81,4 +81,26 @@ describe("routeMessage", () => {
       args: "/compacting",
     });
   });
+
+  it("routes /esc", () => {
+    expect(routeMessage("/esc")).toEqual({ type: "esc" });
+  });
+
+  it("routes /raw with args", () => {
+    expect(routeMessage("/raw /agents")).toEqual({
+      type: "raw",
+      args: "/agents",
+    });
+  });
+
+  it("routes /raw without args", () => {
+    expect(routeMessage("/raw")).toEqual({ type: "raw" });
+  });
+
+  it("preserves the exact /raw payload including leading slashes", () => {
+    expect(routeMessage("/raw /compact focus hint")).toEqual({
+      type: "raw",
+      args: "/compact focus hint",
+    });
+  });
 });

@@ -27,7 +27,9 @@ export type McpToWrapper =
   | { type: "ready" }
   | { type: "capture"; all?: boolean }
   | { type: "input_response"; request_id: string; answer: string }
-  | { type: "input_request_failed"; request_id: string; reason: string };
+  | { type: "input_request_failed"; request_id: string; reason: string }
+  | { type: "esc" }
+  | { type: "raw"; text: string };
 
 /** Messages from wrapper → MCP server. */
 export type WrapperToMcp =

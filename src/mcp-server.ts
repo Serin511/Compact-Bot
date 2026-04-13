@@ -730,6 +730,21 @@ async function handleDiscordMessage(message: Message): Promise<void> {
       return;
     }
 
+    case "esc":
+      await message.reply(msg("escSent"));
+      ipc?.send({ type: "esc" } satisfies McpToWrapper);
+      return;
+
+    case "raw": {
+      if (!route.args) {
+        await message.reply(msg("rawMissing"));
+        return;
+      }
+      await message.reply(msg("rawSent", { text: route.args }));
+      ipc?.send({ type: "raw", text: route.args } satisfies McpToWrapper);
+      return;
+    }
+
     case "capture": {
       const all = isCaptureAll(route.args);
       await message.reply(msg("captureRequested"));
