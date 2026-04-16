@@ -40,6 +40,14 @@ const ALLOWED_CHANNEL_IDS = (process.env.SLACK_ALLOWED_CHANNEL_IDS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
+const DANGEROUSLY_SKIP_PERMISSIONS =
+  process.env.DANGEROUSLY_SKIP_PERMISSIONS === "true";
+
+/**
+ * MCP Channel spec permission request ID format: five lowercase
+ * letters from [a-km-z] (no 'l'). Used for sanity checks in logs.
+ */
+const REQUEST_ID_FORMAT = /^[a-km-z]{5}$/;
 
 /** Max time a tool invocation may take before it is treated as hung. */
 const TOOL_TIMEOUT_MS = 20_000;
@@ -157,21 +165,30 @@ async function getUserDisplayName(userId: string): Promise<string> {
 
 // ── MCP server ────────────────────────────────────────────────────────
 
+// Only declare the permission relay capability when the session actually
+// produces permission prompts. With --dangerously-skip-permissions on,
+// Claude Code never emits permission_request notifications, so the
+// capability would be misleading advertising.
+const experimentalCaps: Record<string, object> = {
+  "claude/channel": {},
+};
+if (!DANGEROUSLY_SKIP_PERMISSIONS) {
+  experimentalCaps["claude/channel/permission"] = {};
+}
+
 const mcp = new McpServer(
   { name: "slack-bot", version: "0.1.0" },
   {
     capabilities: {
       tools: {},
-      experimental: {
-        "claude/channel": {},
-        "claude/channel/permission": {},
-      },
+      experimental: experimentalCaps,
     },
     instructions: [
       "The sender reads Slack, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
       "",
-      'Messages from Slack arrive as <channel source="slack" chat_id="..." message_id="..." user="..." ts="...">.',
-      "If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them.",
+      'Messages from Slack arrive as <channel source="slack" chat_id="..." message_id="..." user="..." user_id="..." ts="...">.',
+      "If the message is in a thread, the tag also has thread_ts.",
+      "If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id, thread_ts) to fetch them. Pass thread_ts when the message is a thread reply.",
       "Reply with the reply tool — pass chat_id back.",
       "Use thread_ts to reply in a thread; omit it for top-level responses.",
       "",
@@ -184,8 +201,6 @@ const mcp = new McpServer(
       "",
       "Use Slack mrkdwn formatting: *bold*, _italic_, `code`, ```code block```, ~strikethrough~.",
       "Do NOT use Discord-style formatting (**bold**, __underline__).",
-      "",
-      "All user-facing messages should be in Korean.",
     ].join("\n"),
   },
 );
@@ -267,9 +282,16 @@ async function runTool(name: string, fn: () => Promise<ToolResult>): Promise<Too
   }
 }
 
-// ── message splitting (Slack 4000 char limit) ──────────────────────
+// ── message splitting ──────────────────────────────────────────────
+//
+// Slack's chat.postMessage accepts up to 40,000 chars in `text`, so a
+// typical reply fits in a single message. We only split when a message
+// would exceed this hard limit; the usual "chunk by 3900 for visual
+// pleasantness" behavior caused unwanted auto-threading (M8).
 
-function splitMessage(text: string, maxLen = 3900): string[] {
+const SLACK_MAX_TEXT_LEN = 39_000;
+
+function splitMessage(text: string, maxLen = SLACK_MAX_TEXT_LEN): string[] {
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
   let remaining = text;
@@ -305,28 +327,27 @@ mcp.tool(
   },
   async ({ chat_id, text, thread_ts, files }) =>
     runTool("reply", async () => {
+      // Slack allows up to 40k chars per message, so splitMessage only
+      // engages for extreme payloads. When it does split, every chunk
+      // stays at the same level (thread-or-top) as the first one — we
+      // don't auto-promote a long top-level reply into a new thread.
       const chunks = splitMessage(text);
       const sentTimestamps: string[] = [];
 
-      for (let i = 0; i < chunks.length; i++) {
+      for (const chunk of chunks) {
         const result = await web.chat.postMessage({
           channel: chat_id,
-          text: chunks[i],
+          text: chunk,
           ...(thread_ts ? { thread_ts } : {}),
         });
         if (result.ts) sentTimestamps.push(result.ts);
-
-        // Use first message's ts as thread_ts for subsequent chunks
-        if (i === 0 && result.ts && !thread_ts) {
-          thread_ts = result.ts;
-        }
       }
 
       if (files?.length) {
         try {
           await web.filesUploadV2({
             channel_id: chat_id,
-            thread_ts,
+            ...(thread_ts ? { thread_ts } : {}),
             file_uploads: files.map((f) => ({
               file: f,
               filename: f.split("/").pop() ?? "file",
@@ -358,7 +379,11 @@ mcp.tool(
   },
   async ({ chat_id, message_id, emoji }) =>
     runTool("react", async () => {
-      const name = emoji.replace(/^:|:$/g, "");
+      // Strip every colon, not just leading/trailing, so compound
+      // names like `:+1::skin-tone-2:` reduce cleanly. Slack's
+      // reactions.add only accepts a base emoji name without
+      // modifiers, and an internal colon would flat-out reject.
+      const name = emoji.replace(/:/g, "").trim();
       await web.reactions.add({
         channel: chat_id,
         timestamp: message_id,
@@ -438,21 +463,47 @@ mcp.tool(
 
 mcp.tool(
   "download_attachment",
-  "Download attachments from a specific Slack message. Returns file paths ready to Read.",
+  "Download attachments from a specific Slack message. Returns file paths ready to Read. Pass thread_ts when the target message is a thread reply; otherwise conversations.history won't find it.",
   {
     chat_id: z.string().describe("Slack channel ID"),
     message_id: z.string().describe("Message timestamp with attachments"),
+    thread_ts: z
+      .string()
+      .optional()
+      .describe(
+        "Parent thread timestamp when the message is a thread reply. Pass the thread_ts from the inbound <channel> tag.",
+      ),
   },
-  async ({ chat_id, message_id }) =>
+  async ({ chat_id, message_id, thread_ts }) =>
     runTool("download_attachment", async () => {
-      const result = await web.conversations.history({
-        channel: chat_id,
-        latest: message_id,
-        inclusive: true,
-        limit: 1,
-      });
+      // conversations.history only returns top-level channel messages,
+      // so thread replies need conversations.replies with the parent ts
+      // (M4 audit finding).
+      let message:
+        | { files?: unknown[]; ts?: string }
+        | undefined;
 
-      const message = result.messages?.[0];
+      if (thread_ts) {
+        const replies = await web.conversations.replies({
+          channel: chat_id,
+          ts: thread_ts,
+          latest: message_id,
+          inclusive: true,
+          limit: 1000,
+        });
+        message = replies.messages?.find((m) => m.ts === message_id) as
+          | typeof message
+          | undefined;
+      } else {
+        const history = await web.conversations.history({
+          channel: chat_id,
+          latest: message_id,
+          inclusive: true,
+          limit: 1,
+        });
+        message = history.messages?.[0] as typeof message | undefined;
+      }
+
       if (!message?.files || message.files.length === 0) {
         return {
           content: [{ type: "text" as const, text: "No attachments found" }],
@@ -565,6 +616,14 @@ async function handlePermissionRequest(params: {
   input_preview: string;
 }): Promise<void> {
   stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
+  if (!REQUEST_ID_FORMAT.test(params.request_id)) {
+    // Non-spec ID still works end-to-end (Claude Code accepts anything
+    // it issued), but a mismatch here usually signals a protocol drift
+    // on the Claude Code side worth investigating.
+    stderr(
+      `Warning: request_id "${params.request_id}" does not match spec format [a-km-z]{5}`,
+    );
+  }
 
   const target = resolveDefaultChannel();
   if (!target) {
@@ -770,14 +829,11 @@ async function handleSlackMessage(event: {
         await replyText(msg("modelCurrent", { model: currentModel || "(CLI default)" }));
         return;
       }
-      const modelMap: Record<string, string> = {
-        sonnet: "claude-sonnet-4-6",
-        opus: "claude-opus-4-6",
-        haiku: "claude-haiku-4-5-20251001",
-      };
-      const resolved = modelMap[route.args] ?? route.args;
-      await replyText(msg("modelChanged", { model: resolved }));
-      ipc?.send({ type: "model", model: resolved } satisfies McpToWrapper);
+      // Pass the alias straight to the CLI — Claude Code resolves
+      // sonnet/opus/haiku to the latest ID itself, so a hard-coded
+      // map here would go stale on every model bump.
+      await replyText(msg("modelChanged", { model: route.args }));
+      ipc?.send({ type: "model", model: route.args } satisfies McpToWrapper);
       return;
     }
 
@@ -838,6 +894,7 @@ async function handleSlackMessage(event: {
         chat_id: event.channel,
         message_id: event.ts,
         user: displayName,
+        user_id: event.user,
         ts: event.ts,
       };
 

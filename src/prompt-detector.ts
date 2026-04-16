@@ -10,6 +10,40 @@
  */
 
 /**
+ * Substrings that mark a prompt as off-limits for channel relay.
+ *
+ * The MCP Channel spec (code.claude.com/docs/en/channels-reference)
+ * states: "Project trust and MCP server consent dialogs don't relay;
+ * those only appear in the local terminal." We extend that rule to
+ * any tool-permission or auth prompt — a remote user answering a
+ * Bash / Write / MCP consent prompt via chat sidesteps the local
+ * dialog and bypasses the audit trail. When any keyword below
+ * appears in the detected text, we refuse to surface it to chat.
+ */
+const SECURITY_PROMPT_MARKERS = [
+  "trust this folder",
+  "trust this project",
+  "trust this workspace",
+  "mcp server",
+  "mcp config",
+  "permission to run",
+  "allow this tool",
+  "bash command",
+  "run this command",
+  "edit this file",
+  "write to this file",
+  "dangerously",
+  "api key",
+  "login",
+  "authenticate",
+];
+
+function containsSecurityMarker(text: string): boolean {
+  const lower = text.toLowerCase();
+  return SECURITY_PROMPT_MARKERS.some((m) => lower.includes(m));
+}
+
+/**
  * Detect whether the terminal screen shows an interactive user prompt.
  *
  * Claude Code's Ink UI renders user-facing questions with a text input
@@ -17,13 +51,27 @@
  * patterns: question marks, input cursors, selection markers, and known
  * prompt phrases that appear when Claude asks the user something.
  *
+ * Any prompt containing security-sensitive keywords is suppressed —
+ * see SECURITY_PROMPT_MARKERS for the rationale.
+ *
  * Args:
  *   screenText: Plain text content of the terminal screen buffer.
  *
  * Returns:
- *   The detected question text, or null if no prompt found.
+ *   The detected question text, or null if no prompt found or the
+ *   prompt looks security-sensitive.
  */
 export function detectUserPrompt(screenText: string): string | null {
+  const result = detectUserPromptRaw(screenText);
+  if (result === null) return null;
+  if (containsSecurityMarker(result)) return null;
+  // Also check the surrounding screen — a Bash approval might render
+  // the command on a separate line above the detected question.
+  if (containsSecurityMarker(screenText)) return null;
+  return result;
+}
+
+function detectUserPromptRaw(screenText: string): string | null {
   const lines = screenText.split("\n").map((l) => l.trimEnd());
 
   // Skip empty screens or screens still loading

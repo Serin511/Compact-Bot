@@ -160,12 +160,12 @@ describe("detectUserPrompt", () => {
         "Output line 1",
         "",
         "Claude has a question for you:",
-        "What API key should I use?",
+        "What should I rename this variable to?",
       ].join("\n");
 
       const result = detectUserPrompt(screen);
       expect(result).toBe(
-        "Claude has a question for you:\nWhat API key should I use?",
+        "Claude has a question for you:\nWhat should I rename this variable to?",
       );
     });
 
@@ -209,6 +209,64 @@ describe("detectUserPrompt", () => {
       const result = detectUserPrompt(screen);
       expect(result).toBe(
         "질문이 있습니다. 답변해주세요.\n어떤 파일을 수정할까요?",
+      );
+    });
+  });
+
+  // ── Security filter ────────────────────────────────────────────────
+
+  describe("security filter", () => {
+    it("suppresses project trust prompts", () => {
+      const screen = [
+        "? Do you want to trust this folder?",
+        "  Yes",
+        "  No",
+      ].join("\n");
+
+      expect(detectUserPrompt(screen)).toBeNull();
+    });
+
+    it("suppresses MCP server consent prompts", () => {
+      const screen = [
+        "? Allow this MCP server to connect?",
+        "  Yes",
+        "  No",
+      ].join("\n");
+
+      expect(detectUserPrompt(screen)).toBeNull();
+    });
+
+    it("suppresses bash permission prompts", () => {
+      const screen = [
+        "Claude wants to run a bash command:",
+        "  rm -rf /",
+        "",
+        "? Allow this tool use?",
+      ].join("\n");
+
+      expect(detectUserPrompt(screen)).toBeNull();
+    });
+
+    it("suppresses API key prompts", () => {
+      const screen = [
+        "? What API key should I use?",
+        "> ",
+      ].join("\n");
+
+      expect(detectUserPrompt(screen)).toBeNull();
+    });
+
+    it("still detects benign prompts near unrelated text", () => {
+      const screen = [
+        "Build complete.",
+        "",
+        "? What component should I refactor next?",
+        "  Button",
+        "  Card",
+      ].join("\n");
+
+      expect(detectUserPrompt(screen)).toBe(
+        "What component should I refactor next?\nButton\nCard",
       );
     });
   });

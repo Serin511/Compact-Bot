@@ -12,7 +12,75 @@
 import { createInterface } from "node:readline/promises";
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
+import { execSync } from "node:child_process";
 import { CONFIG_HOME } from "./paths.js";
+
+/** Minimum Claude Code version required for MCP channel support. */
+const REQUIRED_CLAUDE_CODE_VERSION = "2.1.81";
+
+/** Compare two semver-ish version strings. Returns -1, 0, or 1. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map((n) => parseInt(n, 10) || 0);
+  const pb = b.split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pa[i] || 0) - (pb[i] || 0);
+    if (diff !== 0) return diff < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Probe the Claude Code CLI for its version and warn if too old.
+ *
+ * Channels need v2.1.80+ and permission relay needs v2.1.81+, so we
+ * use v2.1.81 as the effective floor. A failure to detect the version
+ * (not installed, non-standard output) is surfaced as a warning rather
+ * than a fatal error — some installs may use a wrapper that mangles
+ * --version output.
+ */
+function checkClaudeCodeVersion(): void {
+  let output = "";
+  try {
+    output = execSync("claude --version", {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5000,
+    });
+  } catch {
+    console.log(
+      "  \x1b[33m⚠ claude CLI 버전을 확인하지 못했습니다.\x1b[0m",
+    );
+    console.log(
+      `    MCP Channel 기능은 claude-code v${REQUIRED_CLAUDE_CODE_VERSION}+ 가 필요합니다.`,
+    );
+    console.log();
+    return;
+  }
+
+  const match = output.match(/(\d+\.\d+\.\d+)/);
+  if (!match) {
+    console.log(
+      "  \x1b[33m⚠ claude --version 출력에서 버전을 파싱하지 못했습니다.\x1b[0m",
+    );
+    console.log();
+    return;
+  }
+
+  const installed = match[1];
+  if (compareVersions(installed, REQUIRED_CLAUDE_CODE_VERSION) < 0) {
+    console.log(
+      `  \x1b[31m⚠ claude-code v${installed} 설치됨 — v${REQUIRED_CLAUDE_CODE_VERSION}+ 필요\x1b[0m`,
+    );
+    console.log(
+      "    channels (MCP Channel 기능) 및 권한 릴레이가 동작하지 않을 수 있습니다.",
+    );
+    console.log("    업그레이드: npm install -g @anthropic-ai/claude-code");
+    console.log();
+  } else {
+    console.log(`  \x1b[32m✔ claude-code v${installed} 감지\x1b[0m`);
+    console.log();
+  }
+}
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -40,6 +108,16 @@ export async function runInit(): Promise<void> {
   console.log();
   console.log("  \x1b[1m@serin511/compact-bot\x1b[0m — 초기 설정");
   console.log(`  설정 경로: ${CONFIG_HOME}`);
+  console.log();
+
+  checkClaudeCodeVersion();
+
+  console.log("  \x1b[36m[인증 요구사항]\x1b[0m");
+  console.log("  • MCP Channel 기능은 claude.ai 로그인이 필수입니다 (Pro/Max).");
+  console.log("  • Anthropic Console API 키 인증은 지원되지 않습니다.");
+  console.log(
+    "  • Team/Enterprise 플랜에서는 관리자가 `channelsEnabled` 설정을 켜야 합니다.",
+  );
   console.log();
 
   if (existsSync(envPath)) {
@@ -80,7 +158,7 @@ export async function runInit(): Promise<void> {
 
   const model = await ask("기본 모델 (비우면 CLI 기본값)", "");
   const cwd = await ask("작업 디렉토리 (비우면 현재 폴더)", "");
-  const maxTurns = await ask("최대 턴 수 (0=무제한)", "50");
+  const maxTurns = await ask("최대 턴 수 (0=무제한)", "0");
   const skipPerms = await ask("--dangerously-skip-permissions 사용? (y/N)", "N");
 
   console.log();

@@ -34,6 +34,19 @@ export interface Config {
   slackAllowedChannelIds: string[];
 
   systemPromptPath: string;
+
+  /**
+   * Skip the `claude mcp add-json` pre-registration workaround for
+   * Claude Code 2.1.x. Set to true once the upstream regression
+   * (#37072) is confirmed fixed on your installed CLI version.
+   */
+  skipMcpRegistration: boolean;
+
+  /** PTY columns (default 200). */
+  ptyCols: number;
+
+  /** PTY rows (default 50). */
+  ptyRows: number;
 }
 
 
@@ -64,7 +77,7 @@ const _config: Config = {
   claudePath: expandTilde(optionalEnv("CLAUDE_PATH", "claude")),
   defaultModel: optionalEnv("DEFAULT_MODEL", ""),
   defaultCwd: expandTilde(optionalEnv("DEFAULT_CWD", process.cwd())),
-  maxTurns: Number(optionalEnv("MAX_TURNS", "50")),
+  maxTurns: Number(optionalEnv("MAX_TURNS", "0")),
   fetchMessageLimit: Number(optionalEnv("FETCH_MESSAGE_LIMIT", "20")),
   allowedChannelIds: optionalEnv("ALLOWED_CHANNEL_IDS", "")
     .split(",")
@@ -84,6 +97,11 @@ const _config: Config = {
       ? join(CONFIG_HOME, "system-prompt.txt")
       : "data/system-prompt.txt",
   ),
+
+  skipMcpRegistration:
+    optionalEnv("SKIP_MCP_REGISTRATION", "false") === "true",
+  ptyCols: Number(optionalEnv("PTY_COLS", "200")),
+  ptyRows: Number(optionalEnv("PTY_ROWS", "50")),
 };
 
 if (!_config.discordBotToken && !_config.slackBotToken) {

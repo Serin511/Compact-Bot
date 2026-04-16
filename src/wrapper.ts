@@ -62,13 +62,27 @@ const state: WrapperState = {
   cwd: config.defaultCwd,
 };
 
-const PTY_COLS = 200;
-const PTY_ROWS = 50;
+const PTY_COLS = config.ptyCols;
+const PTY_ROWS = config.ptyRows;
 
 let claudeProcess: pty.IPty | null = null;
 const mcpClients = new Set<JsonLineSocket>();
 let expectedExit = false;
 let spawnGrace = false;
+
+/**
+ * Exponential-backoff state for unexpected Claude Code exits.
+ *
+ * Prevents a fork-bomb when the CLI dies immediately on every spawn
+ * (bad args, missing CLI, revoked auth, etc). Resets on a run that
+ * stays up past RESPAWN_RESET_MS.
+ */
+const RESPAWN_RESET_MS = 30_000;
+const RESPAWN_MAX_ATTEMPTS = 8;
+const RESPAWN_BASE_DELAY_MS = 2000;
+let respawnAttempts = 0;
+let lastSpawnAt = 0;
+let respawnTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── user input detection state ───────────────────────────────────────
 
@@ -241,6 +255,7 @@ const registeredCwds = new Set<string>();
 
 function getMcpServerSpecs(): McpServerSpec[] {
   const specs: McpServerSpec[] = [];
+  const skipPerms = String(config.dangerouslySkipPermissions);
 
   if (config.discordBotToken) {
     specs.push({
@@ -254,6 +269,7 @@ function getMcpServerSpecs(): McpServerSpec[] {
           ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
           FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
           VERBOSE: String(config.verbose),
+          DANGEROUSLY_SKIP_PERMISSIONS: skipPerms,
         },
       }),
     });
@@ -272,6 +288,7 @@ function getMcpServerSpecs(): McpServerSpec[] {
           SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
           FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
           VERBOSE: String(config.verbose),
+          DANGEROUSLY_SKIP_PERMISSIONS: skipPerms,
         },
       }),
     });
@@ -318,6 +335,10 @@ function runClaudeMcpCommand(args: string[], cwd: string): boolean {
 }
 
 function registerMcpServers(cwd: string): void {
+  if (config.skipMcpRegistration) {
+    log.debug("SKIP_MCP_REGISTRATION=true — skipping claude mcp add-json");
+    return;
+  }
   const specs = getMcpServerSpecs();
   if (specs.length === 0) return;
 
@@ -345,6 +366,7 @@ function registerMcpServers(cwd: string): void {
 }
 
 function unregisterMcpServers(cwd: string): void {
+  if (config.skipMcpRegistration) return;
   const specs = getMcpServerSpecs();
   for (const { name } of specs) {
     runClaudeMcpCommand(["mcp", "remove", "-s", "local", name], cwd);
@@ -470,6 +492,7 @@ const resolvedClaudePath = resolveClaudePath();
 function spawnClaude(): void {
   registerMcpServers(state.cwd);
   const args = buildArgs();
+  lastSpawnAt = Date.now();
 
   const channels =
     config.allowedChannelIds.length > 0
@@ -541,26 +564,53 @@ function spawnClaude(): void {
     log.debug(`Claude Code exited (code ${exitCode})`);
     claudeProcess = null;
 
+    // A run that stayed up long enough resets the backoff counter, so a
+    // later unrelated crash doesn't inherit an escalated delay.
+    if (Date.now() - lastSpawnAt > RESPAWN_RESET_MS) {
+      respawnAttempts = 0;
+    }
+
     if (expectedExit || spawnGrace) {
       // Killed by restart() or transient startup failure — restart() handles respawn
       if (spawnGrace) {
         log.debug(`Claude Code exited during startup (code ${exitCode}), retrying...`);
         spawnGrace = false;
-        setTimeout(() => {
-          log.debug("Auto-respawning Claude Code...");
-          spawnClaude();
-        }, 2000);
+        scheduleRespawn();
       }
       expectedExit = false;
       return;
     }
 
     log.error("Claude Code exited unexpectedly", new Error(`exit ${exitCode}`));
-    setTimeout(() => {
-      log.debug("Auto-respawning Claude Code...");
-      spawnClaude();
-    }, 2000);
+    scheduleRespawn();
   });
+}
+
+/**
+ * Schedule a respawn with exponential backoff, capped by RESPAWN_MAX_ATTEMPTS.
+ *
+ * Without a cap, a CLI that dies immediately (bad args, revoked auth,
+ * missing binary) turns into a fork bomb. Without backoff, the same
+ * failure floods the log at ~30 lines/second.
+ */
+function scheduleRespawn(): void {
+  if (respawnTimer) return;
+  if (respawnAttempts >= RESPAWN_MAX_ATTEMPTS) {
+    log.error(
+      `Giving up after ${RESPAWN_MAX_ATTEMPTS} consecutive failed spawns`,
+      new Error("respawn limit exceeded"),
+    );
+    return;
+  }
+  const delay = RESPAWN_BASE_DELAY_MS * 2 ** respawnAttempts;
+  respawnAttempts += 1;
+  log.debug(
+    `Auto-respawning Claude Code in ${delay}ms (attempt ${respawnAttempts}/${RESPAWN_MAX_ATTEMPTS})...`,
+  );
+  respawnTimer = setTimeout(() => {
+    respawnTimer = null;
+    spawnClaude();
+  }, delay);
 }
 
 function killClaude(): Promise<void> {
@@ -708,6 +758,10 @@ spawnClaude();
 // Graceful shutdown
 function cleanup(): void {
   log.debug("Shutting down...");
+  if (respawnTimer) {
+    clearTimeout(respawnTimer);
+    respawnTimer = null;
+  }
   if (claudeProcess) {
     claudeProcess.kill();
   }

@@ -115,10 +115,13 @@ wrapper.ts (npm start)
 | `SLACK_ALLOWED_CHANNEL_IDS` | No | Comma-separated Slack channel IDs |
 | `DEFAULT_MODEL` | No | Claude model (default: CLI default) |
 | `DEFAULT_CWD` | No | Working directory (default: current directory) |
-| `MAX_TURNS` | No | Max turns per session (default: 50) |
+| `MAX_TURNS` | No | Max turns per session (default: 0 = unlimited) |
 | `FETCH_MESSAGE_LIMIT` | No | Default message fetch count (default: 20) |
 | `CLAUDE_PATH` | No | Path to Claude CLI (default: `claude` from PATH) |
 | `DANGEROUSLY_SKIP_PERMISSIONS` | No | Pass `--dangerously-skip-permissions` to CLI (default: false) |
+| `SKIP_MCP_REGISTRATION` | No | Skip the `claude mcp add-json` pre-registration workaround for Claude Code 2.1.x regression (default: false) |
+| `PTY_COLS` | No | PTY columns for Claude Code's Ink UI (default: 200) |
+| `PTY_ROWS` | No | PTY rows (default: 50) |
 | `VERBOSE` | No | Enable verbose logging (default: false) |
 
 ## Key Conventions
