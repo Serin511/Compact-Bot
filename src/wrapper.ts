@@ -85,18 +85,10 @@ let inputRequestCounter = 0;
 let vterm = new Terminal({ cols: PTY_COLS, rows: PTY_ROWS, allowProposedApi: true });
 
 /**
- * Capture current screen content from the virtual terminal.
- *
- * Flushes pending writes first, then reads the buffer contents and
- * returns non-empty lines as plain text.
- *
- * Args:
- *   all: If true, include the full scrollback history. If false
- *     (default), only the visible viewport.
+ * Read the current viewport (or full buffer) once, synchronously, after a flush.
  */
-function captureScreen(all = false): Promise<string> {
+function readScreenOnce(all: boolean): Promise<string> {
   return new Promise((resolve) => {
-    // Flush pending async writes before reading the buffer
     vterm.write("", () => {
       const buf = vterm.buffer.active;
       const lines: string[] = [];
@@ -106,16 +98,36 @@ function captureScreen(all = false): Promise<string> {
         const line = buf.getLine(i);
         if (line) lines.push(line.translateToString(false));
       }
-      // Trim trailing empty lines
       while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
         lines.pop();
       }
-      // Uniform width: find rightmost content column, then slice all lines
-      // to that width so right-aligned elements stay at the same column
       const maxLen = lines.reduce((m, l) => Math.max(m, l.trimEnd().length), 0);
       resolve(lines.map((l) => l.slice(0, maxLen)).join("\n"));
     });
   });
+}
+
+/**
+ * Capture current screen content from the virtual terminal.
+ *
+ * Flushes pending writes and retries on empty reads. Ink's in-place
+ * re-render ("cursor up" + "erase to end of screen" + redraw) can arrive
+ * split across PTY chunks, leaving the viewport transiently blank. A short
+ * retry window rides out that gap without hiding genuinely empty screens.
+ *
+ * Args:
+ *   all: If true, include the full scrollback history. If false
+ *     (default), only the visible viewport.
+ */
+async function captureScreen(all = false): Promise<string> {
+  const delaysMs = [40, 80];
+  let screen = await readScreenOnce(all);
+  for (const delay of delaysMs) {
+    if (screen.length > 0) return screen;
+    await new Promise((r) => setTimeout(r, delay));
+    screen = await readScreenOnce(all);
+  }
+  return screen;
 }
 
 // ── user input detection ─────────────────────────────────────────────

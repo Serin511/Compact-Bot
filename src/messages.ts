@@ -61,6 +61,7 @@ const DEFAULTS: Record<string, string> = {
   // Capture
   captureRequested: "📸 CLI 화면 캡처 중...",
   captureEmpty: "⚠️ 캡처할 화면이 없습니다.",
+  captureNoResponse: "⚠️ wrapper가 캡처 요청에 응답하지 않았습니다. Claude Code가 멈췄거나 재시작 중일 수 있습니다.",
 
   // Attachment messages
   attachmentTooLarge:

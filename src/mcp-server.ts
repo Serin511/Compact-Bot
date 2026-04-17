@@ -68,7 +68,10 @@ let pendingInputRequest: { request_id: string; channelId: string } | null = null
  * Request a screen capture from the wrapper via IPC.
  *
  * Returns:
- *   The captured screen text, or null on timeout / no connection.
+ *   The captured screen text (possibly empty string for a genuinely blank
+ *   viewport), or null when the wrapper never responded (no IPC / timeout).
+ *   Callers must distinguish the two — a null signals a likely wrapper
+ *   stall or crash, whereas "" is a real capture outcome.
  */
 function requestCapture(all = false): Promise<string | null> {
   return new Promise((resolve) => {
@@ -76,16 +79,23 @@ function requestCapture(all = false): Promise<string | null> {
       resolve(null);
       return;
     }
-    const timeout = setTimeout(() => resolve(null), 5000);
+    const localIpc = ipc;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      localIpc.removeListener("message", handler);
+    };
     const handler = (msg: WrapperToMcp) => {
       if (msg.type === "capture_result") {
-        clearTimeout(timeout);
-        ipc?.removeListener("message", handler);
+        cleanup();
         resolve(msg.text);
       }
     };
-    ipc.on("message", handler);
-    ipc.send({ type: "capture", all } satisfies McpToWrapper);
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve(null);
+    }, 5000);
+    localIpc.on("message", handler);
+    localIpc.send({ type: "capture", all } satisfies McpToWrapper);
   });
 }
 
@@ -749,7 +759,11 @@ async function handleDiscordMessage(message: Message): Promise<void> {
       const all = isCaptureAll(route.args);
       await message.reply(msg("captureRequested"));
       const screen = await requestCapture(all);
-      if (!screen) {
+      if (screen === null) {
+        await message.reply(msg("captureNoResponse"));
+        return;
+      }
+      if (screen === "") {
         await message.reply(msg("captureEmpty"));
         return;
       }
