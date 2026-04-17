@@ -61,7 +61,7 @@ const state: WrapperState = {
   cwd: config.defaultCwd,
 };
 
-const PTY_COLS = 200;
+const PTY_COLS = 75;
 const PTY_ROWS = 50;
 
 let claudeProcess: pty.IPty | null = null;
@@ -98,13 +98,12 @@ function readScreenOnce(all: boolean): Promise<string> {
       const end = all ? buf.length : buf.baseY + PTY_ROWS;
       for (let i = start; i < end; i++) {
         const line = buf.getLine(i);
-        if (line) lines.push(line.translateToString(false));
+        if (line) lines.push(line.translateToString(true).trimEnd());
       }
-      while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
+      while (lines.length > 0 && lines[lines.length - 1] === "") {
         lines.pop();
       }
-      const maxLen = lines.reduce((m, l) => Math.max(m, l.trimEnd().length), 0);
-      resolve(lines.map((l) => l.slice(0, maxLen)).join("\n"));
+      resolve(lines.join("\n"));
     });
   });
 }
