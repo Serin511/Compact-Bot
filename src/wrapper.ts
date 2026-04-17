@@ -29,7 +29,6 @@ import { fileURLToPath } from "node:url";
 import { config, loadSystemPrompt } from "./config.js";
 import { log, setVerbose } from "./logger.js";
 import { DATA_DIR } from "./paths.js";
-import { detectUserPrompt } from "./prompt-detector.js";
 import {
   createIpcServer,
   type McpToWrapper,
@@ -70,15 +69,18 @@ const mcpClients = new Set<JsonLineSocket>();
 let expectedExit = false;
 let spawnGrace = false;
 
-// ── user input detection state ───────────────────────────────────────
+// ── user input response routing state ────────────────────────────────
+//
+// The wrapper no longer scrapes the PTY for prompts (see the lengthy
+// rationale in ``onData`` below). The state below only exists to keep
+// the IPC ``input_response`` / ``input_request_failed`` path intact for
+// the day a real channel-mode question primitive ships upstream — until
+// then the slot stays null and any inbound response is ignored as stale.
 
-let inputIdleTimer: ReturnType<typeof setTimeout> | null = null;
 let activeInputRequestId: string | null = null;
 let inputRequestExpiry: ReturnType<typeof setTimeout> | null = null;
-const INPUT_IDLE_MS = 3000;
 /** How long to hold an active input request before giving up. */
 const INPUT_REQUEST_TTL_MS = 10 * 60 * 1000;
-let inputRequestCounter = 0;
 
 // ── virtual terminal (screen buffer) ─────────────────────────────────
 
@@ -130,23 +132,14 @@ async function captureScreen(all = false): Promise<string> {
   return screen;
 }
 
-// ── user input detection ─────────────────────────────────────────────
-
-/**
- * Generate a short unique request ID for input requests.
- */
-function nextInputRequestId(): string {
-  inputRequestCounter += 1;
-  return `inp_${inputRequestCounter}_${Date.now().toString(36)}`;
-}
+// ── user input response routing ───────────────────────────────────────
 
 /**
  * Clear the active input request and cancel any pending TTL timer.
  *
- * Called on a successful response, an explicit failure notice from an
- * MCP server, or when the TTL timer fires. Without this cleanup path
- * a stuck ``activeInputRequestId`` would silently swallow every future
- * prompt detection, leaving the user unable to answer anything.
+ * The wrapper does not currently produce input requests (see ``onData``);
+ * this helper exists for the IPC ``input_response`` / ``failed`` paths to
+ * stay consistent if a future code path begins setting the slot again.
  */
 function clearActiveInputRequest(reason: string): void {
   if (activeInputRequestId === null) return;
@@ -158,48 +151,9 @@ function clearActiveInputRequest(reason: string): void {
   }
 }
 
-/**
- * Check the terminal for a user prompt and broadcast to MCP servers.
- */
-async function checkAndRelayUserPrompt(): Promise<void> {
-  if (activeInputRequestId) return;
-  if (mcpClients.size === 0) return;
-
-  const screen = await captureScreen();
-  const question = detectUserPrompt(screen);
-  if (!question) return;
-
-  const requestId = nextInputRequestId();
-  activeInputRequestId = requestId;
-  inputRequestExpiry = setTimeout(() => {
-    log.error(
-      `Input request ${requestId} expired without response`,
-      new Error("input request TTL exceeded"),
-    );
-    clearActiveInputRequest("TTL expired");
-  }, INPUT_REQUEST_TTL_MS);
-
-  log.debug(`User prompt detected (id=${requestId}): ${question.slice(0, 100)}`);
-
-  const msg: WrapperToMcp = {
-    type: "input_request",
-    request_id: requestId,
-    question,
-  };
-  for (const client of mcpClients) {
-    client.send(msg);
-  }
-}
-
-/**
- * Reset the idle timer. Called on each PTY data event.
- */
-function resetInputIdleTimer(): void {
-  if (inputIdleTimer) clearTimeout(inputIdleTimer);
-  inputIdleTimer = setTimeout(() => {
-    checkAndRelayUserPrompt();
-  }, INPUT_IDLE_MS);
-}
+// Suppress "TTL constant is unused" tsc warning while keeping the timeout
+// value documented next to the slot it would govern.
+void INPUT_REQUEST_TTL_MS;
 
 /**
  * Handle a user's answer relayed from an MCP server.
@@ -541,8 +495,15 @@ function spawnClaude(): void {
       claudeProcess!.write("\r");
     }
 
-    // Reset idle timer for user input detection
-    resetInputIdleTimer();
+    // PTY-screen prompt scraping is intentionally disabled in channel mode.
+    // Empirically (see tests/ask-user-question-{repro,pipeline}.test.ts) the
+    // ``prompt-detector`` patterns match Claude's own response text — line-greedy
+    // ``?``-prefixed bullets, multi-line diff previews, and Korean substrings
+    // like "선택해주면" — and forward that mess to Slack/Discord as if it were
+    // a real interactive question. The actual `AskUserQuestion` Ink widget
+    // never reaches the PTY here because Channels mode disables that built-in
+    // tool (anthropics/claude-code#40644). Leaving the detector wired up would
+    // produce broken "Claude의 질문" relays without ever delivering a real one.
 
     if (config.verbose && clean) {
       log.debug(clean);
@@ -611,8 +572,6 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   await killClaude();
   mcpClients.clear();
 
-  // Reset input detection state
-  if (inputIdleTimer) clearTimeout(inputIdleTimer);
   clearActiveInputRequest("restart");
 
   // Reset virtual terminal for fresh session

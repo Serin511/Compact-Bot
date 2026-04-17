@@ -40,7 +40,7 @@ src/
   logger.ts                 — Structured, chalk-colored console logger
   message-router.ts         — Classifies messages as commands (/compact, /clear, /new, …) or chat
   messages.ts               — Customisable bot messages with JSON file overrides (data/messages.json)
-  prompt-detector.ts        — Detects interactive user prompts from PTY screen buffer
+  prompt-detector.ts        — PTY-screen prompt scraper (dormant — see "User input relay" below)
   attachment-handler.ts     — Downloads Discord attachments to data/attachments/, builds prompt prefix
   slack-attachment-handler.ts — Downloads Slack attachments (Bearer auth) to data/attachments/, builds prompt prefix
 tests/
@@ -78,7 +78,7 @@ wrapper.ts (npm start)
 - **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
 - **Permission relay**: When `DANGEROUSLY_SKIP_PERMISSIONS=false`, MCP servers declare `claude/channel/permission` capability. Claude Code sends `permission_request` notifications instead of PTY prompts; MCP servers show interactive buttons (Discord: ButtonBuilder, Slack: Block Kit) and relay the verdict back via `permission` notification
-- **User input relay**: When Claude Code asks the user a question via PTY prompt, the wrapper detects it after 3s idle using screen buffer analysis (prompt-detector.ts), broadcasts `input_request` via IPC to MCP servers, which display the question in Discord/Slack; the next user message is captured as the answer and relayed back to the PTY
+- **User input relay (dormant)**: The PTY-screen scraper (`prompt-detector.ts` → wrapper `input_request` IPC → MCP server `inputRequest` template) is **disabled** in channel mode. Empirical reason: Claude Code's `AskUserQuestion` Ink widget never reaches the PTY here (Channels mode disables that built-in tool, see anthropics/claude-code#40644), and the scraper's loose patterns (substring matches like "선택해주면", `?`-prefixed lines, line-greedy collection) only ever produced false-positive "Claude의 질문" relays that mangled Claude's normal response text. The detector module, IPC `input_request` type, and per-platform `handleInputRequest` paths are kept on disk so the path can be re-enabled if upstream ships a real channel-mode question primitive — see `tests/ask-user-question-{repro,pipeline}.test.ts` for the documented failure modes.
 
 ### Platform Differences
 
