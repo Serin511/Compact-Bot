@@ -180,10 +180,10 @@ const mcp = new McpServer(
     instructions: [
       "The sender reads Slack, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
       "",
-      'Messages from Slack arrive as <channel source="slack" chat_id="..." message_id="..." user="..." ts="...">.',
+      'Messages from Slack arrive as <channel source="slack" chat_id="..." message_id="..." user="..." ts="..." [thread_ts="..."]>.',
       "If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them.",
       "Reply with the reply tool — pass chat_id back.",
-      "Use thread_ts to reply in a thread; omit it for top-level responses.",
+      "Thread behaviour: pass thread_ts to reply ONLY when the inbound <channel> tag includes a thread_ts attribute — copy that exact value. For top-level messages (no thread_ts on the tag) omit thread_ts entirely. Never substitute ts, message_id, or any other value; doing so forks a brand-new thread on the user's message, which is the most common Slack-side bug.",
       "",
       "reply accepts file paths (files: ['/abs/path.png']) for attachments.",
       "Use react to add emoji reactions (name only, no colons — e.g. 'thumbsup' not ':thumbsup:').",
@@ -277,9 +277,15 @@ async function runTool(name: string, fn: () => Promise<ToolResult>): Promise<Too
   }
 }
 
-// ── message splitting (Slack 4000 char limit) ──────────────────────
+// ── message splitting (Slack 40k char request-body limit) ──────────
+//
+// chat.postMessage accepts up to ~40k characters per request. Keeping the
+// threshold just under that lets almost every reply fit in a single
+// message; only pathological cases (/capture --all on a huge scrollback)
+// actually split. Clients show a "Show more" toggle past ~4000 chars,
+// which is a better UX than fragmenting semantic output across messages.
 
-function splitMessage(text: string, maxLen = 3900): string[] {
+function splitMessage(text: string, maxLen = 39000): string[] {
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
   let remaining = text;
@@ -307,7 +313,7 @@ mcp.tool(
     thread_ts: z
       .string()
       .optional()
-      .describe("Thread timestamp to reply in a thread. Use thread_ts from the inbound <channel> block for threaded replies."),
+      .describe("Thread timestamp. Set this ONLY when the inbound <channel> tag had a thread_ts attribute — copy that value verbatim. Never pass ts or message_id here: on a top-level message it would fork a new thread."),
     files: z
       .array(z.string())
       .optional()
@@ -318,18 +324,13 @@ mcp.tool(
       const chunks = splitMessage(text);
       const sentTimestamps: string[] = [];
 
-      for (let i = 0; i < chunks.length; i++) {
+      for (const chunk of chunks) {
         const result = await web.chat.postMessage({
           channel: chat_id,
-          text: chunks[i],
+          text: chunk,
           ...(thread_ts ? { thread_ts } : {}),
         });
         if (result.ts) sentTimestamps.push(result.ts);
-
-        // Use first message's ts as thread_ts for subsequent chunks
-        if (i === 0 && result.ts && !thread_ts) {
-          thread_ts = result.ts;
-        }
       }
 
       if (files?.length) {
@@ -848,11 +849,15 @@ async function handleSlackMessage(event: {
       // Regular message → channel notification
       let content = event.text ?? "";
 
+      // Expose ts as ISO (like Discord) so the model can't confuse it with
+      // thread_ts, which is Slack's float-string timestamp format. Before
+      // this, ts duplicated message_id verbatim and Claude would pass it
+      // as thread_ts, forking a new thread on every reply.
       const meta: Record<string, string> = {
         chat_id: event.channel,
         message_id: event.ts,
         user: displayName,
-        ts: event.ts,
+        ts: new Date(parseFloat(event.ts) * 1000).toISOString(),
       };
 
       if (event.thread_ts) {

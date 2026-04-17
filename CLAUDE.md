@@ -84,7 +84,7 @@ wrapper.ts (npm start)
 
 | Aspect | Discord | Slack |
 |--------|---------|-------|
-| Message limit | 2000 chars | 4000 chars |
+| Message limit | 2000 chars | 40000 chars (clients show "Show more" past ~4000) |
 | Threading | message reference (reply_to) | thread_ts |
 | Attachments | Public CDN | url_private + Bearer auth |
 | Emoji | Unicode or `<:name:id>` | Name only (no colons) |
