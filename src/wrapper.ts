@@ -31,10 +31,13 @@ import { log, setVerbose } from "./logger.js";
 import { DATA_DIR } from "./paths.js";
 import {
   createIpcServer,
-  type McpToWrapper,
+  type PeerToWrapper,
   type WrapperToMcp,
   type JsonLineSocket,
+  type AskQuestion,
+  type AskUserQuestionInput,
 } from "./ipc.js";
+import { randomUUID } from "node:crypto";
 
 setVerbose(config.verbose);
 
@@ -69,18 +72,38 @@ const mcpClients = new Set<JsonLineSocket>();
 let expectedExit = false;
 let spawnGrace = false;
 
-// ── user input response routing state ────────────────────────────────
+// ── AskUserQuestion (hook) input routing state ───────────────────────
 //
-// The wrapper no longer scrapes the PTY for prompts (see the lengthy
-// rationale in ``onData`` below). The state below only exists to keep
-// the IPC ``input_response`` / ``input_request_failed`` path intact for
-// the day a real channel-mode question primitive ships upstream — until
-// then the slot stays null and any inbound response is ignored as stale.
+// Claude Code 2.1.132 re-enabled the built-in `AskUserQuestion` tool in
+// Channels mode. We detect the call via a PreToolUse hook (configured in
+// ``buildArgs`` / ``ASK_USER_QUESTION_HOOK_SETTINGS``) which forwards the
+// structured tool input to the wrapper over IPC before the Ink widget
+// renders. The wrapper queues each question, sends it to whichever MCP
+// server is connected, and translates the user's answer back into the
+// keystroke sequence the Ink widget expects (arrow keys + Enter, or text
+// input + Enter for the auto-added "Type something." option).
 
-let activeInputRequestId: string | null = null;
+interface PendingQuestion {
+  question: AskQuestion;
+  /** 1-based index of this question within its AskUserQuestion call. */
+  index: number;
+  total: number;
+}
+
+interface ActiveInputRequest {
+  id: string;
+  /** Snapshot of the question we relayed (used to compute key sequences). */
+  pending: PendingQuestion;
+}
+
+let activeInputRequest: ActiveInputRequest | null = null;
 let inputRequestExpiry: ReturnType<typeof setTimeout> | null = null;
 /** How long to hold an active input request before giving up. */
 const INPUT_REQUEST_TTL_MS = 10 * 60 * 1000;
+/** Questions remaining in the current AskUserQuestion call (drained as the user answers). */
+const questionQueue: PendingQuestion[] = [];
+/** Pacing between answering question N and presenting question N+1 — gives Ink time to advance. */
+const NEXT_QUESTION_DELAY_MS = 500;
 
 // ── virtual terminal (screen buffer) ─────────────────────────────────
 
@@ -131,59 +154,213 @@ async function captureScreen(all = false): Promise<string> {
   return screen;
 }
 
-// ── user input response routing ───────────────────────────────────────
+// ── AskUserQuestion input routing (hook-driven) ───────────────────────
 
 /**
  * Clear the active input request and cancel any pending TTL timer.
- *
- * The wrapper does not currently produce input requests (see ``onData``);
- * this helper exists for the IPC ``input_response`` / ``failed`` paths to
- * stay consistent if a future code path begins setting the slot again.
  */
 function clearActiveInputRequest(reason: string): void {
-  if (activeInputRequestId === null) return;
-  log.debug(`Clearing active input request ${activeInputRequestId}: ${reason}`);
-  activeInputRequestId = null;
+  if (activeInputRequest === null) return;
+  log.debug(`Clearing active input request ${activeInputRequest.id}: ${reason}`);
+  activeInputRequest = null;
   if (inputRequestExpiry) {
     clearTimeout(inputRequestExpiry);
     inputRequestExpiry = null;
   }
 }
 
-// Suppress "TTL constant is unused" tsc warning while keeping the timeout
-// value documented next to the slot it would govern.
-void INPUT_REQUEST_TTL_MS;
+/**
+ * Render a plain-text view of the question + options for the IPC `question`
+ * field (kept for log lines and channel servers that don't use the
+ * structured ``widget`` payload).
+ */
+function renderQuestionText(pending: PendingQuestion): string {
+  const { question } = pending;
+  const out: string[] = [];
+  if (question.header) out.push(`[${question.header}]`);
+  if (pending.total > 1) out.push(`(${pending.index}/${pending.total})`);
+  out.push(question.question);
+  out.push("");
+  for (let i = 0; i < question.options.length; i++) {
+    const o = question.options[i];
+    out.push(`${i + 1}. ${o.label}`);
+    if (o.description) out.push(`   ${o.description}`);
+  }
+  return out.join("\n");
+}
 
 /**
- * Handle a user's answer relayed from an MCP server.
+ * Send the next question in the queue to whichever MCP servers are
+ * connected, and arm the TTL timer.
+ *
+ * No-op when the queue is empty or another request is already in flight.
  */
-function handleInputResponse(requestId: string, answer: string): void {
-  if (activeInputRequestId !== requestId) {
-    log.debug(`Ignoring stale input response (expected=${activeInputRequestId}, got=${requestId})`);
+function presentNextQuestion(): void {
+  if (activeInputRequest) return; // already waiting on a response
+  const next = questionQueue.shift();
+  if (!next) return;
+
+  if (mcpClients.size === 0) {
+    // Nothing connected — drop the question and warn loudly. Without this
+    // guard the wrapper would silently swallow the AskUserQuestion call,
+    // leaving Claude Code stuck on the (un-rendered-to-channel) Ink widget.
+    log.error(
+      "AskUserQuestion fired but no MCP server is connected — Claude Code is now waiting on the Ink widget with no relay path",
+      new Error("no MCP client"),
+    );
     return;
   }
 
+  const requestId = randomUUID();
+  activeInputRequest = { id: requestId, pending: next };
+  inputRequestExpiry = setTimeout(() => {
+    log.debug(`Input request ${requestId} TTL expired`);
+    activeInputRequest = null;
+    inputRequestExpiry = null;
+  }, INPUT_REQUEST_TTL_MS);
+
+  const message: WrapperToMcp = {
+    type: "input_request",
+    request_id: requestId,
+    question: renderQuestionText(next),
+    widget: {
+      header: next.question.header ?? null,
+      question: next.question.question,
+      options: next.question.options.map((o) => ({
+        label: o.label,
+        description: o.description ?? null,
+      })),
+      questionIndex: next.index,
+      questionTotal: next.total,
+    },
+  };
+  log.debug(
+    `Presenting AskUserQuestion (id=${requestId}, q=${next.index}/${next.total}, options=${next.question.options.length})`,
+  );
+  for (const client of mcpClients) {
+    client.send(message);
+  }
+}
+
+/**
+ * Handle a `pre_ask_user_question` IPC message from the hook-runner.
+ *
+ * Validates the payload, queues the questions, and presents the first one.
+ * Subsequent questions wait for the previous answer to be driven into the
+ * Ink widget.
+ */
+function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
+  const questions = Array.isArray(input?.questions) ? input.questions : [];
+  if (questions.length === 0) {
+    log.debug("Ignoring pre_ask_user_question with empty questions array");
+    return;
+  }
+
+  // If a previous AskUserQuestion was somehow not drained (e.g. the user
+  // answered it via /raw on the PTY), reset state before queuing the new one.
+  if (activeInputRequest || questionQueue.length > 0) {
+    log.debug(
+      `Resetting AskUserQuestion queue (active=${activeInputRequest?.id ?? "none"}, pending=${questionQueue.length})`,
+    );
+    clearActiveInputRequest("new AskUserQuestion call superseded the old one");
+    questionQueue.length = 0;
+  }
+
+  for (let i = 0; i < questions.length; i++) {
+    questionQueue.push({
+      question: questions[i],
+      index: i + 1,
+      total: questions.length,
+    });
+  }
+  log.debug(`Queued AskUserQuestion call (${questions.length} question(s))`);
+  presentNextQuestion();
+}
+
+/**
+ * Build the keystroke sequence that selects the given option in the Ink
+ * widget. The widget always opens with focus on row 1, so we navigate
+ * downward from there.
+ *
+ * Args:
+ *   targetIndex: 1-based option row to select.
+ *
+ * Returns:
+ *   Bytes to write to the PTY: Down arrows + Enter.
+ */
+function buildSelectionKeys(targetIndex: number): string {
+  const downCount = Math.max(0, targetIndex - 1);
+  return "\x1b[B".repeat(downCount) + "\r";
+}
+
+/**
+ * Translate a user's answer into PTY keystrokes for the Ink widget.
+ *
+ * The widget renders user-defined options 1..N followed by an auto-added
+ * "Type something." row at position N+1 for free-form answers. Selection
+ * rules:
+ *   - "1".."N" → press Down (n-1) times, then Enter.
+ *   - any other text → navigate to the "Type something." row (Down N times,
+ *     Enter), wait for Ink to mount the text field, type the answer, Enter.
+ */
+function handleInputResponse(requestId: string, answer: string): void {
+  if (!activeInputRequest || activeInputRequest.id !== requestId) {
+    log.debug(
+      `Ignoring stale input response (expected=${activeInputRequest?.id}, got=${requestId})`,
+    );
+    return;
+  }
+
+  const pending = activeInputRequest.pending;
+  const optionCount = pending.question.options.length;
   log.debug(`Input response received (id=${requestId}): ${answer.slice(0, 100)}`);
   clearActiveInputRequest("response received");
 
-  // Write the answer to PTY — Claude Code reads from stdin
-  writeToPty(`${answer}\r`);
+  const trimmed = answer.trim();
+  const numMatch = /^(\d+)$/.exec(trimmed);
+  let consumed = false;
+  if (numMatch) {
+    const n = parseInt(numMatch[1], 10);
+    if (n >= 1 && n <= optionCount) {
+      writeToPty(buildSelectionKeys(n));
+      consumed = true;
+    }
+  }
+
+  if (!consumed) {
+    // Custom-answer path: navigate to "Type something." (row optionCount+1),
+    // Enter to mount the text input, type, Enter to submit. The 100ms gap
+    // gives Ink time to mount the input field — without it the first few
+    // characters of the answer are sometimes dropped.
+    const customAnswerIndex = optionCount + 1;
+    writeToPty(buildSelectionKeys(customAnswerIndex));
+    setTimeout(() => writeToPty(`${answer}\r`), 100);
+  }
+
+  // Pace the next question so Ink finishes the page transition before the
+  // user sees a fresh prompt on Discord / Slack.
+  setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
 }
 
 /**
  * Handle an MCP server giving up on an input request.
  *
  * Without this, a dropped prompt (e.g. no active channel, send failed)
- * left ``activeInputRequestId`` set until the TTL expired — blocking
- * every subsequent prompt detection for 10 minutes.
+ * left the slot set until the TTL expired — blocking every subsequent
+ * AskUserQuestion call for 10 minutes.
  */
 function handleInputRequestFailed(requestId: string, reason: string): void {
-  if (activeInputRequestId !== requestId) {
-    log.debug(`Ignoring stale failure notice (expected=${activeInputRequestId}, got=${requestId})`);
+  if (!activeInputRequest || activeInputRequest.id !== requestId) {
+    log.debug(
+      `Ignoring stale failure notice (expected=${activeInputRequest?.id}, got=${requestId})`,
+    );
     return;
   }
   log.debug(`Input request ${requestId} failed: ${reason}`);
   clearActiveInputRequest(`failed: ${reason}`);
+  // Drop the rest of the call too — without a path to the user we can't
+  // collect the remaining answers either.
+  questionQueue.length = 0;
 }
 
 // ── MCP server registration ───────────────────────────────────────────
@@ -325,6 +502,32 @@ function unregisterAllMcpServers(): void {
 
 // ── Claude Code lifecycle ─────────────────────────────────────────────
 
+const HOOK_RUNNER_PATH = join(DIST_DIR, "hook-runner.js");
+
+/**
+ * Build a JSON settings blob that wires our PreToolUse hook for
+ * AskUserQuestion. Claude Code merges this with the user's regular
+ * settings, so existing hooks are preserved.
+ */
+function buildAskUserQuestionHookSettings(): string {
+  return JSON.stringify({
+    hooks: {
+      PreToolUse: [
+        {
+          matcher: "AskUserQuestion",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${shellEscape(HOOK_RUNNER_PATH)}`,
+              timeout: 3,
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
 function buildArgs(): string[] {
   const channels: string[] = [];
   if (config.discordBotToken) channels.push("server:discord-bot");
@@ -337,6 +540,8 @@ function buildArgs(): string[] {
     "--dangerously-load-development-channels",
     ...channels,
     ...(state.model ? ["--model", state.model] : []),
+    "--settings",
+    buildAskUserQuestionHookSettings(),
   ];
 
   const systemPrompt = loadSystemPrompt();
@@ -447,7 +652,11 @@ function spawnClaude(): void {
     cols: PTY_COLS,
     rows: PTY_ROWS,
     cwd: state.cwd,
-    env: process.env as Record<string, string>,
+    env: {
+      ...process.env,
+      // Exposed so the PreToolUse hook can reach the wrapper's IPC socket.
+      COMPACT_BOT_WRAPPER_SOCKET: SOCKET_PATH,
+    } as Record<string, string>,
   };
 
   // Strategy 1: Spawn via user's shell (handles aliases, scripts, PATH)
@@ -494,15 +703,11 @@ function spawnClaude(): void {
       claudeProcess!.write("\r");
     }
 
-    // PTY-screen prompt scraping is intentionally disabled in channel mode.
-    // Empirically (see tests/ask-user-question-{repro,pipeline}.test.ts) the
-    // ``prompt-detector`` patterns match Claude's own response text — line-greedy
-    // ``?``-prefixed bullets, multi-line diff previews, and Korean substrings
-    // like "선택해주면" — and forward that mess to Slack/Discord as if it were
-    // a real interactive question. The actual `AskUserQuestion` Ink widget
-    // never reaches the PTY here because Channels mode disables that built-in
-    // tool (anthropics/claude-code#40644). Leaving the detector wired up would
-    // produce broken "Claude의 질문" relays without ever delivering a real one.
+    // AskUserQuestion is captured via a PreToolUse hook (see
+    // ``buildAskUserQuestionHookSettings``), not by scraping this stream —
+    // the hook receives the structured questions/options before Ink even
+    // begins rendering, so the wrapper has clean data without parsing the
+    // PTY. Selection keystrokes go back through ``writeToPty``.
 
     if (config.verbose && clean) {
       log.debug(clean);
@@ -572,6 +777,7 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   mcpClients.clear();
 
   clearActiveInputRequest("restart");
+  questionQueue.length = 0;
 
   // Reset virtual terminal for fresh session
   vterm.dispose();
@@ -596,11 +802,17 @@ function writeToPty(text: string): void {
   claudeProcess.write(text);
 }
 
-function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
+function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
   switch (msg.type) {
     case "restart":
       log.debug(`Restart requested: ${msg.reason}`);
       restart();
+      break;
+    case "pre_ask_user_question":
+      log.debug(
+        `pre_ask_user_question received (${msg.tool_input?.questions?.length ?? 0} question(s))`,
+      );
+      handlePreAskUserQuestion(msg.tool_input);
       break;
     case "compact": {
       const hint = msg.hint ? ` ${msg.hint}` : "";
@@ -662,7 +874,7 @@ function handleIpcMessage(msg: McpToWrapper, sender: JsonLineSocket): void {
 
 createIpcServer(SOCKET_PATH, (client) => {
   mcpClients.add(client);
-  client.on("message", (msg: McpToWrapper) => handleIpcMessage(msg, client));
+  client.on("message", (msg: PeerToWrapper) => handleIpcMessage(msg, client));
   client.on("close", () => {
     mcpClients.delete(client);
   });

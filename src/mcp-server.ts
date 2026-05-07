@@ -27,6 +27,7 @@ import {
   type McpToWrapper,
   type WrapperToMcp,
   type JsonLineSocket,
+  type IpcAskWidget,
 } from "./ipc.js";
 import { routeMessage } from "./message-router.js";
 import { downloadAttachments } from "./attachment-handler.js";
@@ -607,6 +608,35 @@ async function sendPermissionVerdict(
 // ── user input request handling (PTY prompt relay) ───────────────────
 
 /**
+ * Format an AskUserQuestion widget for Discord using markdown.
+ *
+ * Renders the header chip + question + numbered option list with
+ * indented descriptions. Falls back to the wrapper's plain-text rendering
+ * when no structured widget data is supplied (legacy / debug paths).
+ */
+function formatAskUserQuestion(widget: IpcAskWidget | undefined, fallback: string): string {
+  if (!widget) return fallback;
+  const lines: string[] = ["❓ **Claude의 질문**"];
+  if (widget.questionTotal > 1) {
+    lines.push(`*(질문 ${widget.questionIndex}/${widget.questionTotal})*`);
+  }
+  if (widget.header) lines.push(`\`${widget.header}\``);
+  lines.push("");
+  lines.push(widget.question);
+  lines.push("");
+  for (let i = 0; i < widget.options.length; i++) {
+    const o = widget.options[i];
+    lines.push(`**${i + 1}.** ${o.label}`);
+    if (o.description) lines.push(`   ${o.description}`);
+  }
+  lines.push("");
+  lines.push(
+    `💬 번호(\`1\`–\`${widget.options.length}\`)로 선택하거나, 자유 답변은 텍스트로 입력하세요.`,
+  );
+  return lines.join("\n");
+}
+
+/**
  * Handle a user input request relayed from the wrapper.
  *
  * Displays the question in Discord and sets a pending flag so the next
@@ -615,6 +645,7 @@ async function sendPermissionVerdict(
 async function handleInputRequest(
   requestId: string,
   question: string,
+  widget: IpcAskWidget | undefined,
 ): Promise<void> {
   stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
 
@@ -643,7 +674,7 @@ async function handleInputRequest(
 
     pendingInputRequest = { request_id: requestId, channelId };
 
-    const text = msg("inputRequest", { question });
+    const text = formatAskUserQuestion(widget, msg("inputRequest", { question }));
     const chunks = splitMessage(text);
     for (const chunk of chunks) {
       await (channel as TextChannel).send(chunk);
@@ -895,7 +926,7 @@ async function main(): Promise<void> {
         currentCwd = ipcMsg.cwd;
         stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
       } else if (ipcMsg.type === "input_request") {
-        handleInputRequest(ipcMsg.request_id, ipcMsg.question).catch((err) => {
+        handleInputRequest(ipcMsg.request_id, ipcMsg.question, ipcMsg.widget).catch((err) => {
           stderr(`Input request handler error: ${err}`);
         });
       }

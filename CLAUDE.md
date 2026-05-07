@@ -35,12 +35,12 @@ src/
   wrapper.ts                — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
   mcp-server.ts             — MCP Channel server: Discord client, channel notifications, tool handlers
   slack-mcp-server.ts       — MCP Channel server: Slack client (Socket Mode + Web API), channel notifications, tool handlers
-  ipc.ts                    — Unix domain socket IPC protocol between wrapper and MCP servers
+  ipc.ts                    — Unix domain socket IPC protocol (wrapper ↔ MCP servers + hook-runner)
   config.ts                 — Env-based configuration, compact prompt, allowed tools list, system prompt loader
   logger.ts                 — Structured, chalk-colored console logger
   message-router.ts         — Classifies messages as commands (/compact, /clear, /new, …) or chat
   messages.ts               — Customisable bot messages with JSON file overrides (data/messages.json)
-  prompt-detector.ts        — PTY-screen prompt scraper (dormant — see "User input relay" below)
+  hook-runner.ts            — PreToolUse hook for AskUserQuestion (forwards tool_input → wrapper IPC)
   attachment-handler.ts     — Downloads Discord attachments to data/attachments/, builds prompt prefix
   slack-attachment-handler.ts — Downloads Slack attachments (Bearer auth) to data/attachments/, builds prompt prefix
 tests/
@@ -78,7 +78,7 @@ wrapper.ts (npm start)
 - **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
 - **Permission relay**: When `DANGEROUSLY_SKIP_PERMISSIONS=false`, MCP servers declare `claude/channel/permission` capability. Claude Code sends `permission_request` notifications instead of PTY prompts; MCP servers show interactive buttons (Discord: ButtonBuilder, Slack: Block Kit) and relay the verdict back via `permission` notification
-- **User input relay (dormant)**: The PTY-screen scraper (`prompt-detector.ts` → wrapper `input_request` IPC → MCP server `inputRequest` template) is **disabled** in channel mode. Empirical reason: Claude Code's `AskUserQuestion` Ink widget never reaches the PTY here (Channels mode disables that built-in tool, see anthropics/claude-code#40644), and the scraper's loose patterns (substring matches like "선택해주면", `?`-prefixed lines, line-greedy collection) only ever produced false-positive "Claude의 질문" relays that mangled Claude's normal response text. The detector module, IPC `input_request` type, and per-platform `handleInputRequest` paths are kept on disk so the path can be re-enabled if upstream ships a real channel-mode question primitive — see `tests/ask-user-question-{repro,pipeline}.test.ts` for the documented failure modes.
+- **AskUserQuestion relay (Claude Code 2.1.132+)**: Channels mode re-enabled the built-in `AskUserQuestion` tool, but it has no JSON-RPC notification — the Ink widget renders directly to the PTY. The wrapper attaches a `PreToolUse` hook (matcher `AskUserQuestion`) via `--settings`. The hook (`hook-runner.ts`) reads the tool event from stdin, forwards `tool_input` (questions, options, descriptions, previews) to the wrapper over `wrapper.sock`, and exits with `{}` (allow). The wrapper queues each question, sends a structured `input_request` to the connected MCP server, and translates the user's reply into PTY keystrokes (`Down × (n−1) + Enter` for option `n`; `Down × N + Enter` then text + `Enter` for the auto-added "Type something." custom answer). Claude Code sees a normal AskUserQuestion tool result. The PreToolUse hook is co-installed at `dist/hook-runner.js`; the wrapper exposes `COMPACT_BOT_WRAPPER_SOCKET` to the spawned Claude Code process so the hook can reach the socket regardless of CWD.
 
 ### Platform Differences
 

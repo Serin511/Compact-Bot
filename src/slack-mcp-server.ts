@@ -22,6 +22,7 @@ import {
   type McpToWrapper,
   type WrapperToMcp,
   type JsonLineSocket,
+  type IpcAskWidget,
 } from "./ipc.js";
 import { routeMessage } from "./message-router.js";
 import {
@@ -647,6 +648,35 @@ async function sendPermissionVerdict(
 // ── user input request handling (PTY prompt relay) ───────────────────
 
 /**
+ * Format an AskUserQuestion widget for Slack using mrkdwn.
+ *
+ * Renders the header chip + question + numbered option list. Falls back
+ * to the wrapper's plain-text rendering when no structured widget data
+ * is supplied.
+ */
+function formatAskUserQuestion(widget: IpcAskWidget | undefined, fallback: string): string {
+  if (!widget) return fallback;
+  const lines: string[] = [":question: *Claude의 질문*"];
+  if (widget.questionTotal > 1) {
+    lines.push(`_(질문 ${widget.questionIndex}/${widget.questionTotal})_`);
+  }
+  if (widget.header) lines.push(`\`${widget.header}\``);
+  lines.push("");
+  lines.push(widget.question);
+  lines.push("");
+  for (let i = 0; i < widget.options.length; i++) {
+    const o = widget.options[i];
+    lines.push(`*${i + 1}.* ${o.label}`);
+    if (o.description) lines.push(`   ${o.description}`);
+  }
+  lines.push("");
+  lines.push(
+    `:speech_balloon: 번호(\`1\`–\`${widget.options.length}\`)로 선택하거나, 자유 답변은 텍스트로 입력하세요.`,
+  );
+  return lines.join("\n");
+}
+
+/**
  * Handle a user input request relayed from the wrapper.
  *
  * Displays the question in Slack and sets a pending flag so the next
@@ -655,6 +685,7 @@ async function sendPermissionVerdict(
 async function handleInputRequest(
   requestId: string,
   question: string,
+  widget: IpcAskWidget | undefined,
 ): Promise<void> {
   stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
 
@@ -676,7 +707,10 @@ async function handleInputRequest(
       threadTs: target.threadTs,
     };
 
-    const text = `:question: *Claude의 질문*\n\n${question}\n\n:speech_balloon: 다음 메시지로 답변해주세요.`;
+    const text = formatAskUserQuestion(
+      widget,
+      `:question: *Claude의 질문*\n\n${question}\n\n:speech_balloon: 다음 메시지로 답변해주세요.`,
+    );
     const chunks = splitMessage(text);
     for (const chunk of chunks) {
       await web.chat.postMessage({
@@ -975,7 +1009,7 @@ async function main(): Promise<void> {
         currentCwd = ipcMsg.cwd;
         stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
       } else if (ipcMsg.type === "input_request") {
-        handleInputRequest(ipcMsg.request_id, ipcMsg.question).catch((err) => {
+        handleInputRequest(ipcMsg.request_id, ipcMsg.question, ipcMsg.widget).catch((err) => {
           stderr(`Input request handler error: ${err}`);
         });
       }

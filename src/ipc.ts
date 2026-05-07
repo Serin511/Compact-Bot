@@ -1,11 +1,16 @@
 /**
- * IPC protocol between wrapper and MCP server via Unix domain socket.
+ * IPC protocol between the wrapper and its peers via Unix domain socket.
  *
- * The wrapper creates a socket server; the MCP server connects as a client.
- * Messages are exchanged as newline-delimited JSON.
+ * The wrapper creates a socket server. Two kinds of clients connect:
+ *   1. MCP servers (Discord / Slack), bidirectional and long-lived.
+ *   2. The hook-runner subprocess spawned by Claude Code's PreToolUse hook,
+ *      one-shot and write-only — it forwards the AskUserQuestion tool input
+ *      and exits immediately so Claude Code can render the Ink widget.
+ *
+ * All messages are newline-delimited JSON.
  *
  * Exports:
- *   McpToWrapper, WrapperToMcp, JsonLineSocket, createIpcServer, connectToWrapper.
+ *   PeerToWrapper, WrapperToMcp, JsonLineSocket, createIpcServer, connectToWrapper.
  */
 
 import {
@@ -17,8 +22,50 @@ import {
 import { unlinkSync } from "node:fs";
 import { EventEmitter } from "node:events";
 
-/** Messages from MCP server → wrapper. */
-export type McpToWrapper =
+/** A single AskUserQuestion option as relayed over IPC. */
+export interface IpcAskOption {
+  label: string;
+  description: string | null;
+}
+
+/** Structured AskUserQuestion payload carried by `input_request` to MCP servers. */
+export interface IpcAskWidget {
+  header: string | null;
+  question: string;
+  options: IpcAskOption[];
+  /** 1-based question index within the call. 1 when there's only one question. */
+  questionIndex: number;
+  /** Total number of questions in this AskUserQuestion call (1..4). */
+  questionTotal: number;
+}
+
+/**
+ * Single question structure as Claude Code passes it to the PreToolUse hook.
+ *
+ * Mirrors the AskUserQuestion tool's input schema (see Claude Code 2.1.132+):
+ * 1-4 questions per call, each with 2-4 options, optional preview / multi-select.
+ * The wrapper only consumes a subset of these fields — preview rendering and
+ * multi-select are downgraded to plain-text on the channel side.
+ */
+export interface AskQuestion {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: Array<{
+    label: string;
+    description?: string;
+    preview?: string;
+  }>;
+}
+
+/** Tool input shape Claude Code passes to the PreToolUse hook for AskUserQuestion. */
+export interface AskUserQuestionInput {
+  questions: AskQuestion[];
+}
+
+/** Messages received by the wrapper. */
+export type PeerToWrapper =
+  // ── from MCP servers ──
   | { type: "restart"; reason: "new" }
   | { type: "compact"; hint?: string }
   | { type: "clear" }
@@ -29,13 +76,28 @@ export type McpToWrapper =
   | { type: "input_response"; request_id: string; answer: string }
   | { type: "input_request_failed"; request_id: string; reason: string }
   | { type: "esc" }
-  | { type: "raw"; text: string };
+  | { type: "raw"; text: string }
+  // ── from the hook-runner subprocess ──
+  | { type: "pre_ask_user_question"; tool_input: AskUserQuestionInput };
+
+/**
+ * Backwards-compat alias — older code in mcp-server / slack-mcp-server still
+ * imports this name. New code should prefer ``PeerToWrapper``.
+ */
+export type McpToWrapper = PeerToWrapper;
 
 /** Messages from wrapper → MCP server. */
 export type WrapperToMcp =
   | { type: "config"; model: string; cwd: string }
   | { type: "capture_result"; text: string }
-  | { type: "input_request"; request_id: string; question: string };
+  | {
+      type: "input_request";
+      request_id: string;
+      /** Plain-text rendering of the widget — used as a log preview. */
+      question: string;
+      /** Structured widget data (always present for AskUserQuestion). */
+      widget?: IpcAskWidget;
+    };
 
 /**
  * Bidirectional JSON-line protocol over a raw socket.
@@ -63,7 +125,7 @@ export class JsonLineSocket extends EventEmitter {
     socket.on("error", (err) => this.emit("error", err));
   }
 
-  send(msg: McpToWrapper | WrapperToMcp): void {
+  send(msg: PeerToWrapper | WrapperToMcp): void {
     this.socket.write(JSON.stringify(msg) + "\n");
   }
 
@@ -77,7 +139,7 @@ export class JsonLineSocket extends EventEmitter {
  *
  * Args:
  *   socketPath: Unix domain socket path.
- *   onConnection: Called when the MCP server connects.
+ *   onConnection: Called for each connecting peer.
  *
  * Returns:
  *   The net.Server instance.
@@ -100,7 +162,7 @@ export function createIpcServer(
 }
 
 /**
- * Connect to the wrapper's IPC socket (MCP server side).
+ * Connect to the wrapper's IPC socket (peer side — MCP server or hook-runner).
  *
  * Args:
  *   socketPath: Unix domain socket path.
