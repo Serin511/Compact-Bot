@@ -1015,8 +1015,13 @@ async function main(): Promise<void> {
       }
     });
     ipc.on("close", () => {
-      stderr("Wrapper IPC disconnected");
+      stderr("Wrapper IPC disconnected — exiting to avoid zombie state");
       ipc = null;
+      // Exiting prevents this mcp from staying connected to Slack Socket Mode
+      // after its wrapper is gone (or after a new wrapper takes over the socket).
+      // Without this, stale mcps hijack a portion of incoming messages via
+      // Socket Mode round-robin and reply with captureNoResponse / lose user msgs.
+      setTimeout(() => process.exit(0), 100);
     });
     ipc.send({ type: "ready" } satisfies McpToWrapper);
   } catch (err) {

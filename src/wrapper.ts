@@ -459,9 +459,45 @@ function runClaudeMcpCommand(args: string[], cwd: string): boolean {
   }
 }
 
+/**
+ * Kill stale mcp-server processes from previous wrapper runs.
+ *
+ * Claude Code spawns MCP servers as detached children, and on Claude Code
+ * SIGKILL the children don't always receive a clean SIGTERM. They survive
+ * holding onto Discord Gateway / Slack Socket Mode connections, hijack a
+ * portion of inbound messages via round-robin, and reply with stale state
+ * (captureNoResponse, lost user msgs). The new wrapper's IPC server takes
+ * over the socket path, but the zombies' ipc close handler may be from an
+ * older build that doesn't self-exit.
+ *
+ * We unconditionally SIGKILL any leftover compact-bot mcp processes before
+ * spawning Claude Code. Safe because legitimate same-host instances of this
+ * bot are not supported (single SOCKET_PATH).
+ */
+function killStaleMcpServers(): void {
+  const distMcp = join(DIST_DIR, "mcp-server.js");
+  const distSlack = join(DIST_DIR, "slack-mcp-server.js");
+  for (const target of [distMcp, distSlack]) {
+    try {
+      execSync(`pkill -9 -f ${shellEscape(target)}`, {
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 2000,
+      });
+      log.debug(`Killed stale processes matching ${target}`);
+    } catch {
+      // pkill exits 1 when nothing matches — that's the healthy case
+    }
+  }
+}
+
 function registerMcpServers(cwd: string): void {
   const specs = getMcpServerSpecs();
   if (specs.length === 0) return;
+
+  // Kill any leftover mcp-server processes from previous wrapper runs before
+  // re-registering — otherwise zombies hold Slack/Discord connections and
+  // hijack a portion of inbound messages via round-robin.
+  killStaleMcpServers();
 
   // Remove any stale entries (e.g. from a previous crash) before re-adding.
   for (const { name } of specs) {
