@@ -104,6 +104,22 @@ const INPUT_REQUEST_TTL_MS = 10 * 60 * 1000;
 const questionQueue: PendingQuestion[] = [];
 /** Pacing between answering question N and presenting question N+1 — gives Ink time to advance. */
 const NEXT_QUESTION_DELAY_MS = 500;
+/** Extra wait for the custom-answer (free-text) path before sending Submit. */
+const CUSTOM_ANSWER_INPUT_DELAY_MS = 100;
+/**
+ * After the final answer, Ink *may* render a "Ready to submit your answers?"
+ * confirmation page (only on multi-question calls). We detect that page by
+ * scanning the virtual terminal for distinctive text rather than guessing
+ * from the question count — that way a single-question call where the page
+ * never appears never receives a stray Enter.
+ */
+const SUBMIT_PAGE_PATTERN = /Submit answers|Ready to submit/i;
+/** Initial delay before we start polling the screen for the Submit page. */
+const SUBMIT_DETECT_INITIAL_DELAY_MS = 200;
+/** Poll interval while waiting for the Submit page text to appear. */
+const SUBMIT_DETECT_POLL_MS = 100;
+/** Give up looking for the Submit page after this much wall-clock time. */
+const SUBMIT_DETECT_TIMEOUT_MS = 1500;
 
 // ── virtual terminal (screen buffer) ─────────────────────────────────
 
@@ -303,6 +319,24 @@ function buildSelectionKeys(targetIndex: number): string {
  *   - any other text → navigate to the "Type something." row (Down N times,
  *     Enter), wait for Ink to mount the text field, type the answer, Enter.
  */
+/**
+ * Poll the virtual terminal for the AskUserQuestion submit-confirmation page.
+ *
+ * Returns true as soon as the screen contains the page's distinctive text
+ * ("Submit answers" or "Ready to submit"), false if the timeout elapses
+ * with no match — which is the expected outcome for single-question calls
+ * where Ink submits without a confirmation step.
+ */
+async function waitForSubmitConfirmPage(): Promise<boolean> {
+  const deadline = Date.now() + SUBMIT_DETECT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const screen = await readScreenOnce(false);
+    if (SUBMIT_PAGE_PATTERN.test(screen)) return true;
+    await new Promise((r) => setTimeout(r, SUBMIT_DETECT_POLL_MS));
+  }
+  return false;
+}
+
 function handleInputResponse(requestId: string, answer: string): void {
   if (!activeInputRequest || activeInputRequest.id !== requestId) {
     log.debug(
@@ -313,12 +347,14 @@ function handleInputResponse(requestId: string, answer: string): void {
 
   const pending = activeInputRequest.pending;
   const optionCount = pending.question.options.length;
+  const isLastQuestion = pending.index >= pending.total;
   log.debug(`Input response received (id=${requestId}): ${answer.slice(0, 100)}`);
   clearActiveInputRequest("response received");
 
   const trimmed = answer.trim();
   const numMatch = /^(\d+)$/.exec(trimmed);
   let consumed = false;
+  let customAnswerPath = false;
   if (numMatch) {
     const n = parseInt(numMatch[1], 10);
     if (n >= 1 && n <= optionCount) {
@@ -334,7 +370,34 @@ function handleInputResponse(requestId: string, answer: string): void {
     // characters of the answer are sometimes dropped.
     const customAnswerIndex = optionCount + 1;
     writeToPty(buildSelectionKeys(customAnswerIndex));
-    setTimeout(() => writeToPty(`${answer}\r`), 100);
+    setTimeout(() => writeToPty(`${answer}\r`), CUSTOM_ANSWER_INPUT_DELAY_MS);
+    customAnswerPath = true;
+  }
+
+  if (isLastQuestion) {
+    // After the final answer Ink *may* render "Ready to submit your
+    // answers?" (multi-question calls only). Scan the screen for the
+    // page's distinctive text — if it appears, press Enter to confirm;
+    // if not, this was a single-question call that Ink auto-submitted
+    // and the wrapper has nothing to do.
+    const startDelay = customAnswerPath
+      ? CUSTOM_ANSWER_INPUT_DELAY_MS + SUBMIT_DETECT_INITIAL_DELAY_MS
+      : SUBMIT_DETECT_INITIAL_DELAY_MS;
+    setTimeout(() => {
+      waitForSubmitConfirmPage()
+        .then((found) => {
+          if (found) {
+            log.debug("Submit confirmation page detected — pressing Enter");
+            writeToPty("\r");
+          } else {
+            log.debug("No submit confirmation page within wait window — assuming auto-submitted");
+          }
+        })
+        .catch((err) => {
+          log.error("Submit-page detection failed", err);
+        });
+    }, startDelay);
+    return;
   }
 
   // Pace the next question so Ink finishes the page transition before the
