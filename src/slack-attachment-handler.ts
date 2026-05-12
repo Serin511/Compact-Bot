@@ -23,6 +23,7 @@ import {
 import { join } from "node:path";
 import { msg } from "./messages.js";
 import { DATA_DIR } from "./paths.js";
+import { safeAttName } from "./sanitize.js";
 
 const ATTACHMENTS_DIR = join(DATA_DIR, "attachments");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -69,7 +70,9 @@ export async function downloadSlackAttachments(
   const paths: string[] = [];
 
   for (const file of files) {
-    const name = file.name ?? `file-${file.id}`;
+    // Slack filenames are uploader-controlled — sanitize before using
+    // them in a local path or surfacing back as prompt text.
+    const name = safeAttName(file.name, `file-${file.id}`);
 
     if (file.size > MAX_FILE_SIZE) {
       lines.push(

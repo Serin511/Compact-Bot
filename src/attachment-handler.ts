@@ -23,6 +23,7 @@ import {
 import { join } from "node:path";
 import { msg } from "./messages.js";
 import { DATA_DIR } from "./paths.js";
+import { safeAttName } from "./sanitize.js";
 
 const ATTACHMENTS_DIR = join(DATA_DIR, "attachments");
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
@@ -57,19 +58,24 @@ export async function downloadAttachments(
   const metadata: AttachmentResult["metadata"] = [];
 
   for (const attachment of message.attachments.values()) {
+    // Sanitize the uploader-controlled filename before using it as a
+    // local path component or surfacing it back as text — without this,
+    // a name containing newlines / brackets / semicolons can forge new
+    // rows in the prompt-prefix or notification meta.
+    const safeName = safeAttName(attachment.name, attachment.id);
     if (attachment.size > MAX_FILE_SIZE) {
       lines.push(
         msg("attachmentTooLarge", {
-          name: attachment.name,
+          name: safeName,
           size: String(Math.round(attachment.size / 1024 / 1024)),
         }),
       );
       continue;
     }
 
-    const filePath = join(dir, attachment.name);
+    const filePath = join(dir, safeName);
     metadata.push({
-      name: attachment.name,
+      name: safeName,
       url: attachment.url,
       contentType: attachment.contentType,
     });
@@ -77,7 +83,7 @@ export async function downloadAttachments(
     try {
       const res = await fetch(attachment.url);
       if (!res.ok) {
-        lines.push(msg("attachmentFailed", { name: attachment.name }));
+        lines.push(msg("attachmentFailed", { name: safeName }));
         continue;
       }
       const buffer = Buffer.from(await res.arrayBuffer());
@@ -91,7 +97,7 @@ export async function downloadAttachments(
         lines.push(msg("attachmentFile", { path: filePath }));
       }
     } catch {
-      lines.push(msg("attachmentFailed", { name: attachment.name }));
+      lines.push(msg("attachmentFailed", { name: safeName }));
     }
   }
 
@@ -124,11 +130,14 @@ export async function redownloadAttachments(
   const paths: string[] = [];
 
   for (const att of metadata) {
-    const filePath = join(dir, att.name);
+    // Metadata may have been written by an older version that did not
+    // sanitize names; re-apply on the retry path too.
+    const safeName = safeAttName(att.name);
+    const filePath = join(dir, safeName);
     try {
       const res = await fetch(att.url);
       if (!res.ok) {
-        lines.push(msg("attachmentFailed", { name: att.name }));
+        lines.push(msg("attachmentFailed", { name: safeName }));
         continue;
       }
       const buffer = Buffer.from(await res.arrayBuffer());
@@ -142,7 +151,7 @@ export async function redownloadAttachments(
         lines.push(msg("attachmentFile", { path: filePath }));
       }
     } catch {
-      lines.push(msg("attachmentFailed", { name: att.name }));
+      lines.push(msg("attachmentFailed", { name: safeName }));
     }
   }
 
