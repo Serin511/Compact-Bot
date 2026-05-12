@@ -1037,6 +1037,19 @@ async function handleSlackMessage(event: {
       return;
     }
 
+    case "goal": {
+      if (!route.args) {
+        await replyText(msg("goalMissing"));
+        return;
+      }
+      const ack = route.args === "clear"
+        ? msg("goalCleared")
+        : msg("goalSet", { goal: route.args });
+      await replyText(ack);
+      ipc?.send({ type: "goal", args: route.args } satisfies McpToWrapper);
+      return;
+    }
+
     case "capture": {
       const all = isCaptureAll(route.args);
       await replyText(msg("captureRequested"));

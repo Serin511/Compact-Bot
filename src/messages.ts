@@ -46,6 +46,7 @@ const DEFAULTS: Record<string, string> = {
     "`/capture [--all]` — CLI 화면 캡처 (기본: 현재 화면, `--all`: 전체 스크롤백)",
     "`/esc` — ESC 키 전송 (진행 중인 작업 중단 · 멈춘 세션 복구용 안전망)",
     "`/raw <text>` — CLI에 텍스트를 그대로 입력 (예: `/raw /agents`, `/raw /config`)",
+    "`/goal <조건>` — 조건이 충족될 때까지 자동으로 턴 반복 (종료: `/goal clear`)",
     "",
     "━━ 도움말 ━━",
     "`/help` — 이 도움말",
@@ -57,6 +58,9 @@ const DEFAULTS: Record<string, string> = {
   escSent: "⎋ ESC 전송됨.",
   rawSent: "⌨️ CLI에 입력 전송됨: `{text}`",
   rawMissing: "⚠️ 사용법: `/raw <텍스트>` (예: `/raw /agents`)",
+  goalSet: "🎯 목표 설정: `{goal}`",
+  goalCleared: "🎯 목표 모드 종료.",
+  goalMissing: "⚠️ 사용법: `/goal <조건>` (종료: `/goal clear`)",
 
   // Capture
   captureRequested: "📸 CLI 화면 캡처 중...",

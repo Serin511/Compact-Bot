@@ -953,6 +953,19 @@ async function handleDiscordMessage(message: Message): Promise<void> {
       return;
     }
 
+    case "goal": {
+      if (!route.args) {
+        await message.reply(msg("goalMissing"));
+        return;
+      }
+      const ack = route.args === "clear"
+        ? msg("goalCleared")
+        : msg("goalSet", { goal: route.args });
+      await message.reply(ack);
+      ipc?.send({ type: "goal", args: route.args } satisfies McpToWrapper);
+      return;
+    }
+
     case "capture": {
       const all = isCaptureAll(route.args);
       await message.reply(msg("captureRequested"));

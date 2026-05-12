@@ -77,6 +77,7 @@ export type PeerToWrapper =
   | { type: "input_request_failed"; request_id: string; reason: string }
   | { type: "esc" }
   | { type: "raw"; text: string }
+  | { type: "goal"; args: string }
   // ── from the hook-runner subprocess ──
   | { type: "pre_ask_user_question"; tool_input: AskUserQuestionInput };
 

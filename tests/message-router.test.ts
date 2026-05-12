@@ -103,4 +103,22 @@ describe("routeMessage", () => {
       args: "/compact focus hint",
     });
   });
+
+  it("routes /goal with a condition", () => {
+    expect(routeMessage("/goal 모든 테스트 통과")).toEqual({
+      type: "goal",
+      args: "모든 테스트 통과",
+    });
+  });
+
+  it("routes /goal clear to exit goal mode", () => {
+    expect(routeMessage("/goal clear")).toEqual({
+      type: "goal",
+      args: "clear",
+    });
+  });
+
+  it("routes /goal without args (caller must show usage)", () => {
+    expect(routeMessage("/goal")).toEqual({ type: "goal" });
+  });
 });

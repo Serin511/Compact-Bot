@@ -937,6 +937,13 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
       log.debug(`Raw PTY input: ${msg.text.slice(0, 80)}`);
       writeToPty(`${msg.text}\r`);
       break;
+    case "goal":
+      // /goal is a CLI-handled inline command (Claude Code 2.1.139+).
+      // The CLI loops turns until the stated condition is met; `/goal clear`
+      // exits the mode. We just forward the raw arg string to the PTY.
+      log.debug(`Goal via PTY: /goal ${msg.args.slice(0, 80)}`);
+      writeToPty(`/goal ${msg.args}\r`);
+      break;
     case "model":
       log.debug(`Model change: ${msg.model}`);
       restart({ model: msg.model });

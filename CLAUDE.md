@@ -56,13 +56,13 @@ wrapper.ts (npm start)
   │   ├─ Discord MCP server (conditional: DISCORD_BOT_TOKEN)
   │   │   ├─ Discord.js client (Gateway connection)
   │   │   ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
-  │   │   ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /esc, /raw, /help
+  │   │   ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /esc, /raw, /goal, /help
   │   │   └─ Channel notifications (source="discord")
   │   └─ Slack MCP server (conditional: SLACK_BOT_TOKEN)
   │       ├─ Slack Socket Mode client (WebSocket connection)
   │       ├─ Slack Web API client (chat, reactions, files, etc.)
   │       ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
-  │       ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /esc, /raw, /help
+  │       ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /esc, /raw, /goal, /help
   │       └─ Channel notifications (source="slack")
   └─ Restart on IPC signal (kill + respawn Claude Code) or PTY command forwarding
 ```
@@ -102,6 +102,7 @@ wrapper.ts (npm start)
 | `/capture [--all]` | Capture CLI screen (default: viewport only, single message; `--all` for full scrollback) | IPC request → code block reply |
 | `/esc` | Send ESC key to CLI (interrupt current operation / safety net for stuck prompts) | PTY write `\x1b` |
 | `/raw <text>` | Type `<text>` into the CLI verbatim followed by Enter (e.g. `/raw /agents`) | PTY write `<text>\r` |
+| `/goal <condition>` | Goal mode (Claude Code 2.1.139+) — auto-loops turns until a small model judges `<condition>` met. `/goal clear` exits. | PTY write `/goal <args>\r` |
 | `/help` | Show commands | Direct Discord reply |
 
 ## Environment Variables
