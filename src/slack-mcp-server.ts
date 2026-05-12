@@ -32,6 +32,7 @@ import {
 import { msg } from "./messages.js";
 import { isSendablePath, safeAttName } from "./sanitize.js";
 import { chunkText } from "./chunk.js";
+import { statSync } from "node:fs";
 
 // ── env (injected by wrapper via mcp-config.json) ─────────────────────
 
@@ -46,6 +47,15 @@ const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
 
 /** Max time a tool invocation may take before it is treated as hung. */
 const TOOL_TIMEOUT_MS = 20_000;
+
+/**
+ * Per-message attachment-count cap.
+ *
+ * Slack's filesUploadV2 doesn't document a hard cap, but practical
+ * experience and parity with Discord make 10 a sensible upper bound
+ * before we fail fast rather than letting the API stall.
+ */
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled rejection, leaving Claude Code waiting for a tool response forever.
@@ -316,6 +326,17 @@ mcp.tool(
   async ({ chat_id, text, thread_ts, files }) =>
     runTool("reply", async () => {
       if (files?.length) {
+        if (files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `too many attachments: ${files.length} (max ${MAX_ATTACHMENTS_PER_MESSAGE})`,
+              },
+            ],
+            isError: true,
+          };
+        }
         for (const f of files) {
           if (!isSendablePath(f)) {
             return {
@@ -328,19 +349,43 @@ mcp.tool(
               isError: true,
             };
           }
+          // Surface missing/unreadable paths immediately — filesUploadV2
+          // otherwise fails deep inside the SDK with a generic error.
+          try {
+            statSync(f);
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `cannot read file: ${f} (${err instanceof Error ? err.message : String(err)})`,
+                },
+              ],
+              isError: true,
+            };
+          }
         }
       }
 
       const chunks = splitMessage(text);
       const sentTimestamps: string[] = [];
 
-      for (const chunk of chunks) {
-        const result = await web.chat.postMessage({
-          channel: chat_id,
-          text: chunk,
-          ...(thread_ts ? { thread_ts } : {}),
-        });
-        if (result.ts) sentTimestamps.push(result.ts);
+      try {
+        for (const chunk of chunks) {
+          const result = await web.chat.postMessage({
+            channel: chat_id,
+            text: chunk,
+            ...(thread_ts ? { thread_ts } : {}),
+          });
+          if (result.ts) sentTimestamps.push(result.ts);
+        }
+      } catch (err) {
+        // Preserve partial-progress info — same reasoning as the Discord
+        // side. The model can decide whether to retry only the tail.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `reply failed after ${sentTimestamps.length} of ${chunks.length} chunk(s) sent: ${errMsg}`,
+        );
       }
 
       if (files?.length) {
@@ -447,7 +492,10 @@ mcp.tool(
           const att = m.files && (m.files as unknown[]).length > 0
             ? ` +${(m.files as unknown[]).length}att`
             : "";
-          return `[${m.ts}] ${author}: ${(m.text ?? "").slice(0, 200)}${att}`;
+          // Tool result is newline-joined; scrub embedded newlines so a
+          // multi-line message can't forge an adjacent history row.
+          const text = (m.text ?? "").replace(/[\r\n]+/g, " ⏎ ").slice(0, 200);
+          return `[${m.ts}] ${author}: ${text}${att}`;
         }),
       );
 
@@ -1018,6 +1066,13 @@ async function handleSlackMessage(event: {
       return;
 
     default: {
+      // "Processing" signal — Slack has no bot-typing API, so we lean on
+      // an eye reaction. Fire-and-forget; missing scope / already-reacted
+      // failures must not block the channel notification.
+      void web.reactions
+        .add({ channel: event.channel, timestamp: event.ts, name: "eyes" })
+        .catch(() => {});
+
       // Regular message → channel notification
       let content = event.text ?? "";
 

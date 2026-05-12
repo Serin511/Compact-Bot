@@ -34,6 +34,7 @@ import { downloadAttachments } from "./attachment-handler.js";
 import { msg } from "./messages.js";
 import { isSendablePath, safeAttName } from "./sanitize.js";
 import { chunkText } from "./chunk.js";
+import { statSync } from "node:fs";
 
 // ── env (injected by wrapper via mcp-config.json) ─────────────────────
 
@@ -47,6 +48,11 @@ const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
 
 /** Max time a tool invocation may take before it is treated as hung. */
 const TOOL_TIMEOUT_MS = 20_000;
+
+/** Discord per-attachment cap (matches the public 25 MB limit). */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+/** Discord per-message attachment-count cap. */
+const MAX_ATTACHMENTS_PER_MESSAGE = 10;
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled rejection, leaving Claude Code waiting for a tool response forever.
@@ -293,6 +299,17 @@ mcp.tool(
       }
 
       if (files?.length) {
+        if (files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Discord allows max ${MAX_ATTACHMENTS_PER_MESSAGE} attachments per message (got ${files.length})`,
+              },
+            ],
+            isError: true,
+          };
+        }
         for (const f of files) {
           if (!isSendablePath(f)) {
             return {
@@ -305,6 +322,33 @@ mcp.tool(
               isError: true,
             };
           }
+          // Discord rejects >25MB uploads with an opaque 413 — pre-check
+          // so the model sees a useful message instead of "Request entity
+          // too large" after a long upload attempt.
+          try {
+            const st = statSync(f);
+            if (st.size > MAX_ATTACHMENT_BYTES) {
+              return {
+                content: [
+                  {
+                    type: "text" as const,
+                    text: `file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`,
+                  },
+                ],
+                isError: true,
+              };
+            }
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `cannot read file: ${f} (${err instanceof Error ? err.message : String(err)})`,
+                },
+              ],
+              isError: true,
+            };
+          }
         }
       }
 
@@ -312,17 +356,26 @@ mcp.tool(
       const chunks = splitMessage(text);
       const sentIds: string[] = [];
 
-      for (let i = 0; i < chunks.length; i++) {
-        const sent = await ch.send({
-          content: chunks[i],
-          ...(i === 0 && reply_to
-            ? { reply: { messageReference: reply_to, failIfNotExists: false } }
-            : {}),
-          ...(i === 0 && files?.length
-            ? { files: files.map((f) => ({ attachment: f })) }
-            : {}),
-        });
-        sentIds.push(sent.id);
+      try {
+        for (let i = 0; i < chunks.length; i++) {
+          const sent = await ch.send({
+            content: chunks[i],
+            ...(i === 0 && reply_to
+              ? { reply: { messageReference: reply_to, failIfNotExists: false } }
+              : {}),
+            ...(i === 0 && files?.length
+              ? { files: files.map((f) => ({ attachment: f })) }
+              : {}),
+          });
+          sentIds.push(sent.id);
+        }
+      } catch (err) {
+        // Preserve partial-progress info: which chunk failed matters when
+        // a long reply was 80% through and the model needs to recover.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${errMsg}`,
+        );
       }
 
       return {
@@ -412,7 +465,11 @@ mcp.tool(
         const author = m.author.bot ? "BOT" : m.author.displayName;
         const att =
           m.attachments.size > 0 ? ` +${m.attachments.size}att` : "";
-        return `[${m.id}] ${author}: ${m.content.slice(0, 200)}${att}`;
+        // Tool result is newline-joined; a message containing its own
+        // newlines can forge an adjacent row in the model's view of
+        // history. Scrub before truncating.
+        const text = m.content.replace(/[\r\n]+/g, " ⏎ ").slice(0, 200);
+        return `[${m.id}] ${author}: ${text}${att}`;
       });
       return {
         content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
@@ -927,6 +984,15 @@ async function handleDiscordMessage(message: Message): Promise<void> {
       return;
 
     default: {
+      // "Processing" signals — Discord shows a typing indicator for ~10s
+      // and the eye reaction sticks until the bot replies. Both are
+      // fire-and-forget; failures (missing perms, race with delete) must
+      // never block the channel notification path.
+      if ("sendTyping" in message.channel) {
+        void message.channel.sendTyping().catch(() => {});
+      }
+      void message.react("👀").catch(() => {});
+
       // Regular message → channel notification
       let content = message.content;
 
