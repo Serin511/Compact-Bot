@@ -43,6 +43,7 @@ src/
   hook-runner.ts            — PreToolUse hook for AskUserQuestion (forwards tool_input → wrapper IPC)
   attachment-handler.ts     — Downloads Discord attachments to data/attachments/, builds prompt prefix
   slack-attachment-handler.ts — Downloads Slack attachments (Bearer auth) to data/attachments/, builds prompt prefix
+  slack-events.ts           — Pure helpers for interpreting Slack Socket Mode events (e.g. processable subtypes)
 tests/
   *.test.ts             — Unit tests (vitest)
 ```

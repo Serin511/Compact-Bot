@@ -30,7 +30,8 @@ import {
   type SlackFile,
 } from "./slack-attachment-handler.js";
 import { msg } from "./messages.js";
-import { isSendablePath, safeAttName } from "./sanitize.js";
+import { isSendablePath } from "./sanitize.js";
+import { isProcessableSlackMessage } from "./slack-events.js";
 import { chunkText } from "./chunk.js";
 import { statSync } from "node:fs";
 
@@ -194,7 +195,7 @@ const mcp = new McpServer(
       "The sender reads Slack, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.",
       "",
       'Messages from Slack arrive as <channel source="slack" chat_id="..." message_id="..." user="..." ts="..." [thread_ts="..."]>.',
-      "If the tag has attachment_count, the attachments attribute lists name/type/size — call download_attachment(chat_id, message_id) to fetch them.",
+      "Attachments sent with a message are downloaded automatically — their local paths appear at the top of the message body as [첨부 이미지: ...] / [첨부 파일: ...] lines, so just Read those paths. Use download_attachment(chat_id, message_id) only for older attachments surfaced by fetch_messages (marked +Natt).",
       "Reply with the reply tool — pass chat_id back.",
       "Thread behaviour: pass thread_ts to reply ONLY when the inbound <channel> tag includes a thread_ts attribute — copy that exact value. For top-level messages (no thread_ts on the tag) omit thread_ts entirely. Never substitute ts, message_id, or any other value; doing so forks a brand-new thread on the user's message, which is the most common Slack-side bug.",
       "",
@@ -1105,13 +1106,17 @@ async function handleSlackMessage(event: {
       }
 
       if (event.files && event.files.length > 0) {
-        meta.attachment_count = String(event.files.length);
-        meta.attachments = event.files
-          .map(
-            (f) =>
-              `${safeAttName(f.name, f.id)} (${f.mimetype ?? "unknown"}, ${f.size} bytes)`,
-          )
-          .join("; ");
+        // Download attachments up front and inline their local paths into
+        // the prompt body, so Claude can Read them without a separate
+        // download_attachment round-trip. downloadSlackAttachments degrades
+        // gracefully — oversized or failed files surface as explanatory
+        // lines in the prefix rather than throwing.
+        const { promptPrefix } = await downloadSlackAttachments(
+          event.files,
+          event.ts,
+          SLACK_BOT_TOKEN,
+        );
+        if (promptPrefix) content = promptPrefix + content;
       }
 
       await sendChannelNotification(content, meta);
@@ -1124,8 +1129,10 @@ async function handleSlackMessage(event: {
 socketMode.on("message", async ({ event, ack }) => {
   await ack();
 
-  // Only handle regular messages (no subtypes like bot_message, message_changed, etc.)
-  if (event.subtype) return;
+  // Skip non-user message subtypes (bot_message, message_changed, …) but
+  // keep file_share — Slack stamps every file upload with that subtype, so
+  // dropping it would silently swallow attachments and their caption text.
+  if (!isProcessableSlackMessage(event.subtype)) return;
 
   handleSlackMessage(event).catch((err) => {
     stderr(`Message handler error: ${err}`);

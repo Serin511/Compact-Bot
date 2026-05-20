@@ -48,7 +48,7 @@ The wrapper can restart Claude Code on command (`/new`, `/model`), forward CLI c
 
 - **Multi-platform** — Discord and Slack run as independent MCP servers, conditionally enabled by token
 - **Shared session** — Both platforms share the same Claude Code context
-- **Attachments** — Upload images/files; Claude downloads them via `download_attachment` tool
+- **Attachments** — Images/files sent with a message are downloaded automatically; their local paths are inlined into the prompt. The `download_attachment` tool fetches older attachments found via `fetch_messages`
 - **Reply context** — Discord message references and Slack threads are preserved
 - **MCP tools** — `reply`, `react`, `edit_message`, `fetch_messages`, `download_attachment`
 - **Customizable messages** — Override any bot message via `data/messages.json`
