@@ -909,6 +909,27 @@ function writeToPty(text: string): void {
   claudeProcess.write(text);
 }
 
+/**
+ * Delay between typing text and pressing Enter.
+ *
+ * Ink's input editor needs time to process and word-wrap long text
+ * before it can accept the Return keystroke. Without this gap, a `\r`
+ * appended directly to a long string is silently swallowed when the
+ * text wraps past the PTY column width.
+ */
+const ENTER_DELAY_MS = 150;
+
+/**
+ * Write text to the PTY, then press Enter after a short delay.
+ *
+ * Splits the payload so Ink has time to render word-wrapped text
+ * before the Return keystroke arrives.
+ */
+function writeToPtyAndEnter(text: string): void {
+  writeToPty(text);
+  setTimeout(() => writeToPty("\r"), ENTER_DELAY_MS);
+}
+
 function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
   switch (msg.type) {
     case "restart":
@@ -924,7 +945,7 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
     case "compact": {
       const hint = msg.hint ? ` ${msg.hint}` : "";
       log.debug(`Compact via PTY: /compact${hint}`);
-      writeToPty(`/compact${hint}\r`);
+      writeToPtyAndEnter(`/compact${hint}`);
       break;
     }
     case "clear":
@@ -943,7 +964,7 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
       // followed by Enter. Lets the user run any CLI command that
       // isn't explicitly wired into the bot (e.g. /agents, /config).
       log.debug(`Raw PTY input: ${msg.text.slice(0, 80)}`);
-      writeToPty(`${msg.text}\r`);
+      writeToPtyAndEnter(msg.text);
       break;
     case "goal":
       // /goal is a CLI-handled inline command (Claude Code 2.1.139+).
@@ -951,7 +972,7 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
       // exits the mode. We just forward the raw arg string to the PTY.
       const goalArgs = msg.args.replace(/[\r\n]+/g, " ").trim();
       log.debug(`Goal via PTY: /goal ${goalArgs.slice(0, 80)}`);
-      writeToPty(`/goal ${goalArgs}\r`);
+      writeToPtyAndEnter(`/goal ${goalArgs}`);
       break;
     case "model":
       log.debug(`Model change: ${msg.model}`);
