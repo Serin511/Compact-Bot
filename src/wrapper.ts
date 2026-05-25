@@ -306,7 +306,7 @@ function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
  */
 function buildSelectionKeys(targetIndex: number): string {
   const downCount = Math.max(0, targetIndex - 1);
-  return "\x1b[B".repeat(downCount) + "\r";
+  return "\x1b[B".repeat(downCount) + "\n";
 }
 
 /**
@@ -370,7 +370,7 @@ function handleInputResponse(requestId: string, answer: string): void {
     // characters of the answer are sometimes dropped.
     const customAnswerIndex = optionCount + 1;
     writeToPty(buildSelectionKeys(customAnswerIndex));
-    setTimeout(() => writeToPty(`${answer}\r`), CUSTOM_ANSWER_INPUT_DELAY_MS);
+    setTimeout(() => writeToPty(`${answer}\n`), CUSTOM_ANSWER_INPUT_DELAY_MS);
     customAnswerPath = true;
   }
 
@@ -388,7 +388,7 @@ function handleInputResponse(requestId: string, answer: string): void {
         .then((found) => {
           if (found) {
             log.debug("Submit confirmation page detected — pressing Enter");
-            writeToPty("\r");
+            writeToPty("\n");
           } else {
             log.debug("No submit confirmation page within wait window — assuming auto-submitted");
           }
@@ -941,8 +941,9 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
       // /goal is a CLI-handled inline command (Claude Code 2.1.139+).
       // The CLI loops turns until the stated condition is met; `/goal clear`
       // exits the mode. We just forward the raw arg string to the PTY.
-      log.debug(`Goal via PTY: /goal ${msg.args.slice(0, 80)}`);
-      writeToPty(`/goal ${msg.args}\r`);
+      const goalArgs = msg.args.replace(/[\r\n]+/g, " ").trim();
+      log.debug(`Goal via PTY: /goal ${goalArgs.slice(0, 80)}`);
+      writeToPty(`/goal ${goalArgs}\r`);
       break;
     case "model":
       log.debug(`Model change: ${msg.model}`);
