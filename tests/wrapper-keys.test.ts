@@ -14,7 +14,7 @@
 import { describe, it, expect } from "vitest";
 
 const DOWN = "\x1b[B";
-const ENTER = "\n";
+const ENTER = "\r";
 
 /** Mirror of ``buildSelectionKeys`` in ``src/wrapper.ts``. */
 function buildSelectionKeys(targetIndex: number): string {

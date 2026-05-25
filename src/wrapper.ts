@@ -94,6 +94,10 @@ interface ActiveInputRequest {
   id: string;
   /** Snapshot of the question we relayed (used to compute key sequences). */
   pending: PendingQuestion;
+  /** How many MCP clients we broadcast the request to. */
+  recipientCount: number;
+  /** How many of those have reported failure. */
+  failCount: number;
 }
 
 let activeInputRequest: ActiveInputRequest | null = null;
@@ -228,7 +232,7 @@ function presentNextQuestion(): void {
   }
 
   const requestId = randomUUID();
-  activeInputRequest = { id: requestId, pending: next };
+  activeInputRequest = { id: requestId, pending: next, recipientCount: mcpClients.size, failCount: 0 };
   inputRequestExpiry = setTimeout(() => {
     log.debug(`Input request ${requestId} TTL expired`);
     activeInputRequest = null;
@@ -306,7 +310,7 @@ function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
  */
 function buildSelectionKeys(targetIndex: number): string {
   const downCount = Math.max(0, targetIndex - 1);
-  return "\x1b[B".repeat(downCount) + "\n";
+  return "\x1b[B".repeat(downCount) + "\r";
 }
 
 /**
@@ -370,7 +374,7 @@ function handleInputResponse(requestId: string, answer: string): void {
     // characters of the answer are sometimes dropped.
     const customAnswerIndex = optionCount + 1;
     writeToPty(buildSelectionKeys(customAnswerIndex));
-    setTimeout(() => writeToPty(`${answer}\n`), CUSTOM_ANSWER_INPUT_DELAY_MS);
+    setTimeout(() => writeToPty(`${answer}\r`), CUSTOM_ANSWER_INPUT_DELAY_MS);
     customAnswerPath = true;
   }
 
@@ -388,7 +392,7 @@ function handleInputResponse(requestId: string, answer: string): void {
         .then((found) => {
           if (found) {
             log.debug("Submit confirmation page detected — pressing Enter");
-            writeToPty("\n");
+            writeToPty("\r");
           } else {
             log.debug("No submit confirmation page within wait window — assuming auto-submitted");
           }
@@ -419,11 +423,15 @@ function handleInputRequestFailed(requestId: string, reason: string): void {
     );
     return;
   }
-  log.debug(`Input request ${requestId} failed: ${reason}`);
-  clearActiveInputRequest(`failed: ${reason}`);
-  // Drop the rest of the call too — without a path to the user we can't
-  // collect the remaining answers either.
-  questionQueue.length = 0;
+  activeInputRequest.failCount++;
+  log.debug(
+    `Input request ${requestId} partial failure (${activeInputRequest.failCount}/${activeInputRequest.recipientCount}): ${reason}`,
+  );
+  if (activeInputRequest.failCount >= activeInputRequest.recipientCount) {
+    log.debug(`All recipients failed for ${requestId} — dropping request`);
+    clearActiveInputRequest(`all recipients failed`);
+    questionQueue.length = 0;
+  }
 }
 
 // ── MCP server registration ───────────────────────────────────────────
