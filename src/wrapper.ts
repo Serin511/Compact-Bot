@@ -910,24 +910,25 @@ function writeToPty(text: string): void {
 }
 
 /**
- * Delay between typing text and pressing Enter.
- *
- * Ink's input editor needs time to process and word-wrap long text
- * before it can accept the Return keystroke. Without this gap, a `\r`
- * appended directly to a long string is silently swallowed when the
- * text wraps past the PTY column width.
+ * Base delay (ms) between typing text and pressing Enter.
+ * Scales with the number of wrapped lines so Ink has time to
+ * re-render before the Return keystroke arrives.
  */
-const ENTER_DELAY_MS = 150;
+const ENTER_DELAY_BASE_MS = 150;
+const ENTER_DELAY_PER_WRAP_MS = 100;
+
+function enterDelay(text: string): number {
+  const wraps = Math.floor(text.length / PTY_COLS);
+  return ENTER_DELAY_BASE_MS + wraps * ENTER_DELAY_PER_WRAP_MS;
+}
 
 /**
- * Write text to the PTY, then press Enter after a short delay.
- *
- * Splits the payload so Ink has time to render word-wrapped text
- * before the Return keystroke arrives.
+ * Write text to the PTY, then press Enter after a delay scaled to
+ * the number of word-wrap lines the text will produce.
  */
 function writeToPtyAndEnter(text: string): void {
   writeToPty(text);
-  setTimeout(() => writeToPty("\r"), ENTER_DELAY_MS);
+  setTimeout(() => writeToPty("\r"), enterDelay(text));
 }
 
 function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
