@@ -1,26 +1,28 @@
 /**
- * PreToolUse hook for the AskUserQuestion built-in tool.
+ * PreToolUse hook for AskUserQuestion and EnterPlanMode built-in tools.
  *
- * Claude Code 2.1.132+ re-enabled `AskUserQuestion` in Channels mode but
- * does not surface the call over the MCP transport — the Ink widget just
- * renders to the PTY. This hook is wired in via ``--settings`` so it fires
- * the moment Claude Code is about to invoke AskUserQuestion. It hands the
- * structured tool input (questions, options, descriptions, previews) to
- * the wrapper over the existing IPC socket and exits, letting the tool
- * proceed normally. The wrapper then formats the question for Discord /
- * Slack and drives the user's response back into the Ink widget via PTY
- * keystrokes (see ``handleInputResponse`` in ``src/wrapper.ts``).
+ * Handles two tool interceptions:
+ *
+ * **AskUserQuestion**: Claude Code 2.1.132+ re-enabled this in Channels
+ * mode but does not surface the call over MCP — the Ink widget just
+ * renders to the PTY. This hook forwards the structured tool input to the
+ * wrapper over IPC and exits with ``{}`` (allow), letting the tool proceed.
+ * The wrapper formats the question for Discord / Slack and drives the
+ * user's response back into the Ink widget via PTY keystrokes.
+ *
+ * **EnterPlanMode**: Returns a deny decision so Claude Code never enters
+ * plan mode. The deny reason instructs Claude to use the ``reply`` MCP
+ * tool to share its plan with the user and ask for approval directly.
  *
  * Standard hook contract:
- *   - Reads a JSON event from stdin: `{ tool_name, tool_input, ... }`.
- *   - Writes the hook decision JSON to stdout. Empty `{}` means "allow
- *     and continue", which is what we always emit.
+ *   - Reads a JSON event from stdin: ``{ tool_name, tool_input, ... }``.
+ *   - Writes the hook decision JSON to stdout.
  *
- * Exit code is always 0 — a non-zero exit would block AskUserQuestion
- * even if the IPC forward failed, leaving the user with a hung session.
+ * Exit code is always 0 — a non-zero exit would block the tool even if
+ * the IPC forward failed, leaving the user with a hung session.
  *
  * Exports:
- *   None (side-effect: a `node ./hook-runner.js` invocation per AskUserQuestion call).
+ *   None (side-effect only).
  */
 
 import { createConnection } from "node:net";
@@ -101,6 +103,20 @@ function forwardToWrapper(toolInput: unknown): Promise<void> {
 
 async function main(): Promise<void> {
   const event = await readStdinAsJson();
+
+  if (event && event.tool_name === "EnterPlanMode") {
+    process.stdout.write(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason:
+          "Plan mode is not available in this environment. " +
+          "Instead, use the reply tool to send your plan to the user and ask for their approval before proceeding with implementation.",
+      },
+    }));
+    return;
+  }
+
   if (event && event.tool_name === "AskUserQuestion" && event.tool_input) {
     await forwardToWrapper(event.tool_input);
   }

@@ -612,16 +612,26 @@ function unregisterAllMcpServers(): void {
 const HOOK_RUNNER_PATH = join(DIST_DIR, "hook-runner.js");
 
 /**
- * Build a JSON settings blob that wires our PreToolUse hook for
- * AskUserQuestion. Claude Code merges this with the user's regular
- * settings, so existing hooks are preserved.
+ * Build a JSON settings blob that wires PreToolUse hooks for
+ * AskUserQuestion (relay) and EnterPlanMode (deny). Claude Code merges
+ * this with the user's regular settings, so existing hooks are preserved.
  */
-function buildAskUserQuestionHookSettings(): string {
+function buildHookSettings(): string {
   return JSON.stringify({
     hooks: {
       PreToolUse: [
         {
           matcher: "AskUserQuestion",
+          hooks: [
+            {
+              type: "command",
+              command: `node ${shellEscape(HOOK_RUNNER_PATH)}`,
+              timeout: 3,
+            },
+          ],
+        },
+        {
+          matcher: "EnterPlanMode",
           hooks: [
             {
               type: "command",
@@ -648,7 +658,7 @@ function buildArgs(): string[] {
     ...channels,
     ...(state.model ? ["--model", state.model] : []),
     "--settings",
-    buildAskUserQuestionHookSettings(),
+    buildHookSettings(),
   ];
 
   const systemPrompt = loadSystemPrompt();
