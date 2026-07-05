@@ -33,6 +33,7 @@ import { msg } from "./messages.js";
 import { isSendablePath } from "./sanitize.js";
 import { isProcessableSlackMessage } from "./slack-events.js";
 import { chunkText } from "./chunk.js";
+import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
 import { statSync } from "node:fs";
 
 // ── env (injected by wrapper via mcp-config.json) ─────────────────────
@@ -156,6 +157,14 @@ function stderr(msg: string): void {
 
 const web = new WebClient(SLACK_BOT_TOKEN);
 const socketMode = new SocketModeClient({ appToken: SLACK_APP_TOKEN });
+
+/**
+ * Holds the single-instance lock for this app token while connected.
+ *
+ * Kept at module scope so the underlying socket is not garbage-collected for
+ * the process lifetime; released on shutdown.
+ */
+let instanceLock: InstanceLock | null = null;
 
 // ── user display name cache ──────────────────────────────────────────
 
@@ -1288,6 +1297,7 @@ function shutdown(reason: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   stderr(`Shutting down: ${reason}`);
+  instanceLock?.release();
   setTimeout(() => process.exit(0), 2000).unref();
   void Promise.resolve(socketMode.disconnect()).finally(() => process.exit(0));
 }
@@ -1337,15 +1347,30 @@ async function main(): Promise<void> {
     stderr(`Slack auth.test failed: ${err}`);
   }
 
-  // Connect Slack Socket Mode — wait for the handshake to complete before
-  // starting the MCP transport. Otherwise early tool calls can hit a
-  // half-open websocket and queue forever. The ``connected`` listener
-  // above sets ``slackReady``; runTool rejects tool calls until then as
-  // a belt-and-braces guard.
-  await new Promise<void>((resolve, reject) => {
-    socketMode.once("connected", () => resolve());
-    socketMode.start().catch(reject);
-  });
+  // Single-instance guard: only one live Socket Mode connection may exist per
+  // SLACK_APP_TOKEN. Slack round-robins events across every connected socket
+  // for a token, so a duplicate (a second `npx compact-bot`, or a Claude
+  // Code / VSCode session that auto-spawns this MCP server) would silently
+  // steal a share of messages. If another instance already holds the token,
+  // stay up as an inert MCP server but never open the websocket.
+  instanceLock = await acquireInstanceLock("slack", SLACK_APP_TOKEN);
+  if (!instanceLock) {
+    stderr(
+      "Another compact-bot instance already holds this SLACK_APP_TOKEN — " +
+        "skipping Socket Mode to avoid stealing messages via round-robin. " +
+        "Running as an inert MCP server.",
+    );
+  } else {
+    // Connect Slack Socket Mode — wait for the handshake to complete before
+    // starting the MCP transport. Otherwise early tool calls can hit a
+    // half-open websocket and queue forever. The ``connected`` listener
+    // above sets ``slackReady``; runTool rejects tool calls until then as
+    // a belt-and-braces guard.
+    await new Promise<void>((resolve, reject) => {
+      socketMode.once("connected", () => resolve());
+      socketMode.start().catch(reject);
+    });
+  }
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();

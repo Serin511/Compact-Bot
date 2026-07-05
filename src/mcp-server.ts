@@ -34,6 +34,7 @@ import { downloadAttachments } from "./attachment-handler.js";
 import { msg } from "./messages.js";
 import { isSendablePath } from "./sanitize.js";
 import { chunkText } from "./chunk.js";
+import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
 import { statSync } from "node:fs";
 
 // ── env (injected by wrapper via mcp-config.json) ─────────────────────
@@ -154,6 +155,14 @@ const discord = new Client({
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction],
 });
+
+/**
+ * Holds the single-instance lock for this bot token while connected.
+ *
+ * Kept at module scope so the underlying socket is not garbage-collected for
+ * the process lifetime; released on shutdown.
+ */
+let instanceLock: InstanceLock | null = null;
 
 // ── MCP server ────────────────────────────────────────────────────────
 
@@ -1188,6 +1197,7 @@ function shutdown(reason: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   stderr(`Shutting down: ${reason}`);
+  instanceLock?.release();
   setTimeout(() => process.exit(0), 2000).unref();
   void Promise.resolve(discord.destroy()).finally(() => process.exit(0));
 }
@@ -1228,15 +1238,29 @@ async function main(): Promise<void> {
     stderr(`IPC connect failed: ${err}`);
   }
 
-  // Connect Discord — discord.login() resolves after REST token validation,
-  // not when the Gateway is ready. Block on the "ready" event so that any
-  // tool call arriving on the freshly-connected MCP transport will find a
-  // usable cache and websocket. Without this wait, early calls to
-  // channels.fetch()/send() can queue forever and lock the session.
-  await new Promise<void>((resolve, reject) => {
-    discord.once("ready", () => resolve());
-    discord.login(DISCORD_BOT_TOKEN).catch(reject);
-  });
+  // Single-instance guard: only one live Gateway connection may exist per
+  // DISCORD_BOT_TOKEN. A duplicate (a second `npx compact-bot`, or a Claude
+  // Code / VSCode session that auto-spawns this MCP server) would double every
+  // event and produce duplicate replies. If another instance already holds
+  // the token, stay up as an inert MCP server but never log in.
+  instanceLock = await acquireInstanceLock("discord", DISCORD_BOT_TOKEN);
+  if (!instanceLock) {
+    stderr(
+      "Another compact-bot instance already holds this DISCORD_BOT_TOKEN — " +
+        "skipping Gateway login to avoid duplicate event handling. " +
+        "Running as an inert MCP server.",
+    );
+  } else {
+    // Connect Discord — discord.login() resolves after REST token validation,
+    // not when the Gateway is ready. Block on the "ready" event so that any
+    // tool call arriving on the freshly-connected MCP transport will find a
+    // usable cache and websocket. Without this wait, early calls to
+    // channels.fetch()/send() can queue forever and lock the session.
+    await new Promise<void>((resolve, reject) => {
+      discord.once("ready", () => resolve());
+      discord.login(DISCORD_BOT_TOKEN).catch(reject);
+    });
+  }
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();
