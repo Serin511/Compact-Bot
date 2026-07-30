@@ -634,7 +634,7 @@ export class CodexAppServer extends EventEmitter {
       clientInfo: {
         name: "compact_bot",
         title: "Compact Bot",
-        version: "1.4.0",
+        version: "1.4.1",
       },
       capabilities: {
         experimentalApi: true,
