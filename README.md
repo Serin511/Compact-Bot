@@ -23,8 +23,8 @@ This project started as a fix for that one problem: a wrapper that owns the Clau
 | **Session control** | None | `/new`, `/clear`, `/compact` |
 | **Model switching** | Manual restart | `/model sonnet` (auto-restart) |
 | **Working directory** | Fixed at launch | `/cwd /path` (auto-restart) |
-| **Screen capture** | N/A | `/capture` (virtual terminal buffer) |
-| **System prompt** | Not configurable | Custom file injection (`--append-system-prompt`) |
+| **Runtime capture** | N/A | `/capture` (Claude terminal / Codex transcript) |
+| **System prompt** | Not configurable | Claude append / Codex developer instructions |
 | **Message customization** | N/A | All bot messages overridable via JSON |
 | **Auto-recovery** | N/A | Auto-respawn on unexpected exit |
 
@@ -58,6 +58,7 @@ terminal:
 wrapper.ts (always-on)
   ├── Codex app-server JSON-RPC client
   │     ├── thread/start, turn/start, turn/steer
+  │     ├── thread/read transcript capture
   │     ├── thread/compact/start, turn/interrupt, thread goals
   │     └── approval + request_user_input relay
   └── Codex app-server
@@ -172,18 +173,26 @@ All commands work from both Discord and Slack.
 | Command | Description |
 |---------|-------------|
 | `/new` | Start a fresh session/thread |
-| `/clear` | Clear current context (Claude CLI command / fresh Codex thread) |
-| `/compact [hint]` | Compress context. The optional focus hint is supported by Claude Code |
+| `/clear` | Clear current context (Claude CLI command / fresh Codex runtime and thread) |
+| `/compact [hint]` | Compress context. Claude forwards the hint to its CLI; Codex injects it into thread history before compaction |
 | `/model <name>` | Switch model. Claude supports `sonnet`/`opus`/`haiku` aliases; Codex accepts a full Codex model ID |
 | `/effort [level]` | Show or change Codex reasoning effort. Supported levels are validated against the current model |
 | `/cwd <path>` | Change the agent's working directory |
-| `/capture [--all]` | Claude: capture the CLI screen. Codex: show app-server thread/turn status and recent events |
-| `/esc` | Interrupt the active operation |
-| `/raw <text>` | Claude: type into the CLI. Codex: submit the text as a turn |
+| `/capture [--all]` | Claude: capture the CLI screen/scrollback. Codex: capture the last 50 lines/full current-thread transcript |
+| `/esc` | Claude: send ESC. Codex: interrupt the active turn |
+| `/raw <text>` | Claude: type into the CLI. Codex: submit/steer a normal turn (not a Codex TUI slash command) |
 | `/goal <condition>` | Set the agent goal; `/goal clear` clears it |
 | `/help` | Show available commands |
 
 Any other message is forwarded to the selected agent.
+
+In Codex mode, `/capture` uses structured app-server thread items rather than a
+literal terminal viewport. It includes available metadata, user/agent messages,
+reasoning summaries, plans, command output, file changes, and MCP calls. The
+active turn's streamed progress is merged in while it is running. The default
+form returns the last 50 rendered transcript lines to approximate a CLI
+viewport; `/capture --all` returns the available transcript for the entire
+current thread.
 
 `/effort` is Codex-only. A change applies to the next new turn without
 restarting the thread; a turn already in progress keeps its original effort.
@@ -225,7 +234,10 @@ echo "Always respond in English. Be concise." > data/system-prompt.txt
 ```
 
 The content is injected via `--append-system-prompt` for Claude Code and as
-`developerInstructions` when a Codex thread starts.
+`developerInstructions` when a Codex runtime starts. Compact Bot reads the file
+when it starts or restarts the agent runtime; editing it does not change an
+already-running session. `/new`, `/clear`, `/model`, and `/cwd` restart the
+Codex runtime and therefore load the current file contents.
 
 ## Troubleshooting
 

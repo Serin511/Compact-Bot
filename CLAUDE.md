@@ -97,6 +97,7 @@ wrapper.ts
   ├─ IPC socket server (data/wrapper.sock)
   ├─ CodexAppServer (`codex app-server`, JSONL over stdio)
   │   ├─ thread/start + turn/start/turn/steer for inbound chat
+  │   ├─ thread/read for structured transcript capture
   │   ├─ model/list for model-specific reasoning effort validation
   │   ├─ thread/compact/start, turn/interrupt, thread/goal/*
   │   └─ app-server approvals and request_user_input → existing channel UI
@@ -110,12 +111,24 @@ wrapper.ts
   app-server turn input.
 - Codex starts the same platform MCP servers as stdio tools. Agent replies still
   go through `reply`, `react`, `edit_message`, and related MCP tools.
-- `/new`, `/clear`, model changes, and CWD changes create a fresh Codex thread.
+- `/new`, `/clear`, model changes, and CWD changes stop the old app-server
+  generation (including its per-thread MCP children) before starting a fresh
+  runtime and thread. This prevents stale subscriptions/goals and duplicate
+  platform MCP processes from surviving a session change.
 - `/effort [level]` updates `turn/start.effort` for the next new turn without
   restarting the thread. The current model's `model/list` entry supplies the
   accepted values. Model changes reset an incompatible prior effort to the new
   model default.
-- `/capture` returns structured thread/turn status plus recent app-server events.
+- `/capture` renders metadata and structured `thread/read` items as a transcript
+  (user/assistant messages, reasoning summaries, plans, command output, file
+  changes, and MCP calls), merged with streamed progress from an active turn.
+  The default returns the last 50 rendered lines to approximate a viewport;
+  `--all` returns the available transcript for the entire current thread.
+  App-server does not expose a literal Codex TUI viewport.
+- `system-prompt.txt` is read when the Codex runtime starts and sent as
+  `developerInstructions`. Runtime-restarting commands (`/new`, `/clear`,
+  `/model`, `/cwd`) reload the file; editing it does not mutate the current
+  running thread.
 - `DANGEROUSLY_SKIP_PERMISSIONS=true` maps to Codex `approvalPolicy=never` and
   `sandbox=danger-full-access`; otherwise the user's Codex policy is retained
   and app-server approval requests are relayed to Discord/Slack.
@@ -134,15 +147,15 @@ wrapper.ts
 
 | Command | Description | Mechanism |
 |---------|-------------|-----------|
-| `/new` | New session | Claude: hard restart; Codex: fresh thread |
-| `/clear` | Clear session | Claude: CLI `/clear`; Codex: fresh thread |
-| `/compact [hint]` | Compress context | Claude: PTY command; Codex: `thread/compact/start` (no hint) |
+| `/new` | New session | Claude/Codex: hard runtime restart and fresh session/thread |
+| `/clear` | Clear session | Claude: CLI `/clear`; Codex: hard runtime restart and fresh thread |
+| `/compact [hint]` | Compress context | Claude: PTY command; Codex: inject hint into history, then `thread/compact/start` |
 | `/model <name>` | Change model (sonnet/opus/haiku or full ID) | Restart with new `--model` flag |
 | `/effort [level]` | Show/change Codex reasoning effort | Codex: IPC → `turn/start.effort`; Claude: unsupported |
 | `/cwd <path>` | Change working directory | Restart with new CWD |
-| `/capture [--all]` | Capture runtime status | Claude: terminal buffer; Codex: thread/turn events |
+| `/capture [--all]` | Capture runtime transcript | Claude: viewport/full scrollback; Codex: last 50 lines/full `thread/read` transcript |
 | `/esc` | Interrupt current operation | Claude: ESC key; Codex: `turn/interrupt` |
-| `/raw <text>` | Submit raw text | Claude: PTY input; Codex: turn input |
+| `/raw <text>` | Submit raw text | Claude: PTY input; Codex: submit/steer normal turn input (not a TUI slash command) |
 | `/goal <condition>` | Set/clear goal | Claude: PTY `/goal`; Codex: `thread/goal/*` |
 | `/help` | Show commands | Direct platform reply |
 

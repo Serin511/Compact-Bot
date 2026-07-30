@@ -22,7 +22,7 @@ const AGENT_NAME =
   process.env.AGENT_PROVIDER === "codex" ? "Codex" : "Claude Code";
 const COMPACT_HELP =
   process.env.AGENT_PROVIDER === "codex"
-    ? "`/compact` — 컨텍스트 압축"
+    ? "`/compact [힌트]` — 컨텍스트 압축 (힌트는 압축 기록에 주입)"
     : "`/compact [힌트]` — 컨텍스트 압축 (선택적 힌트로 중점 영역 지정)";
 const MODEL_HELP =
   process.env.AGENT_PROVIDER === "codex"
@@ -32,9 +32,17 @@ const EFFORT_HELP =
   process.env.AGENT_PROVIDER === "codex"
     ? "`/effort [level]` — reasoning effort 조회/변경"
     : "`/effort` — Codex 모드에서만 사용 가능";
+const CAPTURE_HELP =
+  process.env.AGENT_PROVIDER === "codex"
+    ? "`/capture [--all]` — Codex 대화·실행 기록 캡처 (기본: 최근 50줄, `--all`: 현재 스레드 전체 기록)"
+    : "`/capture [--all]` — CLI 화면 캡처 (기본: 현재 화면, `--all`: 전체 스크롤백)";
+const ESC_HELP =
+  process.env.AGENT_PROVIDER === "codex"
+    ? "`/esc` — 진행 중인 Codex 턴 중단"
+    : "`/esc` — ESC 키 전송 (진행 중인 작업 중단 · 멈춘 세션 복구용 안전망)";
 const RAW_HELP =
   process.env.AGENT_PROVIDER === "codex"
-    ? "`/raw <text>` — 텍스트를 새 Codex 입력으로 전송"
+    ? "`/raw <text>` — 텍스트를 Codex 턴 입력으로 전송 (진행 중이면 steer, CLI 명령이 아님)"
     : "`/raw <text>` — CLI에 텍스트를 그대로 입력 (예: `/raw /agents`, `/raw /config`)";
 
 const DEFAULTS: Record<string, string> = {
@@ -42,11 +50,11 @@ const DEFAULTS: Record<string, string> = {
   sessionCleared: "✅ 세션 초기화 완료. 다음 메시지부터 새 세션이 시작됩니다.",
 
   // Command responses
-  newSession: `✅ 새 ${AGENT_NAME} 세션을 시작합니다...`,
+  newSession: `✅ 새 ${AGENT_NAME} 세션을 시작했습니다.`,
   clearSession: "✅ 세션 초기화 완료.",
   compacting: "🔄 컨텍스트 압축 중...",
   modelCurrent: "현재 모델: `{model}`",
-  modelChanged: "✅ 모델 변경: `{model}`. 재시작 중...",
+  modelChanged: "✅ 모델 변경 완료: `{model}`.",
   effortCurrent: "현재 reasoning effort: `{effort}`",
   effortChanged:
     "✅ reasoning effort 변경: `{effort}`. 다음 새 턴부터 적용됩니다.",
@@ -56,7 +64,7 @@ const DEFAULTS: Record<string, string> = {
     "⚠️ `{model}`은 `{effort}`를 지원하지 않습니다. 사용 가능: `{efforts}`",
   effortChangeFailed: "⚠️ reasoning effort 변경 실패: {reason}",
   cwdCurrent: "현재 작업 디렉토리: `{cwd}`",
-  cwdChanged: "✅ 작업 디렉토리 변경: `{path}`. 재시작 중...",
+  cwdChanged: "✅ 작업 디렉토리 변경 완료: `{path}`.",
   help: [
     "📖 사용 가능한 명령어",
     "",
@@ -70,9 +78,9 @@ const DEFAULTS: Record<string, string> = {
     EFFORT_HELP,
     "`/cwd [path]` — 작업 디렉토리 조회/변경",
     "",
-    "━━ CLI 제어 ━━",
-    "`/capture [--all]` — CLI 화면 캡처 (기본: 현재 화면, `--all`: 전체 스크롤백)",
-    "`/esc` — ESC 키 전송 (진행 중인 작업 중단 · 멈춘 세션 복구용 안전망)",
+    "━━ 에이전트 제어 ━━",
+    CAPTURE_HELP,
+    ESC_HELP,
     RAW_HELP,
     "`/goal <조건>` — 조건이 충족될 때까지 자동으로 턴 반복 (종료: `/goal clear`)",
     "",
@@ -83,7 +91,10 @@ const DEFAULTS: Record<string, string> = {
   ].join("\n"),
 
   // Passthrough commands
-  escSent: "⎋ ESC 전송됨.",
+  escSent:
+    process.env.AGENT_PROVIDER === "codex"
+      ? "⏹️ 진행 중인 Codex 턴 중단 요청됨."
+      : "⎋ ESC 전송됨.",
   rawSent: `⌨️ ${AGENT_NAME}에 입력 전송됨: \`{text}\``,
   rawMissing: "⚠️ 사용법: `/raw <텍스트>`",
   goalSet: "🎯 목표 설정: `{goal}`",
@@ -93,9 +104,12 @@ const DEFAULTS: Record<string, string> = {
   // Capture
   captureRequested:
     process.env.AGENT_PROVIDER === "codex"
-      ? "📸 Codex 상태 확인 중..."
+      ? "📸 Codex 대화·실행 기록 캡처 중..."
       : "📸 CLI 화면 캡처 중...",
-  captureEmpty: "⚠️ 캡처할 화면이 없습니다.",
+  captureEmpty:
+    process.env.AGENT_PROVIDER === "codex"
+      ? "⚠️ 캡처할 Codex 기록이 없습니다."
+      : "⚠️ 캡처할 화면이 없습니다.",
   captureNoResponse: `⚠️ wrapper가 캡처 요청에 응답하지 않았습니다. ${AGENT_NAME}가 멈췄거나 재시작 중일 수 있습니다.`,
 
   // Attachment messages

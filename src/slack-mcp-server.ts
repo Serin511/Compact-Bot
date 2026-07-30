@@ -23,6 +23,14 @@ import {
   type WrapperToMcp,
   type JsonLineSocket,
   type IpcAskWidget,
+  type IpcOrigin,
+  type IpcCommandRequest,
+  type IpcCommandResult,
+  IpcCommandTracker,
+  isOriginForPlatform,
+  sameConversationOrigin,
+  isAllowedInputAnswer,
+  isMatchingInputRequest,
 } from "./ipc.js";
 import { routeMessage } from "./message-router.js";
 import {
@@ -32,7 +40,7 @@ import {
 import { msg } from "./messages.js";
 import { isSendablePath } from "./sanitize.js";
 import { isProcessableSlackMessage } from "./slack-events.js";
-import { chunkText } from "./chunk.js";
+import { chunkCodeBlock, chunkText } from "./chunk.js";
 import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
 import {
   KNOWN_REASONING_EFFORTS,
@@ -88,9 +96,108 @@ let currentCwd = "";
 let botUserId = "";
 let lastActiveChannelId: string | null = null;
 let lastActiveThreadTs: string | undefined = undefined;
+const commandTracker = new IpcCommandTracker();
 
 /** Pending user input request — when set, the next user message is treated as the answer. */
-let pendingInputRequest: { request_id: string; channelId: string; threadTs?: string } | null = null;
+let pendingInputRequest: {
+  request_id: string;
+  channelId: string;
+  threadTs?: string;
+  userId?: string;
+  origin?: IpcOrigin;
+} | null = null;
+const cancelledInputRequests = new Set<string>();
+const INPUT_REQUEST_TOMBSTONE_MS = 10 * 60 * 1000;
+
+type AgentReply = Extract<WrapperToMcp, { type: "agent_reply" }>;
+type RoutedOutput = IpcCommandResult | AgentReply;
+const deferredRoutedOutput: RoutedOutput[] = [];
+
+function slackOrigin(
+  event: { channel: string; ts: string; thread_ts?: string },
+  user?: string,
+): IpcOrigin {
+  return {
+    source: "slack",
+    chat_id: event.channel,
+    message_id: event.ts,
+    ...(user ? { user } : {}),
+    ts: new Date(parseFloat(event.ts) * 1000).toISOString(),
+    ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+  };
+}
+
+function sameSlackTarget(
+  actual: { channel: string; thread_ts?: string },
+  expected: { channelId: string; threadTs?: string },
+): boolean {
+  return (
+    actual.channel === expected.channelId &&
+    actual.thread_ts === expected.threadTs
+  );
+}
+
+function commandResultText(
+  result: IpcCommandResult,
+  successFallback = ":white_check_mark: 명령 실행 완료.",
+): string {
+  if (result.ok) return result.message || successFallback;
+  return (
+    result.message ||
+    `:warning: 명령 실행 실패: ${result.error || "알 수 없는 오류"}`
+  );
+}
+
+async function postSlackOrigin(origin: IpcOrigin, text: string): Promise<void> {
+  if (origin.source !== "slack") return;
+  for (const chunk of splitMessage(text)) {
+    await web.chat.postMessage({
+      channel: origin.chat_id,
+      text: chunk,
+      ...(origin.thread_ts ? { thread_ts: origin.thread_ts } : {}),
+    });
+  }
+}
+
+async function deliverRoutedOutput(output: RoutedOutput): Promise<void> {
+  if (!isOriginForPlatform(output.origin, "slack")) return;
+  if (!slackReady) {
+    deferredRoutedOutput.push(output);
+    if (deferredRoutedOutput.length > 100) deferredRoutedOutput.shift();
+    return;
+  }
+  const text = output.type === "agent_reply"
+    ? output.text
+    : commandResultText(output);
+  await postSlackOrigin(output.origin, text);
+}
+
+async function flushDeferredRoutedOutput(): Promise<void> {
+  const queued = deferredRoutedOutput.splice(0);
+  for (const output of queued) {
+    try {
+      await deliverRoutedOutput(output);
+    } catch (error) {
+      stderr(`Failed to deliver deferred ${output.type}: ${error}`);
+    }
+  }
+}
+
+async function runSlackCommand(
+  origin: IpcOrigin,
+  request: IpcCommandRequest,
+  pendingMessage: string,
+  successMessage: string,
+  replyText: (text: string) => Promise<void>,
+): Promise<void> {
+  await replyText(pendingMessage);
+  const result = await commandTracker.request(ipc, {
+    ...request,
+    origin,
+    success_message: successMessage,
+  });
+  await replyText(commandResultText(result, successMessage));
+}
 
 /**
  * Request a screen capture from the wrapper via IPC.
@@ -103,6 +210,7 @@ let pendingInputRequest: { request_id: string; channelId: string; threadTs?: str
  */
 function requestCapture(all = false): Promise<string | null> {
   return new Promise((resolve) => {
+    const requestId = randomUUID();
     if (!ipc) {
       resolve(null);
       return;
@@ -113,7 +221,11 @@ function requestCapture(all = false): Promise<string | null> {
       localIpc.removeListener("message", handler);
     };
     const handler = (msg: WrapperToMcp) => {
-      if (msg.type === "capture_result") {
+      if (
+        msg.type === "capture_result" &&
+        // A missing ID is accepted from older wrappers.
+        (!msg.request_id || msg.request_id === requestId)
+      ) {
         cleanup();
         resolve(msg.text);
       }
@@ -121,9 +233,13 @@ function requestCapture(all = false): Promise<string | null> {
     const timeout = setTimeout(() => {
       cleanup();
       resolve(null);
-    }, 5000);
+    }, 65_000);
     localIpc.on("message", handler);
-    localIpc.send({ type: "capture", all } satisfies McpToWrapper);
+    localIpc.send({
+      type: "capture",
+      all,
+      request_id: requestId,
+    } satisfies McpToWrapper);
   });
 }
 
@@ -168,7 +284,7 @@ function requestEffortChange(effort: string): Promise<EffortResult> {
         availableEfforts,
         error: "wrapper 응답 시간 초과",
       });
-    }, 5000);
+    }, 180_000);
     localIpc.on("message", handler);
     localIpc.send({
       type: "effort",
@@ -881,11 +997,13 @@ function buildAskUserQuestionElements(
       style: "primary",
     });
   }
-  elements.push({
-    type: "button",
-    text: { type: "plain_text", text: "✏️ 직접 입력" },
-    action_id: `ask:custom:${requestId}`,
-  });
+  if (widget.allowOther !== false) {
+    elements.push({
+      type: "button",
+      text: { type: "plain_text", text: "✏️ 직접 입력" },
+      action_id: `ask:custom:${requestId}`,
+    });
+  }
   return elements;
 }
 
@@ -900,10 +1018,28 @@ async function handleInputRequest(
   requestId: string,
   question: string,
   widget: IpcAskWidget | undefined,
+  origin?: IpcOrigin,
 ): Promise<void> {
   stderr(`Input request: id=${requestId}, question=${question.slice(0, 100)}`);
 
-  const target = resolveDefaultChannel();
+  if (cancelledInputRequests.has(requestId)) return;
+
+  // The wrapper may broadcast for backwards compatibility. Only the named
+  // platform renders a turn-scoped request.
+  if (origin && !isOriginForPlatform(origin, "slack")) return;
+  if (widget?.isSecret) {
+    stderr("Refusing to render secret input request in Slack");
+    ipc?.send({
+      type: "input_request_failed",
+      request_id: requestId,
+      reason: "secret input is unsupported on public chat",
+    } satisfies McpToWrapper);
+    return;
+  }
+
+  const target = origin
+    ? { channelId: origin.chat_id, threadTs: origin.thread_ts }
+    : resolveDefaultChannel();
   if (!target) {
     stderr("No active channel for input request — notifying wrapper");
     ipc?.send({
@@ -919,6 +1055,8 @@ async function handleInputRequest(
       request_id: requestId,
       channelId: target.channelId,
       threadTs: target.threadTs,
+      userId: origin?.user,
+      origin,
     };
     if (widget) pendingAskUserQuestion.set(requestId, widget);
 
@@ -928,8 +1066,10 @@ async function handleInputRequest(
     );
     const chunks = splitMessage(text);
     for (let i = 0; i < chunks.length; i++) {
+      if (cancelledInputRequests.has(requestId)) return;
       const isLast = i === chunks.length - 1;
       if (isLast && widget) {
+        const elements = buildAskUserQuestionElements(requestId, widget);
         await web.chat.postMessage({
           channel: target.channelId,
           text: chunks[i],
@@ -938,10 +1078,9 @@ async function handleInputRequest(
               type: "section",
               text: { type: "mrkdwn", text: chunks[i] },
             },
-            {
-              type: "actions",
-              elements: buildAskUserQuestionElements(requestId, widget),
-            },
+            ...(elements.length > 0
+              ? [{ type: "actions" as const, elements }]
+              : []),
           ],
           ...(target.threadTs ? { thread_ts: target.threadTs } : {}),
         });
@@ -955,7 +1094,9 @@ async function handleInputRequest(
     }
   } catch (err) {
     stderr(`Failed to send input request to Slack: ${err}`);
-    pendingInputRequest = null;
+    if (pendingInputRequest?.request_id === requestId) {
+      pendingInputRequest = null;
+    }
     pendingAskUserQuestion.delete(requestId);
     ipc?.send({
       type: "input_request_failed",
@@ -1027,19 +1168,40 @@ async function handleSlackMessage(event: {
   const route = routeMessage(event.text ?? "");
   const displayName = await getUserDisplayName(event.user);
 
-  // If there is a pending input request, treat this message as the answer —
-  // except /capture, which should still run so the user can inspect the CLI
-  // state while it is waiting for input.
+  // Only plain chat messages answer a pending input request. Slash commands
+  // remain commands, so users can inspect, interrupt, or restart while Codex
+  // is waiting without accidentally submitting the command text as an answer.
   if (
     pendingInputRequest &&
-    event.channel === pendingInputRequest.channelId &&
-    route.type !== "capture"
+    (pendingInputRequest.origin
+      ? sameConversationOrigin(
+          pendingInputRequest.origin,
+          slackOrigin(event, event.user),
+        )
+      : sameSlackTarget(event, pendingInputRequest) &&
+        (!pendingInputRequest.userId ||
+          event.user === pendingInputRequest.userId)) &&
+    route.type === "message"
   ) {
     const { request_id } = pendingInputRequest;
+    const widget = pendingAskUserQuestion.get(request_id);
+    if (!isAllowedInputAnswer(widget, event.text ?? "")) {
+      await web.chat.postMessage({
+        channel: event.channel,
+        text: ":warning: 유효한 번호 또는 옵션 이름으로 답해주세요.",
+        ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+      });
+      return;
+    }
     pendingInputRequest = null;
     pendingAskUserQuestion.delete(request_id);
     stderr(`Input response from user: ${(event.text ?? "").slice(0, 100)}`);
-    ipc?.send({ type: "input_response", request_id, answer: event.text ?? "" } satisfies McpToWrapper);
+    ipc?.send({
+      type: "input_response",
+      request_id,
+      answer: event.text ?? "",
+      origin: slackOrigin(event, event.user),
+    } satisfies McpToWrapper);
     await web.chat.postMessage({
       channel: event.channel,
       text: msg("inputResponseSent"),
@@ -1059,21 +1221,36 @@ async function handleSlackMessage(event: {
 
   switch (route.type) {
     case "new":
-      await replyText(msg("newSession"));
-      ipc?.send({ type: "restart", reason: "new" } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "restart", reason: "new" },
+        msg("processing"),
+        msg("newSession"),
+        replyText,
+      );
       return;
 
     case "clear":
-      await replyText(msg("clearSession"));
-      ipc?.send({ type: "clear" } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "clear" },
+        msg("processing"),
+        msg("clearSession"),
+        replyText,
+      );
       return;
 
     case "compact":
-      await replyText(msg("compacting"));
-      ipc?.send({
-        type: "compact",
-        ...(route.args ? { hint: route.args } : {}),
-      } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        {
+          type: "compact",
+          ...(route.args ? { hint: route.args } : {}),
+        },
+        msg("compacting"),
+        ":white_check_mark: 컨텍스트 압축 완료.",
+        replyText,
+      );
       return;
 
     case "model": {
@@ -1089,8 +1266,13 @@ async function handleSlackMessage(event: {
           }
         : {};
       const resolved = modelMap[route.args] ?? route.args;
-      await replyText(msg("modelChanged", { model: resolved }));
-      ipc?.send({ type: "model", model: resolved } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "model", model: resolved },
+        msg("processing"),
+        msg("modelChanged", { model: resolved }),
+        replyText,
+      );
       return;
     }
 
@@ -1147,14 +1329,24 @@ async function handleSlackMessage(event: {
         await replyText(msg("cwdCurrent", { cwd: currentCwd }));
         return;
       }
-      await replyText(msg("cwdChanged", { path: route.args }));
-      ipc?.send({ type: "cwd", cwd: route.args } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "cwd", cwd: route.args },
+        msg("processing"),
+        msg("cwdChanged", { path: route.args }),
+        replyText,
+      );
       return;
     }
 
     case "esc":
-      await replyText(msg("escSent"));
-      ipc?.send({ type: "esc" } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "esc" },
+        msg("processing"),
+        msg("escSent"),
+        replyText,
+      );
       return;
 
     case "raw": {
@@ -1162,8 +1354,13 @@ async function handleSlackMessage(event: {
         await replyText(msg("rawMissing"));
         return;
       }
-      await replyText(msg("rawSent", { text: route.args }));
-      ipc?.send({ type: "raw", text: route.args } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "raw", text: route.args },
+        msg("processing"),
+        msg("rawSent", { text: route.args }),
+        replyText,
+      );
       return;
     }
 
@@ -1175,8 +1372,13 @@ async function handleSlackMessage(event: {
       const ack = route.args === "clear"
         ? msg("goalCleared")
         : msg("goalSet", { goal: route.args });
-      await replyText(ack);
-      ipc?.send({ type: "goal", args: route.args } satisfies McpToWrapper);
+      await runSlackCommand(
+        slackOrigin(event, event.user),
+        { type: "goal", args: route.args },
+        msg("processing"),
+        ack,
+        replyText,
+      );
       return;
     }
 
@@ -1192,8 +1394,10 @@ async function handleSlackMessage(event: {
         await replyText(msg("captureEmpty"));
         return;
       }
-      const chunks = splitMessage(`\`\`\`\n${screen}\n\`\`\``);
-      const toSend = all ? chunks : chunks.slice(-1);
+      const chunks = chunkCodeBlock(screen, 39000);
+      const toSend = all || AGENT_PROVIDER === "codex"
+        ? chunks
+        : chunks.slice(-1);
       for (const chunk of toSend) {
         await web.chat.postMessage({
           channel: event.channel,
@@ -1227,6 +1431,7 @@ async function handleSlackMessage(event: {
         chat_id: event.channel,
         message_id: event.ts,
         user: displayName,
+        user_id: event.user,
         ts: new Date(parseFloat(event.ts) * 1000).toISOString(),
       };
 
@@ -1336,8 +1541,39 @@ socketMode.on("interactive", async ({ body, ack }) => {
   if (kind === "ask") {
     const requestId = parts[2];
     if (!requestId || !channel || !ts) return;
+    const interactionContext = body as unknown as {
+      message?: { thread_ts?: string };
+      container?: { thread_ts?: string };
+      user?: { id?: string };
+    };
+    const interactionThreadTs =
+      interactionContext.message?.thread_ts ??
+      interactionContext.container?.thread_ts;
+    const interactionOrigin: IpcOrigin = {
+      source: "slack",
+      chat_id: channel,
+      message_id: ts,
+      ...(interactionContext.user?.id
+        ? { user: interactionContext.user.id }
+        : {}),
+      ...(interactionThreadTs ? { thread_ts: interactionThreadTs } : {}),
+    };
 
-    if (!pendingInputRequest || pendingInputRequest.request_id !== requestId) {
+    if (
+      !pendingInputRequest ||
+      pendingInputRequest.request_id !== requestId ||
+      (pendingInputRequest.origin
+        ? !sameConversationOrigin(
+            pendingInputRequest.origin,
+            interactionOrigin,
+          )
+        : !sameSlackTarget(
+            { channel, thread_ts: interactionThreadTs },
+            pendingInputRequest,
+          ) ||
+          (pendingInputRequest.userId !== undefined &&
+            interactionContext.user?.id !== pendingInputRequest.userId))
+    ) {
       // Stale click — request was already answered/cancelled.
       return;
     }
@@ -1348,6 +1584,9 @@ socketMode.on("interactive", async ({ body, ack }) => {
       if (!widget || !Number.isFinite(optionIndex)) return;
       const opt = widget.options[optionIndex - 1];
 
+      const responseOrigin = pendingInputRequest.origin
+        ? interactionOrigin
+        : undefined;
       pendingInputRequest = null;
       pendingAskUserQuestion.delete(requestId);
       stderr(`AskUserQuestion option ${optionIndex} clicked for ${requestId}`);
@@ -1355,6 +1594,7 @@ socketMode.on("interactive", async ({ body, ack }) => {
         type: "input_response",
         request_id: requestId,
         answer: String(optionIndex),
+        ...(responseOrigin ? { origin: responseOrigin } : {}),
       } satisfies McpToWrapper);
 
       const label = opt
@@ -1374,6 +1614,10 @@ socketMode.on("interactive", async ({ body, ack }) => {
     }
 
     if (parts[1] === "custom") {
+      const widget = pendingAskUserQuestion.get(requestId);
+      if (widget?.allowOther === false) {
+        return;
+      }
       stderr(`AskUserQuestion custom-answer button for ${requestId}`);
       // Keep pendingInputRequest set — the user's next text message becomes the answer.
       try {
@@ -1396,6 +1640,7 @@ socketMode.on("interactive", async ({ body, ack }) => {
 socketMode.on("connected", () => {
   slackReady = true;
   stderr("Slack Socket Mode connected");
+  void flushDeferredRoutedOutput();
 });
 
 socketMode.on("disconnected", () => {
@@ -1443,8 +1688,38 @@ async function main(): Promise<void> {
           `Config received: provider=${ipcMsg.provider} model=${ipcMsg.model} effort=${ipcMsg.effort || "default"} cwd=${ipcMsg.cwd}`,
         );
       } else if (ipcMsg.type === "input_request") {
-        handleInputRequest(ipcMsg.request_id, ipcMsg.question, ipcMsg.widget).catch((err) => {
+        handleInputRequest(
+          ipcMsg.request_id,
+          ipcMsg.question,
+          ipcMsg.widget,
+          ipcMsg.origin,
+        ).catch((err) => {
           stderr(`Input request handler error: ${err}`);
+        });
+      } else if (ipcMsg.type === "input_request_cancel") {
+        cancelledInputRequests.add(ipcMsg.request_id);
+        setTimeout(
+          () => cancelledInputRequests.delete(ipcMsg.request_id),
+          INPUT_REQUEST_TOMBSTONE_MS,
+        ).unref();
+        pendingAskUserQuestion.delete(ipcMsg.request_id);
+        if (
+          isMatchingInputRequest(
+            pendingInputRequest?.request_id,
+            ipcMsg.request_id,
+          )
+        ) {
+          pendingInputRequest = null;
+        }
+      } else if (ipcMsg.type === "command_result") {
+        if (!commandTracker.settle(ipcMsg)) {
+          deliverRoutedOutput(ipcMsg).catch((err) => {
+            stderr(`Command result delivery error: ${err}`);
+          });
+        }
+      } else if (ipcMsg.type === "agent_reply") {
+        deliverRoutedOutput(ipcMsg).catch((err) => {
+          stderr(`Agent reply delivery error: ${err}`);
         });
       }
     });
@@ -1457,7 +1732,7 @@ async function main(): Promise<void> {
       // Socket Mode round-robin and reply with captureNoResponse / lose user msgs.
       setTimeout(() => process.exit(0), 100);
     });
-    ipc.send({ type: "ready" } satisfies McpToWrapper);
+    ipc.send({ type: "ready", source: "slack" } satisfies McpToWrapper);
   } catch (err) {
     stderr(`IPC connect failed: ${err}`);
   }

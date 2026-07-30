@@ -3,6 +3,7 @@
  *
  * Exports:
  *   chunkText — split long text along paragraph / line / space boundaries.
+ *   chunkCodeBlock — split text into independently fenced Markdown code blocks.
  *
  * Example:
  *   >>> chunkText("para1\n\npara2", 8);
@@ -54,4 +55,33 @@ export function chunkText(text: string, maxLen: number): string[] {
   }
   if (rest.length > 0) out.push(rest);
   return out;
+}
+
+/**
+ * Split text into Markdown code blocks that are each independently renderable.
+ *
+ * Backtick runs in terminal output are separated with an invisible character
+ * so Slack and Discord, which both document triple-backtick fences, cannot
+ * mistake captured Markdown for the outer closing fence. ``maxLen`` includes
+ * the opening/closing fences.
+ */
+export function chunkCodeBlock(
+  text: string,
+  maxLen: number,
+  language = "",
+): string[] {
+  const fence = "```";
+  const safeText = text.replace(/```/g, "``\u200b`");
+  const safeLanguage = language.replace(/[\r\n`]/g, "");
+  const prefix = `${fence}${safeLanguage}\n`;
+  const suffix = `\n${fence}`;
+  const contentLimit = maxLen - prefix.length - suffix.length;
+  if (contentLimit <= 0) {
+    throw new Error(
+      `chunkCodeBlock: maxLen ${maxLen} is too small for code fences`,
+    );
+  }
+  return chunkText(safeText, contentLimit).map(
+    (chunk) => `${prefix}${chunk}${suffix}`,
+  );
 }

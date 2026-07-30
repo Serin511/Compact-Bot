@@ -35,6 +35,10 @@ import {
   type JsonLineSocket,
   type AskQuestion,
   type AskUserQuestionInput,
+  type IpcOrigin,
+  type IpcCommandRequest,
+  type IpcCommandResult,
+  sameConversationOrigin,
 } from "./ipc.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -42,6 +46,7 @@ import {
   type CodexMcpServerConfig,
   type CodexQuestion,
 } from "./codex-app-server.js";
+import { CodexDeliveryTracker } from "./codex-delivery.js";
 
 setVerbose(config.verbose);
 
@@ -77,9 +82,29 @@ let claudeProcess: pty.IPty | null = null;
 let codexBackend: CodexAppServer | null = null;
 let codexStartPromise: Promise<void> | null = null;
 let codexSessionChanging = false;
-const mcpClients = new Set<JsonLineSocket>();
+/** Ready platform clients and the source they serve (`null` = legacy peer). */
+const mcpClients = new Map<JsonLineSocket, IpcOrigin["source"] | null>();
+/** Serialize ingress and lifecycle operations across app-server generations. */
+let codexOperationQueue: Promise<void> = Promise.resolve();
+/** One delayed unexpected-exit recovery at a time. */
+let codexRespawnTimer: ReturnType<typeof setTimeout> | null = null;
 let expectedExit = false;
 let spawnGrace = false;
+
+function enqueueCodexOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const run = codexOperationQueue.then(operation);
+  codexOperationQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+function cancelScheduledCodexRespawn(): void {
+  if (!codexRespawnTimer) return;
+  clearTimeout(codexRespawnTimer);
+  codexRespawnTimer = null;
+}
 
 // ── AskUserQuestion (hook) input routing state ───────────────────────
 //
@@ -98,7 +123,13 @@ interface PendingQuestion {
   index: number;
   total: number;
   /** Present only for Codex app-server questions. */
-  resolve?: (answer: string) => void;
+  resolve?: (answer: string | null) => void;
+  /** Exact channel/user that owns a Codex question or approval. */
+  origin?: IpcOrigin;
+  /** Codex-provided auto-resolution window for this request. */
+  autoResolutionMs?: number | null;
+  /** Whether Codex accepts a free-form answer in addition to listed options. */
+  isOther?: boolean;
 }
 
 interface ActiveInputRequest {
@@ -135,6 +166,11 @@ const SUBMIT_DETECT_INITIAL_DELAY_MS = 200;
 const SUBMIT_DETECT_POLL_MS = 100;
 /** Give up looking for the Submit page after this much wall-clock time. */
 const SUBMIT_DETECT_TIMEOUT_MS = 1500;
+
+/** Delivery state is keyed by turn so a final fallback is never duplicated. */
+const codexDeliveryTracker = new CodexDeliveryTracker();
+/** Routed output can briefly outlive an MCP child during a runtime restart. */
+const pendingRoutedOutput: WrapperToMcp[] = [];
 
 // ── virtual terminal (screen buffer) ─────────────────────────────────
 
@@ -192,11 +228,25 @@ async function captureScreen(all = false): Promise<string> {
  */
 function clearActiveInputRequest(reason: string): void {
   if (activeInputRequest === null) return;
-  log.debug(`Clearing active input request ${activeInputRequest.id}: ${reason}`);
+  const requestId = activeInputRequest.id;
+  log.debug(`Clearing active input request ${requestId}: ${reason}`);
   activeInputRequest = null;
   if (inputRequestExpiry) {
     clearTimeout(inputRequestExpiry);
     inputRequestExpiry = null;
+  }
+  sendRoutedOutput({
+    type: "input_request_cancel",
+    request_id: requestId,
+  });
+}
+
+function cancelQuestionRelay(reason: string): void {
+  const active = activeInputRequest?.pending;
+  clearActiveInputRequest(reason);
+  active?.resolve?.(null);
+  for (const pending of questionQueue.splice(0)) {
+    pending.resolve?.(null);
   }
 }
 
@@ -220,6 +270,80 @@ function renderQuestionText(pending: PendingQuestion): string {
   return out.join("\n");
 }
 
+function originFromMeta(
+  source: "discord" | "slack",
+  meta: Record<string, string>,
+): IpcOrigin | null {
+  const chatId = meta.chat_id;
+  const messageId = meta.message_id;
+  if (!chatId || !messageId) return null;
+  return {
+    source,
+    chat_id: chatId,
+    message_id: messageId,
+    ...(meta.user_id ? { user: meta.user_id } : {}),
+    ...(meta.ts ? { ts: meta.ts } : {}),
+    ...(meta.thread_ts ? { thread_ts: meta.thread_ts } : {}),
+  };
+}
+
+function rememberCodexOrigin(origin: IpcOrigin | null): void {
+  codexDeliveryTracker.setOrigin(origin, codexBackend?.currentTurnId);
+}
+
+function routedMessageOrigin(message: WrapperToMcp): IpcOrigin | undefined {
+  return message.type === "command_result" || message.type === "agent_reply"
+    ? message.origin
+    : undefined;
+}
+
+function clientsForOrigin(origin: IpcOrigin): JsonLineSocket[] {
+  const exact = [...mcpClients.entries()]
+    .filter(([, source]) => source === origin.source)
+    .map(([client]) => client);
+  if (exact.length > 0) return exact;
+  return [...mcpClients.entries()]
+    .filter(([, source]) => source === null)
+    .map(([client]) => client);
+}
+
+function sendRoutedOutput(message: WrapperToMcp): void {
+  const origin = routedMessageOrigin(message);
+  if (origin) {
+    const targets = clientsForOrigin(origin);
+    if (targets.length > 0) {
+      // Only one process should own a platform realtime connection. Choosing
+      // the newest matching ready peer also avoids duplicate ACKs during the
+      // brief overlap of a runtime replacement.
+      targets[targets.length - 1].send(message);
+      return;
+    }
+    pendingRoutedOutput.push(message);
+    if (pendingRoutedOutput.length > 100) pendingRoutedOutput.shift();
+    return;
+  }
+
+  if (mcpClients.size === 0) return;
+  for (const client of mcpClients.keys()) client.send(message);
+}
+
+function flushRoutedOutput(
+  client: JsonLineSocket,
+  source: IpcOrigin["source"] | null,
+): void {
+  if (pendingRoutedOutput.length === 0) return;
+  const retained: WrapperToMcp[] = [];
+  for (const message of pendingRoutedOutput.splice(0)) {
+    const origin = routedMessageOrigin(message);
+    if (origin && source !== null && origin.source !== source) {
+      retained.push(message);
+      continue;
+    }
+    client.send(message);
+  }
+  pendingRoutedOutput.push(...retained);
+}
+
 /**
  * Send the next question in the queue to whichever MCP servers are
  * connected, and arm the TTL timer.
@@ -231,7 +355,17 @@ function presentNextQuestion(): void {
   const next = questionQueue.shift();
   if (!next) return;
 
-  if (mcpClients.size === 0) {
+  const matchingClients = next.origin
+    ? clientsForOrigin(next.origin)
+    : [...mcpClients.keys()];
+  // A Codex question has one exact platform owner. During a brief MCP
+  // generation overlap, use only the newest matching client so the same
+  // approval widget is not posted twice.
+  const clients =
+    next.origin && matchingClients.length > 0
+      ? [matchingClients[matchingClients.length - 1]]
+      : matchingClients;
+  if (clients.length === 0) {
     // Nothing connected — drop the question and warn loudly. Without this
     // guard the wrapper would silently swallow the AskUserQuestion call,
     // leaving Claude Code stuck on the (un-rendered-to-channel) Ink widget.
@@ -240,7 +374,7 @@ function presentNextQuestion(): void {
         "Codex requested user input but no platform MCP server is connected",
         new Error("no MCP client"),
       );
-      next.resolve("");
+      next.resolve(null);
       setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
     } else {
       log.error(
@@ -252,15 +386,28 @@ function presentNextQuestion(): void {
   }
 
   const requestId = randomUUID();
-  activeInputRequest = { id: requestId, pending: next, recipientCount: mcpClients.size, failCount: 0 };
-  inputRequestExpiry = setTimeout(() => {
-    log.debug(`Input request ${requestId} TTL expired`);
-    const expired = activeInputRequest?.pending;
-    activeInputRequest = null;
-    inputRequestExpiry = null;
-    expired?.resolve?.("");
-    setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
-  }, INPUT_REQUEST_TTL_MS);
+  activeInputRequest = {
+    id: requestId,
+    pending: next,
+    recipientCount: clients.length,
+    failCount: 0,
+  };
+  const requestTtl = next.resolve
+    ? (
+        typeof next.autoResolutionMs === "number"
+          ? Math.max(0, next.autoResolutionMs)
+          : null
+      )
+    : INPUT_REQUEST_TTL_MS;
+  if (requestTtl !== null) {
+    inputRequestExpiry = setTimeout(() => {
+      log.debug(`Input request ${requestId} TTL expired`);
+      const expired = activeInputRequest?.pending;
+      clearActiveInputRequest("TTL expired");
+      expired?.resolve?.(null);
+      setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
+    }, requestTtl);
+  }
 
   const message: WrapperToMcp = {
     type: "input_request",
@@ -275,12 +422,15 @@ function presentNextQuestion(): void {
       })),
       questionIndex: next.index,
       questionTotal: next.total,
+      allowOther: next.isOther ?? true,
+      isSecret: false,
     },
+    ...(next.origin ? { origin: next.origin } : {}),
   };
   log.debug(
     `Presenting AskUserQuestion (id=${requestId}, q=${next.index}/${next.total}, options=${next.question.options.length})`,
   );
-  for (const client of mcpClients) {
+  for (const client of clients) {
     client.send(message);
   }
 }
@@ -324,7 +474,29 @@ function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
  * Present one Codex app-server question through the existing Discord/Slack
  * question UI and resolve with the user's selected label or free-form answer.
  */
-function askCodexQuestion(question: CodexQuestion): Promise<string> {
+function askCodexQuestion(question: CodexQuestion): Promise<string | null> {
+  const origin = codexDeliveryTracker.originForTurn(question.turnId);
+  if (
+    typeof question.autoResolutionMs === "number" &&
+    question.autoResolutionMs <= 0
+  ) {
+    return Promise.resolve(null);
+  }
+  if (question.isSecret) {
+    log.error(
+      "Declining Codex secret input request because chat channels are not private input surfaces",
+      new Error("secret input is unsupported"),
+    );
+    if (origin) {
+      sendRoutedOutput({
+        type: "agent_reply",
+        origin,
+        text:
+          "⚠️ Codex가 비밀 입력을 요청했지만 공개 채팅에서는 안전하게 받을 수 없어 요청을 거부했습니다.",
+      });
+    }
+    return Promise.resolve(null);
+  }
   return new Promise((resolve) => {
     questionQueue.push({
       question: {
@@ -335,6 +507,9 @@ function askCodexQuestion(question: CodexQuestion): Promise<string> {
       index: 1,
       total: 1,
       resolve,
+      origin: origin ?? undefined,
+      autoResolutionMs: question.autoResolutionMs,
+      isOther: question.isOther,
     });
     presentNextQuestion();
   });
@@ -384,7 +559,11 @@ async function waitForSubmitConfirmPage(): Promise<boolean> {
   return false;
 }
 
-function handleInputResponse(requestId: string, answer: string): void {
+function handleInputResponse(
+  requestId: string,
+  answer: string,
+  origin?: IpcOrigin,
+): void {
   if (!activeInputRequest || activeInputRequest.id !== requestId) {
     log.debug(
       `Ignoring stale input response (expected=${activeInputRequest?.id}, got=${requestId})`,
@@ -393,6 +572,15 @@ function handleInputResponse(requestId: string, answer: string): void {
   }
 
   const pending = activeInputRequest.pending;
+  if (
+    pending.origin &&
+    (!origin || !sameConversationOrigin(pending.origin, origin))
+  ) {
+    log.debug(
+      `Ignoring input response from the wrong target (expected=${pending.origin.source}:${pending.origin.chat_id}, got=${origin?.source ?? "unknown"}:${origin?.chat_id ?? "unknown"})`,
+    );
+    return;
+  }
   const optionCount = pending.question.options.length;
   const isLastQuestion = pending.index >= pending.total;
   log.debug(`Input response received (id=${requestId}): ${answer.slice(0, 100)}`);
@@ -406,7 +594,12 @@ function handleInputResponse(requestId: string, answer: string): void {
       const selected = pending.question.options[index];
       pending.resolve(selected?.label ?? trimmed);
     } else {
-      pending.resolve(trimmed);
+      const selected = pending.question.options.find(
+        (option) => option.label === trimmed,
+      );
+      pending.resolve(
+        selected?.label ?? (pending.isOther === false ? "" : trimmed),
+      );
     }
     setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
     return;
@@ -486,10 +679,7 @@ function handleInputRequestFailed(requestId: string, reason: string): void {
   );
   if (activeInputRequest.failCount >= activeInputRequest.recipientCount) {
     log.debug(`All recipients failed for ${requestId} — dropping request`);
-    const failed = activeInputRequest.pending;
-    clearActiveInputRequest(`all recipients failed`);
-    failed.resolve?.("");
-    for (const pending of questionQueue.splice(0)) pending.resolve?.("");
+    cancelQuestionRelay("all recipients failed");
   }
 }
 
@@ -643,6 +833,11 @@ function runClaudeMcpCommand(args: string[], cwd: string): boolean {
  * bot are not supported (single SOCKET_PATH).
  */
 function killStaleMcpServers(): void {
+  // Integration tests start an isolated wrapper with a fake app-server while
+  // a developer may have a real Compact Bot running from the same checkout.
+  // Never let that fixture's broad process cleanup terminate the live bot.
+  if (process.env.NODE_ENV === "test") return;
+
   const distMcp = join(DIST_DIR, "mcp-server.js");
   const distSlack = join(DIST_DIR, "slack-mcp-server.js");
   for (const target of [distMcp, distSlack]) {
@@ -864,6 +1059,13 @@ function resolveCodexPath(): string | null {
         stdio: ["ignore", "ignore", "ignore"],
         timeout: 5000,
       });
+      // Some npm shims can print their JavaScript wrapper version even when
+      // the platform-native binary they delegate `app-server` to is missing.
+      // Verify the exact subcommand Compact Bot needs before selecting it.
+      execFileSync(candidate, ["app-server", "--help"], {
+        stdio: ["ignore", "ignore", "ignore"],
+        timeout: 5000,
+      });
       return true;
     } catch {
       return false;
@@ -909,14 +1111,50 @@ function codexDeveloperInstructions(): string {
   return custom ? `${bridgeInstructions}\n\n${custom}` : bridgeInstructions;
 }
 
-async function spawnCodex(): Promise<void> {
+function observeCodexNotification(
+  method: string,
+  params: Record<string, unknown>,
+): void {
+  const fallback = codexDeliveryTracker.observe(method, params);
+  if (fallback) {
+    sendRoutedOutput({
+      type: "agent_reply",
+      origin: fallback.origin,
+      text: fallback.text,
+    });
+  }
+}
+
+function scheduleCodexRespawn(): void {
+  if (codexRespawnTimer || codexSessionChanging || expectedExit) return;
+  codexRespawnTimer = setTimeout(() => {
+    codexRespawnTimer = null;
+    if (codexSessionChanging || codexBackend || expectedExit) return;
+    log.debug("Auto-respawning Codex app-server...");
+    void enqueueCodexOperation(async () => {
+      if (codexSessionChanging || codexBackend || expectedExit) return;
+      await spawnCodex(false);
+    }).catch((error) => {
+      log.error("Codex auto-respawn failed", error);
+      scheduleCodexRespawn();
+    });
+  }, 2000);
+}
+
+async function spawnCodex(exitOnFailure = true): Promise<void> {
   if (!resolvedCodexPath) {
-    console.error(
+    const error = new Error(
+      `Codex CLI를 찾을 수 없습니다: ${config.codexPath}`,
+    );
+    const message =
       `\n  Codex CLI 실행에 실패했습니다.\n` +
       `  CODEX_PATH: ${config.codexPath}\n\n` +
-      `  Codex CLI를 설치·로그인한 뒤 CODEX_PATH에 실행 파일 경로를 지정하세요.\n`,
-    );
-    process.exit(1);
+      `  Codex CLI를 설치·로그인한 뒤 CODEX_PATH에 실행 파일 경로를 지정하세요.\n`;
+    if (exitOnFailure) {
+      console.error(message);
+      process.exit(1);
+    }
+    throw error;
   }
 
   killStaleMcpServers();
@@ -966,19 +1204,36 @@ async function spawnCodex(): Promise<void> {
     },
   );
   backend.on(
+    "notification",
+    ({
+      method,
+      params,
+    }: {
+      method: string;
+      params: Record<string, unknown>;
+    }) => {
+      observeCodexNotification(method, params);
+    },
+  );
+  backend.on(
     "exit",
     ({ code, expected }: { code: number | null; expected: boolean }) => {
-      if (codexBackend === backend) codexBackend = null;
+      const wasCurrent = codexBackend === backend;
+      if (wasCurrent) codexBackend = null;
       log.debug(`Codex app-server exited (code ${code ?? "null"})`);
       if (expected || expectedExit) {
         expectedExit = false;
         return;
       }
+      // Ignore a late event from a generation that has already been replaced.
+      if (!wasCurrent && codexBackend) return;
       log.error("Codex app-server exited unexpectedly", new Error(`exit ${code}`));
-      setTimeout(() => {
-        log.debug("Auto-respawning Codex app-server...");
-        void spawnCodex();
-      }, 2000);
+      cancelQuestionRelay("Codex app-server exited unexpectedly");
+      codexDeliveryTracker.clearTurns();
+      mcpClients.clear();
+      // An explicit restart owns recovery while it is replacing generations;
+      // scheduling a second spawn here would create duplicate MCP children.
+      if (!codexSessionChanging) scheduleCodexRespawn();
     },
   );
 
@@ -1001,13 +1256,16 @@ async function spawnCodex(): Promise<void> {
     if (codexBackend === backend) codexBackend = null;
     await backend.stop().catch(() => {});
     log.error("Failed to start Codex app-server", error);
-    console.error(
+    const message =
       `\n  Codex app-server 시작에 실패했습니다.\n` +
       `  경로: ${resolvedCodexPath}\n` +
       `  CWD:  ${state.cwd}\n\n` +
-      `  codex login 상태와 CODEX_PATH를 확인하세요.\n`,
-    );
-    process.exit(1);
+      `  codex login 상태와 CODEX_PATH를 확인하세요.\n`;
+    if (exitOnFailure) {
+      console.error(message);
+      process.exit(1);
+    }
+    throw error;
   } finally {
     if (codexBackend === backend) codexStartPromise = null;
   }
@@ -1153,26 +1411,52 @@ function killClaude(): Promise<void> {
 async function restart(updates?: Partial<WrapperState>): Promise<void> {
   const previousState = { ...state };
   if (updates) Object.assign(state, updates);
+  if (
+    config.agentProvider === "codex" &&
+    updates?.model &&
+    codexBackend
+  ) {
+    state.effort = codexBackend.effortForModel(
+      updates.model,
+      state.effort,
+    );
+  }
 
   log.debug(
     `Starting fresh ${config.agentProvider} session (model=${state.model}, cwd=${state.cwd})`,
   );
 
   if (config.agentProvider === "codex") {
-    const active = activeInputRequest?.pending;
-    clearActiveInputRequest("Codex session restart");
-    active?.resolve?.("");
-    for (const pending of questionQueue.splice(0)) pending.resolve?.("");
+    cancelScheduledCodexRespawn();
+    cancelQuestionRelay("Codex session restart");
+    codexDeliveryTracker.clearTurns();
     codexSessionChanging = true;
+    const previousBackend = codexBackend;
     try {
-      await codexBackend?.newSession({
-        model: state.model,
-        effort: state.effort,
-        cwd: state.cwd,
-      });
+      // Codex starts configured MCP servers per loaded thread. Merely creating
+      // another thread leaves the old Discord/Slack child alive and holding
+      // the single-instance realtime lock, so the new thread's reply tools
+      // become inert. Replace the whole app-server generation to terminate
+      // every old goal, subscription, and MCP child before a fresh thread.
+      if (previousBackend) await previousBackend.closeSession();
+      if (codexBackend === previousBackend) codexBackend = null;
+      codexStartPromise = null;
+      mcpClients.clear();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      await spawnCodex(false);
     } catch (error) {
       Object.assign(state, previousState);
       broadcastConfig();
+      if (!codexBackend) {
+        try {
+          await spawnCodex(false);
+        } catch (rollbackError) {
+          log.error(
+            "Failed to restore previous Codex runtime after restart error",
+            rollbackError,
+          );
+        }
+      }
       throw error;
     } finally {
       codexSessionChanging = false;
@@ -1184,8 +1468,7 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   await killClaude();
   mcpClients.clear();
 
-  clearActiveInputRequest("restart");
-  questionQueue.length = 0;
+  cancelQuestionRelay("restart");
 
   // Reset virtual terminal for fresh session
   vterm.dispose();
@@ -1244,7 +1527,132 @@ function broadcastConfig(): void {
         : [],
     cwd: state.cwd,
   };
-  for (const client of mcpClients) client.send(message);
+  for (const client of mcpClients.keys()) client.send(message);
+}
+
+function originMeta(origin: IpcOrigin): Record<string, string> {
+  return {
+    chat_id: origin.chat_id,
+    message_id: origin.message_id,
+    ...(origin.user ? { user_id: origin.user } : {}),
+    ...(origin.ts ? { ts: origin.ts } : {}),
+    ...(origin.thread_ts ? { thread_ts: origin.thread_ts } : {}),
+  };
+}
+
+function completeMutableCommand(
+  command: IpcCommandRequest,
+  ok: boolean,
+  error?: unknown,
+): void {
+  if (!command.request_id) return;
+  const result: IpcCommandResult = {
+    type: "command_result",
+    request_id: command.request_id,
+    command: command.type,
+    ok,
+    ...(command.origin ? { origin: command.origin } : {}),
+    ...(ok && command.success_message
+      ? { message: command.success_message }
+      : {}),
+    ...(!ok
+      ? {
+          error:
+            error instanceof Error ? error.message : String(error ?? "알 수 없는 오류"),
+        }
+      : {}),
+  };
+  sendRoutedOutput(result);
+}
+
+async function executeMutableCommand(
+  command: IpcCommandRequest,
+): Promise<void> {
+  switch (command.type) {
+    case "restart":
+      await restart();
+      return;
+    case "clear":
+      if (config.agentProvider === "codex") await restart();
+      else {
+        cancelQuestionRelay("clear command");
+        writeToPty("/clear\r");
+      }
+      return;
+    case "compact": {
+      const hint = command.hint ? ` ${command.hint}` : "";
+      if (config.agentProvider === "codex") {
+        log.debug(`Compact via Codex app-server${hint}`);
+        if (!codexBackend) throw new Error("Codex backend가 준비되지 않았습니다");
+        await codexBackend.compact(command.hint);
+      } else {
+        log.debug(`Compact via PTY: /compact${hint}`);
+        writeToPtyAndEnter(`/compact${hint}`);
+      }
+      return;
+    }
+    case "model":
+      await restart({ model: command.model });
+      return;
+    case "cwd":
+      await restart({ cwd: command.cwd });
+      return;
+    case "esc":
+      cancelQuestionRelay("interrupt command");
+      if (config.agentProvider === "codex") {
+        log.debug("Interrupt via Codex app-server");
+        if (!codexBackend) throw new Error("Codex backend가 준비되지 않았습니다");
+        await codexBackend.interrupt();
+      } else {
+        log.debug("ESC via PTY");
+        writeToPty("\x1b");
+      }
+      return;
+    case "raw":
+      if (config.agentProvider === "codex") {
+        log.debug(`Raw Codex turn input: ${command.text.slice(0, 80)}`);
+        if (!codexBackend) throw new Error("Codex backend가 준비되지 않았습니다");
+        if (command.origin) {
+          rememberCodexOrigin(command.origin);
+          const submitted = await codexBackend.submitChannelMessage(
+            command.origin.source,
+            command.text,
+            originMeta(command.origin),
+          );
+          codexDeliveryTracker.setOriginForTurn(
+            submitted.turnId,
+            command.origin,
+          );
+        } else {
+          await codexBackend.submitText(command.text);
+        }
+      } else {
+        log.debug(`Raw PTY input: ${command.text.slice(0, 80)}`);
+        writeToPtyAndEnter(command.text);
+      }
+      return;
+    case "goal": {
+      const args = command.args.replace(/[\r\n]+/g, " ").trim();
+      if (config.agentProvider === "codex") {
+        log.debug(`Goal via Codex app-server: ${args.slice(0, 80)}`);
+        if (!codexBackend) throw new Error("Codex backend가 준비되지 않았습니다");
+        if (command.origin && args !== "clear") {
+          // Goal creation can schedule an automatic turn. Remember its
+          // destination without reassigning any turn already in progress.
+          codexDeliveryTracker.setCurrentOrigin(command.origin);
+        }
+        await codexBackend.setGoal(
+          args,
+          command.origin?.source,
+          command.origin ? originMeta(command.origin) : undefined,
+        );
+      } else {
+        log.debug(`Goal via PTY: /goal ${args.slice(0, 80)}`);
+        writeToPtyAndEnter(`/goal ${args}`);
+      }
+      return;
+    }
+  }
 }
 
 function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
@@ -1254,14 +1662,54 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
         log.debug("Ignoring direct user_message while using Claude MCP Channels");
         break;
       }
-      void (async () => {
-        await codexStartPromise;
-        await codexBackend?.submitChannelMessage(msg.source, msg.content, msg.meta);
-      })().catch((error) => log.error("Failed to deliver message to Codex", error));
+      {
+        const origin = originFromMeta(msg.source, msg.meta);
+        void enqueueCodexOperation(async () => {
+          await codexStartPromise;
+          if (!codexBackend) {
+            throw new Error("Codex backend가 준비되지 않았습니다");
+          }
+          rememberCodexOrigin(origin);
+          const submitted = await codexBackend.submitChannelMessage(
+            msg.source,
+            msg.content,
+            msg.meta,
+          );
+          if (origin) {
+            codexDeliveryTracker.setOriginForTurn(submitted.turnId, origin);
+          }
+        }).catch((error) => {
+          log.error("Failed to deliver message to Codex", error);
+          if (origin) {
+            sendRoutedOutput({
+              type: "agent_reply",
+              origin,
+              text: `⚠️ Codex에 메시지를 전달하지 못했습니다: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            });
+          }
+        });
+      }
       break;
     case "restart":
-      log.debug(`Restart requested: ${msg.reason}`);
-      void restart().catch((error) => log.error("Restart failed", error));
+    case "compact":
+    case "clear":
+    case "model":
+    case "cwd":
+    case "esc":
+    case "raw":
+    case "goal":
+      void (
+        config.agentProvider === "codex"
+          ? enqueueCodexOperation(() => executeMutableCommand(msg))
+          : executeMutableCommand(msg)
+      ).then(() => {
+        completeMutableCommand(msg, true);
+      }).catch((error) => {
+        log.error(`${msg.type} command failed`, error);
+        completeMutableCommand(msg, false, error);
+      });
       break;
     case "pre_ask_user_question":
       log.debug(
@@ -1269,129 +1717,80 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
       );
       handlePreAskUserQuestion(msg.tool_input);
       break;
-    case "compact": {
-      const hint = msg.hint ? ` ${msg.hint}` : "";
-      if (config.agentProvider === "codex") {
-        log.debug(`Compact via Codex app-server${hint}`);
-        void codexBackend
-          ?.compact(msg.hint)
-          .catch((error) => log.error("Codex compaction failed", error));
-      } else {
-        log.debug(`Compact via PTY: /compact${hint}`);
-        writeToPtyAndEnter(`/compact${hint}`);
-      }
-      break;
-    }
-    case "clear":
-      if (config.agentProvider === "codex") {
-        log.debug("Clear via fresh Codex thread");
-        void restart().catch((error) => log.error("Codex clear failed", error));
-      } else {
-        log.debug("Clear via PTY: /clear");
-        writeToPty("/clear\r");
-      }
-      break;
-    case "esc":
-      // Safety net — sends the ESC key to interrupt whatever Claude Code
-      // is doing. Useful when a tool call or prompt gets stuck and the
-      // user needs to break the session without a full restart.
-      if (config.agentProvider === "codex") {
-        log.debug("Interrupt via Codex app-server");
-        void codexBackend
-          ?.interrupt()
-          .catch((error) => log.error("Codex interrupt failed", error));
-      } else {
-        log.debug("ESC via PTY");
-        writeToPty("\x1b");
-      }
-      break;
-    case "raw":
-      // Pass-through — type the given text into the CLI verbatim,
-      // followed by Enter. Lets the user run any CLI command that
-      // isn't explicitly wired into the bot (e.g. /agents, /config).
-      if (config.agentProvider === "codex") {
-        log.debug(`Raw Codex turn input: ${msg.text.slice(0, 80)}`);
-        void codexBackend
-          ?.submitText(msg.text)
-          .catch((error) => log.error("Codex raw input failed", error));
-      } else {
-        log.debug(`Raw PTY input: ${msg.text.slice(0, 80)}`);
-        writeToPtyAndEnter(msg.text);
-      }
-      break;
-    case "goal":
-      // /goal is a CLI-handled inline command (Claude Code 2.1.139+).
-      // The CLI loops turns until the stated condition is met; `/goal clear`
-      // exits the mode. We just forward the raw arg string to the PTY.
-      const goalArgs = msg.args.replace(/[\r\n]+/g, " ").trim();
-      if (config.agentProvider === "codex") {
-        log.debug(`Goal via Codex app-server: ${goalArgs.slice(0, 80)}`);
-        void codexBackend
-          ?.setGoal(goalArgs)
-          .catch((error) => log.error("Codex goal update failed", error));
-      } else {
-        log.debug(`Goal via PTY: /goal ${goalArgs.slice(0, 80)}`);
-        writeToPtyAndEnter(`/goal ${goalArgs}`);
-      }
-      break;
-    case "model":
-      log.debug(`Model change: ${msg.model}`);
-      void restart({ model: msg.model }).catch((error) =>
-        log.error("Model change failed", error),
-      );
-      break;
-    case "effort":
-      try {
-        if (config.agentProvider !== "codex") {
-          throw new Error("/effort는 Codex 모드에서만 사용할 수 있습니다");
+    case "effort": {
+      void enqueueCodexOperation(async () => {
+        try {
+          if (config.agentProvider !== "codex") {
+            throw new Error("/effort는 Codex 모드에서만 사용할 수 있습니다");
+          }
+          if (!codexBackend) {
+            throw new Error("Codex backend가 준비되지 않았습니다");
+          }
+          if (!codexBackend.currentThreadId || codexSessionChanging) {
+            throw new Error("Codex thread가 전환 중입니다. 잠시 후 다시 시도해주세요");
+          }
+          codexBackend.setEffort(msg.effort);
+          state.effort = codexBackend.currentEffort;
+          log.debug(`Reasoning effort change: ${state.effort}`);
+          broadcastConfig();
+          sender.send({
+            type: "effort_result",
+            request_id: msg.request_id,
+            ok: true,
+            effort: state.effort,
+            availableEfforts: codexBackend.availableEfforts,
+          } satisfies WrapperToMcp);
+        } catch (error) {
+          log.error("Reasoning effort change failed", error);
+          sender.send({
+            type: "effort_result",
+            request_id: msg.request_id,
+            ok: false,
+            effort: state.effort,
+            availableEfforts: codexBackend?.availableEfforts ?? [],
+            error: error instanceof Error ? error.message : String(error),
+          } satisfies WrapperToMcp);
         }
-        if (!codexBackend) {
-          throw new Error("Codex backend가 준비되지 않았습니다");
-        }
-        if (!codexBackend.currentThreadId || codexSessionChanging) {
-          throw new Error("Codex thread가 전환 중입니다. 잠시 후 다시 시도해주세요");
-        }
-        codexBackend.setEffort(msg.effort);
-        state.effort = codexBackend.currentEffort;
-        log.debug(`Reasoning effort change: ${state.effort}`);
-        broadcastConfig();
-        sender.send({
-          type: "effort_result",
-          request_id: msg.request_id,
-          ok: true,
-          effort: state.effort,
-          availableEfforts: codexBackend.availableEfforts,
-        } satisfies WrapperToMcp);
-      } catch (error) {
-        log.error("Reasoning effort change failed", error);
-        sender.send({
-          type: "effort_result",
-          request_id: msg.request_id,
-          ok: false,
-          effort: state.effort,
-          availableEfforts: codexBackend?.availableEfforts ?? [],
-          error: error instanceof Error ? error.message : String(error),
-        } satisfies WrapperToMcp);
-      }
-      break;
-    case "cwd":
-      log.debug(`CWD change: ${msg.cwd}`);
-      void restart({ cwd: msg.cwd }).catch((error) =>
-        log.error("CWD change failed", error),
-      );
-      break;
-    case "capture": {
-      const capture = config.agentProvider === "codex"
-        ? Promise.resolve(codexBackend?.captureStatus(msg.all === true) ?? "")
-        : captureScreen(msg.all === true);
-      capture.then((screen) => {
-        log.debug(`Screen capture requested (all=${msg.all === true}, ${screen.length} chars)`);
-        sender.send({ type: "capture_result", text: screen } satisfies WrapperToMcp);
       });
       break;
     }
-    case "ready":
-      log.debug("MCP server connected");
+    case "capture": {
+      const capture = async (): Promise<void> => {
+        let screen: string;
+        if (config.agentProvider === "codex") {
+          if (!codexBackend) {
+            throw new Error("Codex backend가 준비되지 않았습니다");
+          }
+          screen = await codexBackend.captureStatus(msg.all === true);
+        } else {
+          screen = await captureScreen(msg.all === true);
+        }
+        log.debug(`Screen capture requested (all=${msg.all === true}, ${screen.length} chars)`);
+        sender.send({
+          type: "capture_result",
+          text: screen,
+          ...(msg.request_id ? { request_id: msg.request_id } : {}),
+        } satisfies WrapperToMcp);
+      };
+      const operation = config.agentProvider === "codex"
+        ? enqueueCodexOperation(capture)
+        : capture();
+      void operation.catch((error) => {
+        log.error("Capture failed", error);
+        sender.send({
+          type: "capture_result",
+          text: `capture failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          ...(msg.request_id ? { request_id: msg.request_id } : {}),
+        } satisfies WrapperToMcp);
+      });
+      break;
+    }
+    case "ready": {
+      const source = msg.source ?? null;
+      mcpClients.set(sender, source);
+      log.debug(`MCP server connected (${source ?? "legacy"})`);
       sender.send({
         type: "config",
         provider: config.agentProvider,
@@ -1403,9 +1802,11 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
             : [],
         cwd: state.cwd,
       } satisfies WrapperToMcp);
+      flushRoutedOutput(sender, source);
       break;
+    }
     case "input_response":
-      handleInputResponse(msg.request_id, msg.answer);
+      handleInputResponse(msg.request_id, msg.answer, msg.origin);
       break;
     case "input_request_failed":
       handleInputRequestFailed(msg.request_id, msg.reason);
@@ -1416,7 +1817,6 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
 // ── IPC server ────────────────────────────────────────────────────────
 
 createIpcServer(SOCKET_PATH, (client) => {
-  mcpClients.add(client);
   client.on("message", (msg: PeerToWrapper) => handleIpcMessage(msg, client));
   client.on("close", () => {
     mcpClients.delete(client);
@@ -1434,6 +1834,7 @@ spawnAgent();
 async function cleanup(): Promise<void> {
   log.debug("Shutting down...");
   expectedExit = true;
+  cancelScheduledCodexRespawn();
   if (claudeProcess) {
     claudeProcess.kill();
   }
