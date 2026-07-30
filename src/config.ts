@@ -6,24 +6,31 @@
  *
  * Example:
  *   >>> import { config } from "./config.js";
- *   >>> console.log(config.claudePath);
+ *   >>> console.log(config.agentProvider);
  */
 
 import dotenv from "dotenv";
 import { readFileSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { CONFIG_HOME } from "./paths.js";
+import {
+  KNOWN_REASONING_EFFORTS,
+  normalizeReasoningEffort,
+} from "./reasoning-effort.js";
 
 // CWD .env first (higher priority), then global .env (fills missing vars)
 dotenv.config();
 dotenv.config({ path: join(CONFIG_HOME, ".env") });
 
 export interface Config {
+  agentProvider: "claude" | "codex";
   verbose: boolean;
   dangerouslySkipPermissions: boolean;
   discordBotToken: string;
   claudePath: string;
+  codexPath: string;
   defaultModel: string;
+  defaultReasoningEffort: string;
   defaultCwd: string;
   maxTurns: number;
   fetchMessageLimit: number;
@@ -56,13 +63,36 @@ function expandTilde(path: string): string {
   return path;
 }
 
+function parseAgentProvider(value: string): "claude" | "codex" {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "claude" || normalized === "codex") return normalized;
+  throw new Error(
+    `Invalid AGENT_PROVIDER: ${value}. Expected "claude" or "codex".`,
+  );
+}
+
+const defaultReasoningEffort = optionalEnv("DEFAULT_REASONING_EFFORT", "")
+  .trim()
+  .toLowerCase();
+if (
+  defaultReasoningEffort &&
+  !normalizeReasoningEffort(defaultReasoningEffort)
+) {
+  throw new Error(
+    `Invalid DEFAULT_REASONING_EFFORT: ${defaultReasoningEffort}. Expected one of: ${KNOWN_REASONING_EFFORTS.join(", ")}.`,
+  );
+}
+
 const _config: Config = {
+  agentProvider: parseAgentProvider(optionalEnv("AGENT_PROVIDER", "claude")),
   verbose: optionalEnv("VERBOSE", "false") === "true",
   dangerouslySkipPermissions:
     optionalEnv("DANGEROUSLY_SKIP_PERMISSIONS", "false") === "true",
   discordBotToken: optionalEnv("DISCORD_BOT_TOKEN", ""),
   claudePath: expandTilde(optionalEnv("CLAUDE_PATH", "claude")),
+  codexPath: expandTilde(optionalEnv("CODEX_PATH", "codex")),
   defaultModel: optionalEnv("DEFAULT_MODEL", ""),
+  defaultReasoningEffort,
   defaultCwd: expandTilde(optionalEnv("DEFAULT_CWD", process.cwd())),
   maxTurns: Number(optionalEnv("MAX_TURNS", "50")),
   fetchMessageLimit: Number(optionalEnv("FETCH_MESSAGE_LIMIT", "20")),

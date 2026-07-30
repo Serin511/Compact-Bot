@@ -13,6 +13,7 @@ export type RouteType =
   | "compact"
   | "clear"
   | "model"
+  | "effort"
   | "cwd"
   | "help"
   | "new"
@@ -31,6 +32,7 @@ const COMMAND_MAP: Record<string, RouteType> = {
   "/compact": "compact",
   "/clear": "clear",
   "/model": "model",
+  "/effort": "effort",
   "/cwd": "cwd",
   "/help": "help",
   "/new": "new",

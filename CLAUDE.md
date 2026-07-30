@@ -1,8 +1,9 @@
 # Compact Bot (`@serin511/compact-bot`)
 
-Multi-platform chat bot (Discord + Slack) using Claude Code as MCP Channel plugins.
-Claude Code runs as the main process; our code is MCP servers bridging each platform.
-Uses Claude Pro or Max subscription auth (Max recommended for higher usage limits) — no API key needed.
+Multi-platform chat bot (Discord + Slack) supporting both Claude Code and Codex.
+Claude Code uses MCP Channels under a PTY wrapper. Codex uses `codex app-server`
+JSON-RPC while reusing the same platform MCP tools. Both use existing CLI login
+state; no API key is needed.
 
 Published as `@serin511/compact-bot` on npm. CLI binary: `compact-bot`.
 
@@ -32,7 +33,8 @@ src/
   cli.ts                    — CLI entry point (shebang, routes init/start subcommands)
   init.ts                   — Interactive setup: generates .env, copies custom files to ~/.config/compact-bot/
   paths.ts                  — Shared XDG path constants (CONFIG_HOME, DATA_DIR)
-  wrapper.ts                — Main entrypoint: spawns Claude Code via node-pty, IPC server, lifecycle management
+  wrapper.ts                — Main entrypoint: selects provider, owns IPC and agent lifecycle
+  codex-app-server.ts       — Codex app-server JSON-RPC client, thread/turn lifecycle, approval/input relay
   mcp-server.ts             — MCP Channel server: Discord client, channel notifications, tool handlers
   slack-mcp-server.ts       — MCP Channel server: Slack client (Socket Mode + Web API), channel notifications, tool handlers
   ipc.ts                    — Unix domain socket IPC protocol (wrapper ↔ MCP servers + hook-runner)
@@ -50,6 +52,8 @@ tests/
 
 ## Architecture (MCP Channel Mode)
 
+`AGENT_PROVIDER=claude` (the backward-compatible default):
+
 ```
 wrapper.ts (npm start)
   ├─ IPC socket server (data/wrapper.sock) — multi-client
@@ -57,13 +61,13 @@ wrapper.ts (npm start)
   │   ├─ Discord MCP server (conditional: DISCORD_BOT_TOKEN)
   │   │   ├─ Discord.js client (Gateway connection)
   │   │   ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
-  │   │   ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /esc, /raw, /goal, /help
+  │   │   ├─ Command routing: /new, /clear, /compact, /model, /effort, /cwd, /capture, /esc, /raw, /goal, /help
   │   │   └─ Channel notifications (source="discord")
   │   └─ Slack MCP server (conditional: SLACK_BOT_TOKEN)
   │       ├─ Slack Socket Mode client (WebSocket connection)
   │       ├─ Slack Web API client (chat, reactions, files, etc.)
   │       ├─ MCP tools: reply, react, edit_message, fetch_messages, download_attachment
-  │       ├─ Command routing: /new, /clear, /compact, /model, /cwd, /capture, /esc, /raw, /goal, /help
+  │       ├─ Command routing: /new, /clear, /compact, /model, /effort, /cwd, /capture, /esc, /raw, /goal, /help
   │       └─ Channel notifications (source="slack")
   └─ Restart on IPC signal (kill + respawn Claude Code) or PTY command forwarding
 ```
@@ -75,6 +79,7 @@ wrapper.ts (npm start)
 - **Hard restart**: `/new` kills and respawns Claude Code (fresh session)
 - **PTY commands**: `/compact`, `/clear` forwarded to CLI via PTY write (no restart, MCP connection preserved)
 - **Model/CWD change**: `/model`, `/cwd` trigger restart with new settings
+- **Reasoning effort**: `/effort` is rejected in Claude mode
 - **Screen capture**: `/capture` sends IPC request to wrapper → `@xterm/headless` virtual terminal reads PTY buffer → text returned as code block. Default captures only the visible viewport and sends a single message; `/capture --all` returns the full scrollback as multiple messages. `/capture` still runs while Claude Code is waiting for user input (bypasses the pending-input answer capture)
 - **IPC**: Wrapper ↔ MCP servers communicate via shared Unix domain socket (JSON-line protocol, multi-client)
 - **Auto-respawn**: If Claude Code exits unexpectedly, wrapper respawns after 2s delay
@@ -82,6 +87,38 @@ wrapper.ts (npm start)
 - **Permission relay**: When `DANGEROUSLY_SKIP_PERMISSIONS=false`, MCP servers declare `claude/channel/permission` capability. Claude Code sends `permission_request` notifications instead of PTY prompts; MCP servers show interactive buttons (Discord: ButtonBuilder, Slack: Block Kit) and relay the verdict back via `permission` notification
 - **AskUserQuestion relay (Claude Code 2.1.132+)**: Channels mode re-enabled the built-in `AskUserQuestion` tool, but it has no JSON-RPC notification — the Ink widget renders directly to the PTY. The wrapper attaches a `PreToolUse` hook (matcher `AskUserQuestion`) via `--settings`. The hook (`hook-runner.ts`) reads the tool event from stdin, forwards `tool_input` (questions, options, descriptions, previews) to the wrapper over `wrapper.sock`, and exits with `{}` (allow). The wrapper queues each question, sends a structured `input_request` to the connected MCP server, and translates the user's reply into PTY keystrokes (`Down × (n−1) + Enter` for option `n`; `Down × N + Enter` then text + `Enter` for the auto-added "Type something." custom answer). Claude Code sees a normal AskUserQuestion tool result. On multi-question calls Ink renders a final "Ready to submit your answers?" page after the last answer; the wrapper polls the virtual terminal for `Submit answers` / `Ready to submit` and auto-presses Enter only when the text appears (single-question calls have no confirmation page and receive no extra keystroke). The PreToolUse hook is co-installed at `dist/hook-runner.js`; the wrapper exposes `COMPACT_BOT_WRAPPER_SOCKET` to the spawned Claude Code process so the hook can reach the socket regardless of CWD.
 - **Plan mode deny**: The wrapper also registers a `PreToolUse` hook for `EnterPlanMode`. The hook always returns a deny decision with a reason instructing Claude to use the `reply` MCP tool to share plans and ask for user approval directly, instead of entering the terminal-only plan mode. This ensures plan approval works through the existing channel UI without additional infrastructure.
+
+## Architecture (Codex App Server Mode)
+
+`AGENT_PROVIDER=codex`:
+
+```
+wrapper.ts
+  ├─ IPC socket server (data/wrapper.sock)
+  ├─ CodexAppServer (`codex app-server`, JSONL over stdio)
+  │   ├─ thread/start + turn/start/turn/steer for inbound chat
+  │   ├─ model/list for model-specific reasoning effort validation
+  │   ├─ thread/compact/start, turn/interrupt, thread/goal/*
+  │   └─ app-server approvals and request_user_input → existing channel UI
+  ├─ Discord MCP server (conditional)
+  └─ Slack MCP server (conditional)
+```
+
+- Platform servers send normal chat messages to the wrapper over IPC because
+  Codex does not consume Claude's `notifications/claude/channel` extension.
+- The wrapper recreates the `<channel source="...">` envelope and submits it as
+  app-server turn input.
+- Codex starts the same platform MCP servers as stdio tools. Agent replies still
+  go through `reply`, `react`, `edit_message`, and related MCP tools.
+- `/new`, `/clear`, model changes, and CWD changes create a fresh Codex thread.
+- `/effort [level]` updates `turn/start.effort` for the next new turn without
+  restarting the thread. The current model's `model/list` entry supplies the
+  accepted values. Model changes reset an incompatible prior effort to the new
+  model default.
+- `/capture` returns structured thread/turn status plus recent app-server events.
+- `DANGEROUSLY_SKIP_PERMISSIONS=true` maps to Codex `approvalPolicy=never` and
+  `sandbox=danger-full-access`; otherwise the user's Codex policy is retained
+  and app-server approval requests are relayed to Discord/Slack.
 
 ### Platform Differences
 
@@ -97,31 +134,35 @@ wrapper.ts (npm start)
 
 | Command | Description | Mechanism |
 |---------|-------------|-----------|
-| `/new` | New session | Hard restart (no resume) |
-| `/clear` | Clear session | CLI `/clear` via PTY |
-| `/compact [hint]` | Compress context | CLI `/compact` via PTY |
+| `/new` | New session | Claude: hard restart; Codex: fresh thread |
+| `/clear` | Clear session | Claude: CLI `/clear`; Codex: fresh thread |
+| `/compact [hint]` | Compress context | Claude: PTY command; Codex: `thread/compact/start` (no hint) |
 | `/model <name>` | Change model (sonnet/opus/haiku or full ID) | Restart with new `--model` flag |
+| `/effort [level]` | Show/change Codex reasoning effort | Codex: IPC → `turn/start.effort`; Claude: unsupported |
 | `/cwd <path>` | Change working directory | Restart with new CWD |
-| `/capture [--all]` | Capture CLI screen (default: viewport only, single message; `--all` for full scrollback) | IPC request → code block reply |
-| `/esc` | Send ESC key to CLI (interrupt current operation / safety net for stuck prompts) | PTY write `\x1b` |
-| `/raw <text>` | Type `<text>` into the CLI verbatim followed by Enter (e.g. `/raw /agents`) | PTY write `<text>\r` |
-| `/goal <condition>` | Goal mode (Claude Code 2.1.139+) — auto-loops turns until a small model judges `<condition>` met. `/goal clear` exits. | PTY write `/goal <args>\r` |
-| `/help` | Show commands | Direct Discord reply |
+| `/capture [--all]` | Capture runtime status | Claude: terminal buffer; Codex: thread/turn events |
+| `/esc` | Interrupt current operation | Claude: ESC key; Codex: `turn/interrupt` |
+| `/raw <text>` | Submit raw text | Claude: PTY input; Codex: turn input |
+| `/goal <condition>` | Set/clear goal | Claude: PTY `/goal`; Codex: `thread/goal/*` |
+| `/help` | Show commands | Direct platform reply |
 
 ## Environment Variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
+| `AGENT_PROVIDER` | No | `claude` (default) or `codex` |
 | `DISCORD_BOT_TOKEN` | One of Discord/Slack | Discord bot token |
 | `SLACK_BOT_TOKEN` | One of Discord/Slack | Slack Bot OAuth Token (`xoxb-...`) |
 | `SLACK_APP_TOKEN` | With SLACK_BOT_TOKEN | Slack App-Level Token (`xapp-...`, Socket Mode) |
 | `ALLOWED_CHANNEL_IDS` | No | Comma-separated Discord channel IDs |
 | `SLACK_ALLOWED_CHANNEL_IDS` | No | Comma-separated Slack channel IDs |
-| `DEFAULT_MODEL` | No | Claude model (default: CLI default) |
+| `DEFAULT_MODEL` | No | Selected agent model (default: CLI default) |
+| `DEFAULT_REASONING_EFFORT` | No | Codex reasoning effort (default: Codex config; must be supported by the model) |
 | `DEFAULT_CWD` | No | Working directory (default: current directory) |
-| `MAX_TURNS` | No | Max turns per session (default: 50) |
+| `MAX_TURNS` | No | Claude Code max turns per session (default: 50; ignored by Codex) |
 | `FETCH_MESSAGE_LIMIT` | No | Default message fetch count (default: 20) |
 | `CLAUDE_PATH` | No | Path to Claude CLI (default: `claude` from PATH) |
+| `CODEX_PATH` | No | Path to Codex CLI (default: `codex`; macOS app bundles are fallback) |
 | `DANGEROUSLY_SKIP_PERMISSIONS` | No | Pass `--dangerously-skip-permissions` to CLI (default: false) |
 | `VERBOSE` | No | Enable verbose logging (default: false) |
 
@@ -135,6 +176,9 @@ wrapper.ts (npm start)
 - All user-facing strings in Korean
 - MCP server logs to stderr (stdout reserved for MCP protocol)
 - At least one platform token (Discord or Slack) must be configured
+- Keep both providers working: Claude-specific hooks/PTY behavior must remain
+  behind `AGENT_PROVIDER=claude`; Codex-specific app-server behavior belongs in
+  `codex-app-server.ts`.
 
 ## Discord / Slack Parity Rule
 

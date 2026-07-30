@@ -66,10 +66,17 @@ export interface AskUserQuestionInput {
 /** Messages received by the wrapper. */
 export type PeerToWrapper =
   // ── from MCP servers ──
+  | {
+      type: "user_message";
+      source: "discord" | "slack";
+      content: string;
+      meta: Record<string, string>;
+    }
   | { type: "restart"; reason: "new" }
   | { type: "compact"; hint?: string }
   | { type: "clear" }
   | { type: "model"; model: string }
+  | { type: "effort"; request_id: string; effort: string }
   | { type: "cwd"; cwd: string }
   | { type: "ready" }
   | { type: "capture"; all?: boolean }
@@ -89,8 +96,23 @@ export type McpToWrapper = PeerToWrapper;
 
 /** Messages from wrapper → MCP server. */
 export type WrapperToMcp =
-  | { type: "config"; model: string; cwd: string }
+  | {
+      type: "config";
+      provider: "claude" | "codex";
+      model: string;
+      effort: string;
+      availableEfforts: string[];
+      cwd: string;
+    }
   | { type: "capture_result"; text: string }
+  | {
+      type: "effort_result";
+      request_id: string;
+      ok: boolean;
+      effort: string;
+      availableEfforts: string[];
+      error?: string;
+    }
   | {
       type: "input_request";
       request_id: string;

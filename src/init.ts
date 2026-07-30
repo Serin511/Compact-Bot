@@ -13,6 +13,10 @@ import { createInterface } from "node:readline/promises";
 import { copyFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { CONFIG_HOME } from "./paths.js";
+import {
+  KNOWN_REASONING_EFFORTS,
+  normalizeReasoningEffort,
+} from "./reasoning-effort.js";
 
 const rl = createInterface({ input: process.stdin, output: process.stdout });
 
@@ -52,6 +56,25 @@ export async function runInit(): Promise<void> {
     console.log();
   }
 
+  // ── Agent backend ──────────────────────────────────────────────────
+
+  console.log("  \x1b[36m[에이전트]\x1b[0m Claude Code 또는 Codex를 선택하세요.");
+  console.log();
+
+  const providerInput = (await ask("에이전트 (claude/codex)", "claude")).toLowerCase();
+  if (providerInput !== "claude" && providerInput !== "codex") {
+    console.log();
+    console.log("  \x1b[31m에이전트는 claude 또는 codex여야 합니다.\x1b[0m");
+    rl.close();
+    process.exit(1);
+  }
+  const provider: "claude" | "codex" = providerInput;
+  const cliPath = await ask(
+    `${provider === "codex" ? "Codex" : "Claude Code"} CLI 경로`,
+    provider === "codex" ? "codex" : "claude",
+  );
+  console.log();
+
   // ── Platform tokens ────────────────────────────────────────────────
 
   console.log("  \x1b[36m[플랫폼 토큰]\x1b[0m Discord / Slack 중 최소 하나는 필수");
@@ -79,8 +102,21 @@ export async function runInit(): Promise<void> {
   console.log();
 
   const model = await ask("기본 모델 (비우면 CLI 기본값)", "");
+  const reasoningEffort = provider === "codex"
+    ? (await ask("기본 reasoning effort (비우면 Codex 설정값)", "")).toLowerCase()
+    : "";
+  if (reasoningEffort && !normalizeReasoningEffort(reasoningEffort)) {
+    console.log();
+    console.log(
+      `  \x1b[31mreasoning effort는 ${KNOWN_REASONING_EFFORTS.join(", ")} 중 하나여야 합니다.\x1b[0m`,
+    );
+    rl.close();
+    process.exit(1);
+  }
   const cwd = await ask("작업 디렉토리 (비우면 현재 폴더)", "");
-  const maxTurns = await ask("최대 턴 수 (0=무제한)", "50");
+  const maxTurns = provider === "claude"
+    ? await ask("최대 턴 수 (0=무제한)", "50")
+    : "0";
   const skipPerms = await ask("--dangerously-skip-permissions 사용? (y/N)", "N");
 
   console.log();
@@ -124,6 +160,10 @@ export async function runInit(): Promise<void> {
   // ── Write .env ─────────────────────────────────────────────────────
 
   const lines: string[] = [
+    "# Agent backend: claude or codex",
+    `AGENT_PROVIDER=${provider}`,
+    provider === "codex" ? `CODEX_PATH=${cliPath}` : `CLAUDE_PATH=${cliPath}`,
+    "",
     "# [플랫폼 토큰] Discord / Slack 중 최소 하나는 필수",
   ];
 
@@ -148,12 +188,23 @@ export async function runInit(): Promise<void> {
   } else {
     lines.push("# DEFAULT_MODEL=");
   }
+  if (provider === "codex" && reasoningEffort) {
+    lines.push(`DEFAULT_REASONING_EFFORT=${reasoningEffort}`);
+  } else if (provider === "codex") {
+    lines.push("# DEFAULT_REASONING_EFFORT=");
+  } else {
+    lines.push("# DEFAULT_REASONING_EFFORT is only used by Codex");
+  }
   if (cwd) {
     lines.push(`DEFAULT_CWD=${cwd}`);
   } else {
     lines.push("# DEFAULT_CWD=");
   }
-  lines.push(`MAX_TURNS=${maxTurns}`);
+  if (provider === "claude") {
+    lines.push(`MAX_TURNS=${maxTurns}`);
+  } else {
+    lines.push("# MAX_TURNS is only used by Claude Code");
+  }
   if (skipPerms.toLowerCase() === "y") {
     lines.push("DANGEROUSLY_SKIP_PERMISSIONS=true");
   } else {

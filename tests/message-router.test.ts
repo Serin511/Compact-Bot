@@ -35,6 +35,17 @@ describe("routeMessage", () => {
     expect(routeMessage("/model")).toEqual({ type: "model" });
   });
 
+  it("routes /effort with a level", () => {
+    expect(routeMessage("/effort ultra")).toEqual({
+      type: "effort",
+      args: "ultra",
+    });
+  });
+
+  it("routes /effort without args", () => {
+    expect(routeMessage("/effort")).toEqual({ type: "effort" });
+  });
+
   it("routes /cwd with path", () => {
     expect(routeMessage("/cwd /home/user/projects/myapp")).toEqual({
       type: "cwd",

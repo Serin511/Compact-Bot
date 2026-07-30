@@ -1,9 +1,9 @@
 /**
- * MCP Channel server bridging Discord and Claude Code.
+ * MCP server bridging Discord and Claude Code or Codex.
  *
- * Spawned by Claude Code as a subprocess. Communicates with Claude via
- * the MCP stdio transport (channel notifications + tool calls) and with
- * the wrapper via a Unix domain socket for lifecycle control.
+ * Spawned by the selected agent as a subprocess. Tool calls always use MCP
+ * stdio. Inbound messages use Claude's channel notification extension in
+ * Claude mode and wrapper IPC in Codex mode.
  *
  * Exports:
  *   None (side-effect: starts MCP server, connects to Discord and wrapper).
@@ -35,7 +35,12 @@ import { msg } from "./messages.js";
 import { isSendablePath } from "./sanitize.js";
 import { chunkText } from "./chunk.js";
 import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
+import {
+  KNOWN_REASONING_EFFORTS,
+  normalizeReasoningEffort,
+} from "./reasoning-effort.js";
 import { statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 
 // ── env (injected by wrapper via mcp-config.json) ─────────────────────
 
@@ -46,6 +51,8 @@ const ALLOWED_CHANNEL_IDS = (process.env.ALLOWED_CHANNEL_IDS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
+const AGENT_PROVIDER =
+  process.env.AGENT_PROVIDER === "codex" ? "codex" : "claude";
 
 /** Max time a tool invocation may take before it is treated as hung. */
 const TOOL_TIMEOUT_MS = 20_000;
@@ -68,6 +75,8 @@ process.on("uncaughtException", (err) => {
 
 let ipc: JsonLineSocket | null = null;
 let currentModel = "";
+let currentEffort = "";
+let availableEfforts: string[] = [];
 let currentCwd = "";
 let lastActiveChannelId: string | null = null;
 
@@ -106,6 +115,57 @@ function requestCapture(all = false): Promise<string | null> {
     }, 5000);
     localIpc.on("message", handler);
     localIpc.send({ type: "capture", all } satisfies McpToWrapper);
+  });
+}
+
+type EffortResult = Extract<WrapperToMcp, { type: "effort_result" }>;
+
+/** Ask the wrapper to apply an effort change and wait for its validation. */
+function requestEffortChange(effort: string): Promise<EffortResult> {
+  return new Promise((resolve) => {
+    const requestId = randomUUID();
+    if (!ipc) {
+      resolve({
+        type: "effort_result",
+        request_id: requestId,
+        ok: false,
+        effort: currentEffort,
+        availableEfforts,
+        error: "wrapper 연결 없음",
+      });
+      return;
+    }
+    const localIpc = ipc;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      localIpc.removeListener("message", handler);
+    };
+    const handler = (message: WrapperToMcp) => {
+      if (
+        message.type === "effort_result" &&
+        message.request_id === requestId
+      ) {
+        cleanup();
+        resolve(message);
+      }
+    };
+    const timeout = setTimeout(() => {
+      cleanup();
+      resolve({
+        type: "effort_result",
+        request_id: requestId,
+        ok: false,
+        effort: currentEffort,
+        availableEfforts,
+        error: "wrapper 응답 시간 초과",
+      });
+    }, 5000);
+    localIpc.on("message", handler);
+    localIpc.send({
+      type: "effort",
+      request_id: requestId,
+      effort,
+    } satisfies McpToWrapper);
   });
 }
 
@@ -743,7 +803,8 @@ function truncateLabel(s: string, max = 80): string {
  */
 function formatAskUserQuestion(widget: IpcAskWidget | undefined, fallback: string): string {
   if (!widget) return fallback;
-  const lines: string[] = ["❓ **Claude의 질문**"];
+  const agentName = AGENT_PROVIDER === "codex" ? "Codex" : "Claude";
+  const lines: string[] = [`❓ **${agentName}의 질문**`];
   if (widget.questionTotal > 1) {
     lines.push(`*(질문 ${widget.questionIndex}/${widget.questionTotal})*`);
   }
@@ -857,6 +918,15 @@ async function sendChannelNotification(
   content: string,
   meta: Record<string, string>,
 ): Promise<void> {
+  if (AGENT_PROVIDER === "codex") {
+    ipc?.send({
+      type: "user_message",
+      source: "discord",
+      content,
+      meta,
+    } satisfies McpToWrapper);
+    return;
+  }
   await mcp.server.notification({
     method: "notifications/claude/channel",
     params: { content, meta },
@@ -926,14 +996,64 @@ async function handleDiscordMessage(message: Message): Promise<void> {
         await message.reply(msg("modelCurrent", { model: currentModel || "(CLI default)" }));
         return;
       }
-      const modelMap: Record<string, string> = {
-        sonnet: "claude-sonnet-4-6",
-        opus: "claude-opus-4-6",
-        haiku: "claude-haiku-4-5-20251001",
-      };
+      const modelMap: Record<string, string> = AGENT_PROVIDER === "claude"
+        ? {
+            sonnet: "claude-sonnet-4-6",
+            opus: "claude-opus-4-6",
+            haiku: "claude-haiku-4-5-20251001",
+          }
+        : {};
       const resolved = modelMap[route.args] ?? route.args;
       await message.reply(msg("modelChanged", { model: resolved }));
       ipc?.send({ type: "model", model: resolved } satisfies McpToWrapper);
+      return;
+    }
+
+    case "effort": {
+      if (AGENT_PROVIDER !== "codex") {
+        await message.reply(msg("effortUnsupported"));
+        return;
+      }
+      if (!route.args) {
+        await message.reply(
+          msg("effortCurrent", { effort: currentEffort || "(Codex default)" }),
+        );
+        return;
+      }
+      const effort = normalizeReasoningEffort(route.args);
+      if (!effort) {
+        await message.reply(
+          msg("effortInvalid", {
+            efforts: KNOWN_REASONING_EFFORTS.join(", "),
+          }),
+        );
+        return;
+      }
+      if (
+        availableEfforts.length > 0 &&
+        !availableEfforts.includes(effort)
+      ) {
+        await message.reply(
+          msg("effortUnavailable", {
+            model: currentModel || "(Codex default)",
+            effort,
+            efforts: availableEfforts.join(", "),
+          }),
+        );
+        return;
+      }
+      const result = await requestEffortChange(effort);
+      currentEffort = result.effort;
+      availableEfforts = result.availableEfforts;
+      if (!result.ok) {
+        await message.reply(
+          msg("effortChangeFailed", {
+            reason: result.error || "변경을 적용하지 못했습니다.",
+          }),
+        );
+        return;
+      }
+      await message.reply(msg("effortChanged", { effort: result.effort }));
       return;
     }
 
@@ -1216,8 +1336,12 @@ async function main(): Promise<void> {
     ipc.on("message", (ipcMsg: WrapperToMcp) => {
       if (ipcMsg.type === "config") {
         currentModel = ipcMsg.model;
+        currentEffort = ipcMsg.effort;
+        availableEfforts = ipcMsg.availableEfforts;
         currentCwd = ipcMsg.cwd;
-        stderr(`Config received: model=${ipcMsg.model} cwd=${ipcMsg.cwd}`);
+        stderr(
+          `Config received: provider=${ipcMsg.provider} model=${ipcMsg.model} effort=${ipcMsg.effort || "default"} cwd=${ipcMsg.cwd}`,
+        );
       } else if (ipcMsg.type === "input_request") {
         handleInputRequest(ipcMsg.request_id, ipcMsg.question, ipcMsg.widget).catch((err) => {
           stderr(`Input request handler error: ${err}`);
