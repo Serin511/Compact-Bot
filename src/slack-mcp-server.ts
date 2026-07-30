@@ -27,6 +27,7 @@ import {
   type IpcCommandRequest,
   type IpcCommandResult,
   IpcCommandTracker,
+  announceRealtimeReady,
   isOriginForPlatform,
   sameConversationOrigin,
   isAllowedInputAnswer,
@@ -39,7 +40,10 @@ import {
 } from "./slack-attachment-handler.js";
 import { msg } from "./messages.js";
 import { isSendablePath } from "./sanitize.js";
-import { isProcessableSlackMessage } from "./slack-events.js";
+import {
+  isProcessableSlackMessage,
+  resolveSlackBlockActionContext,
+} from "./slack-events.js";
 import { chunkCodeBlock, chunkText } from "./chunk.js";
 import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
 import {
@@ -1483,9 +1487,13 @@ socketMode.on("interactive", async ({ body, ack }) => {
 
   const parts = action.action_id.split(":");
   const kind = parts[0];
-  const channel = body.channel?.id;
-  const ts = body.message?.ts;
-  const originalText: string = body.message?.text ?? "";
+  const {
+    channelId: channel,
+    messageTs: ts,
+    threadTs: interactionThreadTs,
+    userId: interactionUserId,
+    originalText,
+  } = resolveSlackBlockActionContext(body);
 
   if (kind === "perm") {
     const [, behavior, requestId] = parts as [string, string, string];
@@ -1541,20 +1549,12 @@ socketMode.on("interactive", async ({ body, ack }) => {
   if (kind === "ask") {
     const requestId = parts[2];
     if (!requestId || !channel || !ts) return;
-    const interactionContext = body as unknown as {
-      message?: { thread_ts?: string };
-      container?: { thread_ts?: string };
-      user?: { id?: string };
-    };
-    const interactionThreadTs =
-      interactionContext.message?.thread_ts ??
-      interactionContext.container?.thread_ts;
     const interactionOrigin: IpcOrigin = {
       source: "slack",
       chat_id: channel,
       message_id: ts,
-      ...(interactionContext.user?.id
-        ? { user: interactionContext.user.id }
+      ...(interactionUserId
+        ? { user: interactionUserId }
         : {}),
       ...(interactionThreadTs ? { thread_ts: interactionThreadTs } : {}),
     };
@@ -1572,9 +1572,12 @@ socketMode.on("interactive", async ({ body, ack }) => {
             pendingInputRequest,
           ) ||
           (pendingInputRequest.userId !== undefined &&
-            interactionContext.user?.id !== pendingInputRequest.userId))
+            interactionUserId !== pendingInputRequest.userId))
     ) {
-      // Stale click — request was already answered/cancelled.
+      stderr(
+        `Ignoring stale AskUserQuestion click ${requestId} ` +
+          `(pending=${pendingInputRequest?.request_id ?? "none"})`,
+      );
       return;
     }
 
@@ -1732,7 +1735,6 @@ async function main(): Promise<void> {
       // Socket Mode round-robin and reply with captureNoResponse / lose user msgs.
       setTimeout(() => process.exit(0), 100);
     });
-    ipc.send({ type: "ready", source: "slack" } satisfies McpToWrapper);
   } catch (err) {
     stderr(`IPC connect failed: ${err}`);
   }
@@ -1770,6 +1772,14 @@ async function main(): Promise<void> {
       socketMode.start().catch(reject);
     });
   }
+  // Only the process that owns the Socket Mode connection can receive button
+  // events. Inert duplicate MCP children must never become wrapper routing
+  // targets, even though they remain connected over stdio for Codex.
+  announceRealtimeReady(
+    ipc,
+    "slack",
+    instanceLock !== null && slackReady,
+  );
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();

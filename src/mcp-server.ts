@@ -32,6 +32,7 @@ import {
   type IpcCommandRequest,
   type IpcCommandResult,
   IpcCommandTracker,
+  announceRealtimeReady,
   isOriginForPlatform,
   sameConversationOrigin,
   isAllowedInputAnswer,
@@ -1621,7 +1622,6 @@ async function main(): Promise<void> {
       // with captureNoResponse / lose user msgs.
       setTimeout(() => process.exit(0), 100);
     });
-    ipc.send({ type: "ready", source: "discord" } satisfies McpToWrapper);
   } catch (err) {
     stderr(`IPC connect failed: ${err}`);
   }
@@ -1649,6 +1649,13 @@ async function main(): Promise<void> {
       discord.login(DISCORD_BOT_TOKEN).catch(reject);
     });
   }
+  // Only the Gateway owner can receive button interactions. Do not register
+  // inert duplicate MCP children as wrapper routing targets.
+  announceRealtimeReady(
+    ipc,
+    "discord",
+    instanceLock !== null && discord.isReady(),
+  );
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();

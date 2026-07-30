@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  announceRealtimeReady,
   IpcCommandTracker,
   isAllowedInputAnswer,
   isOriginForPlatform,
@@ -118,6 +119,24 @@ describe("IPC question input policy", () => {
     expect(isMatchingInputRequest("request-a", "request-a")).toBe(true);
     expect(isMatchingInputRequest("request-b", "request-a")).toBe(false);
     expect(isMatchingInputRequest(undefined, "request-a")).toBe(false);
+  });
+});
+
+describe("realtime platform readiness", () => {
+  it("registers only a process with a usable realtime connection", () => {
+    const sender = new FakeSender();
+
+    expect(announceRealtimeReady(sender, "slack", false)).toBe(false);
+    expect(sender.messages).toEqual([]);
+
+    expect(announceRealtimeReady(sender, "slack", true)).toBe(true);
+    expect(sender.messages).toEqual([
+      { type: "ready", source: "slack" },
+    ]);
+  });
+
+  it("does not throw when wrapper IPC is unavailable", () => {
+    expect(announceRealtimeReady(null, "discord", true)).toBe(false);
   });
 });
 

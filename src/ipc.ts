@@ -271,6 +271,25 @@ export interface IpcMessageSender {
 }
 
 /**
+ * Register a platform process with the wrapper only after it owns a usable
+ * realtime connection.
+ *
+ * Codex app-server can spawn more than one copy of a configured MCP server.
+ * Non-owner copies still need to serve MCP over stdio, but must not become
+ * wrapper routing targets because they cannot receive Discord/Slack button
+ * events.
+ */
+export function announceRealtimeReady(
+  sender: IpcMessageSender | null,
+  source: IpcOrigin["source"],
+  realtimeReady: boolean,
+): boolean {
+  if (!sender || !realtimeReady) return false;
+  sender.send({ type: "ready", source });
+  return true;
+}
+
+/**
  * Tracks mutable command requests without installing one EventEmitter listener
  * per request. The MCP client's central IPC handler feeds every
  * ``command_result`` to ``settle``; unknown results can then be delivered
