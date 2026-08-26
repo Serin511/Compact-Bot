@@ -436,6 +436,187 @@ describe("CodexDeliveryTracker", () => {
     expect(tracker.originForTurn("goal-turn-2")).toEqual(discordOrigin);
   });
 
+  it("inherits a native goal owner from its classified active turn", () => {
+    const tracker = new CodexDeliveryTracker();
+    const submission = tracker.beginExplicitSubmission(slackOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "native-goal-creator" },
+    });
+    tracker.acceptExplicitSubmission(submission, "native-goal-creator");
+
+    // Native create_goal emits a thread-scoped notification without a usable
+    // turnId. The app-server's active turn id is the causal owner in that case.
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: null,
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: slackOrigin,
+      active: true,
+    });
+    completeTurn(tracker, "native-goal-creator");
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "automatic-native-goal-turn" },
+    });
+
+    const laterSameConversation = {
+      ...slackOrigin,
+      message_id: "1000.002",
+    };
+    const automaticOwner = tracker.authorizationOriginForTurn(
+      "automatic-native-goal-turn",
+    );
+    expect(automaticOwner).toEqual(slackOrigin);
+    expect(
+      canUseActiveCodexTurn(automaticOwner, laterSameConversation),
+    ).toBe(true);
+    expect(canUseActiveCodexTurn(automaticOwner, discordOrigin)).toBe(false);
+  });
+
+  it("prefers a goal notification's causal turn over another active turn", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setOriginForTurn("causal-turn", slackOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "causal-turn" },
+    });
+    tracker.setOriginForTurn("other-active-turn", discordOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "other-active-turn" },
+    });
+
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: "causal-turn",
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: slackOrigin,
+      active: true,
+    });
+  });
+
+  it("binds a native goal after its sole active turn is classified", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "late-classified-creator" },
+    });
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: true,
+    });
+
+    tracker.setOriginForTurn("late-classified-creator", slackOrigin);
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: slackOrigin,
+      active: true,
+    });
+  });
+
+  it("does not infer a native goal owner from multiple active turns", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setOriginForTurn("active-slack", slackOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "active-slack" },
+    });
+    tracker.setOriginForTurn("active-discord", discordOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "active-discord" },
+    });
+
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: true,
+    });
+  });
+
+  it("uses an exact causal turn id after that turn completes", () => {
+    const tracker = new CodexDeliveryTracker();
+    startTurn(tracker, "completed-goal-creator", slackOrigin);
+    completeTurn(tracker, "completed-goal-creator");
+
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: "completed-goal-creator",
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: slackOrigin,
+      active: true,
+    });
+  });
+
+  it("does not guess from the last completed turn without a causal id", () => {
+    const tracker = new CodexDeliveryTracker();
+    startTurn(tracker, "completed-without-causal-id", slackOrigin);
+    completeTurn(tracker, "completed-without-causal-id");
+
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: true,
+    });
+  });
+
+  it("does not let a later conversation capture an ownerless active goal", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      goal: { status: "active" },
+    });
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: true,
+    });
+
+    const laterSubmission = tracker.beginExplicitSubmission(slackOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "later-conversation-turn" },
+    });
+    tracker.acceptExplicitSubmission(
+      laterSubmission,
+      "later-conversation-turn",
+    );
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: "later-conversation-turn",
+      goal: { status: "paused" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: true,
+    });
+    expect(
+      canMutateCodexGoal(tracker.snapshotGoalOrigin(), slackOrigin),
+    ).toBe(false);
+  });
+
   it("uses a pending explicit origin before the accepted turn id is returned", () => {
     const tracker = new CodexDeliveryTracker();
     const submission = tracker.beginExplicitSubmission(slackOrigin);

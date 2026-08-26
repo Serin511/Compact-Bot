@@ -172,6 +172,12 @@ export class CodexDeliveryTracker {
   private currentOrigin: IpcOrigin | null = null;
   private goalOrigin: IpcOrigin | null = null;
   private goalActive = false;
+  /** Turn ids observed as started but not yet observed as completed. */
+  private readonly activeTurnIds = new Set<string>();
+  /** Exact completed owners retained only for causal goal notifications. */
+  private readonly completedTurnOrigins = new Map<string, IpcOrigin | null>();
+  /** A goal update whose exact causal turn is not classified yet. */
+  private pendingGoalOriginTurnId: string | null = null;
   private nextSubmissionToken = 1;
   private pendingExplicitSubmission: CodexExplicitSubmission | null = null;
   private readonly deliveries = new Map<string, CodexTurnDelivery>();
@@ -192,6 +198,7 @@ export class CodexDeliveryTracker {
   setGoalOrigin(origin: IpcOrigin | null): void {
     this.goalOrigin = origin;
     this.goalActive = origin !== null;
+    this.pendingGoalOriginTurnId = null;
   }
 
   snapshotGoalOrigin(): CodexGoalOriginSnapshot {
@@ -201,6 +208,7 @@ export class CodexDeliveryTracker {
   restoreGoalOrigin(snapshot: CodexGoalOriginSnapshot): void {
     this.goalOrigin = snapshot.origin;
     this.goalActive = snapshot.active;
+    this.pendingGoalOriginTurnId = null;
   }
 
   /**
@@ -239,6 +247,7 @@ export class CodexDeliveryTracker {
             : (this.goalActive ? this.goalOrigin : null) ??
               submission.previousOrigin;
         this.resolveProvisionalDelivery(delivery, resolvedOrigin);
+        this.tryBindPendingGoalOrigin(candidateTurnId);
         const fallback = this.finishBufferedDelivery(
           candidateTurnId,
           delivery,
@@ -264,6 +273,7 @@ export class CodexDeliveryTracker {
         (this.goalActive ? this.goalOrigin : null) ??
         submission.previousOrigin;
       this.resolveProvisionalDelivery(delivery, restoredOrigin);
+      this.tryBindPendingGoalOrigin(turnId);
       const fallback = this.finishBufferedDelivery(turnId, delivery);
       if (fallback) fallbacks.push(fallback);
     }
@@ -291,6 +301,7 @@ export class CodexDeliveryTracker {
     delivery.provisionalOriginAmbiguous = false;
     this.consumePendingReplyItems(delivery);
     this.deliveries.set(turnId, delivery);
+    this.tryBindPendingGoalOrigin(turnId);
   }
 
   /**
@@ -350,10 +361,13 @@ export class CodexDeliveryTracker {
   clearTurns(): void {
     this.deliveries.clear();
     this.completedTurnIds.clear();
+    this.activeTurnIds.clear();
+    this.completedTurnOrigins.clear();
     this.pendingExplicitSubmission = null;
     this.currentOrigin = null;
     this.goalOrigin = null;
     this.goalActive = false;
+    this.pendingGoalOriginTurnId = null;
   }
 
   /**
@@ -370,6 +384,7 @@ export class CodexDeliveryTracker {
     if (method === "thread/goal/cleared") {
       this.goalOrigin = null;
       this.goalActive = false;
+      this.pendingGoalOriginTurnId = null;
       return null;
     }
     if (method === "thread/goal/updated") {
@@ -378,13 +393,39 @@ export class CodexDeliveryTracker {
           ? (params.goal as Record<string, unknown>)
           : {};
       const status = typeof goal.status === "string" ? goal.status : "";
+      const wasActive = this.goalActive;
       if (TERMINAL_GOAL_STATUSES.has(status)) {
         this.goalActive = false;
         this.goalOrigin = null;
+        this.pendingGoalOriginTurnId = null;
       } else if (
         ["active", "paused", "blocked", "usageLimited", "budgetLimited"]
           .includes(status)
       ) {
+        // A model can call native create_goal inside an ordinary channel-owned
+        // turn, bypassing the wrapper's `/goal` command path. Attribute that
+        // goal only through a fully classified causal turn: prefer the id on
+        // the notification, then a single turn observed as currently active.
+        // Never fall back to currentOrigin, which may belong to a concurrent or
+        // merely more recent conversation.
+        const causalTurnId = !wasActive
+          ? turnIdFromNotification(params) ?? this.singleActiveTurnId()
+          : null;
+        if (this.goalOrigin === null && causalTurnId) {
+          const causalOrigin = this.classifiedOriginForCausalTurn(causalTurnId);
+          if (causalOrigin) {
+            this.goalOrigin = causalOrigin;
+            this.pendingGoalOriginTurnId = null;
+          } else {
+            // The turn/start response can lag notifications. Remember only the
+            // exact observed turn id and bind after that same turn is classified.
+            this.pendingGoalOriginTurnId = causalTurnId;
+          }
+        }
+        // Once a goal is active, an ownerless state stays ownerless except for
+        // the exact causal turn captured on its first non-terminal update.
+        // Otherwise a later conversation could capture an existing goal merely
+        // by causing another active/paused/blocked notification.
         // Non-terminal goals can be resumed by Codex later. Retain their
         // conversation owner even while no automatic turn is running.
         this.goalActive = true;
@@ -399,6 +440,7 @@ export class CodexDeliveryTracker {
     }
 
     if (method === "turn/started") {
+      this.activeTurnIds.add(turnId);
       // `turn/start` can return before this notification is delivered. Keep an
       // origin explicitly bound to its returned turn id instead of replacing
       // it with whichever channel most recently became current.
@@ -452,6 +494,7 @@ export class CodexDeliveryTracker {
 
     if (method !== "turn/completed") return null;
 
+    this.activeTurnIds.delete(turnId);
     this.rememberCompletedTurn(turnId);
     const pending = this.pendingExplicitSubmission;
     const delivery =
@@ -499,6 +542,32 @@ export class CodexDeliveryTracker {
 
   private automaticTurnOrigin(): IpcOrigin | null {
     return this.goalActive ? this.goalOrigin : this.currentOrigin;
+  }
+
+  private singleActiveTurnId(): string | null {
+    if (this.activeTurnIds.size !== 1) return null;
+    const turnId = this.activeTurnIds.values().next().value;
+    return typeof turnId === "string" ? turnId : null;
+  }
+
+  private classifiedOriginForCausalTurn(turnId: string): IpcOrigin | null {
+    return this.authorizationOriginForTurn(turnId) ??
+      this.completedTurnOrigins.get(turnId) ??
+      null;
+  }
+
+  private tryBindPendingGoalOrigin(turnId: string): void {
+    if (
+      !this.goalActive ||
+      this.goalOrigin !== null ||
+      this.pendingGoalOriginTurnId !== turnId
+    ) {
+      return;
+    }
+    const origin = this.classifiedOriginForCausalTurn(turnId);
+    if (!origin) return;
+    this.goalOrigin = origin;
+    this.pendingGoalOriginTurnId = null;
   }
 
   private resolveProvisionalDelivery(
@@ -549,6 +618,13 @@ export class CodexDeliveryTracker {
     delivery: CodexTurnDelivery,
     completionParams: Record<string, unknown>,
   ): CodexFallbackReply | null {
+    if (
+      delivery.provisionalSubmissionToken === null &&
+      !delivery.provisionalOriginAmbiguous
+    ) {
+      this.completedTurnOrigins.set(turnId, delivery.origin);
+      this.tryBindPendingGoalOrigin(turnId);
+    }
     this.deliveries.delete(turnId);
     if (!delivery.origin) return null;
 
@@ -568,6 +644,7 @@ export class CodexDeliveryTracker {
       const oldest = this.completedTurnIds.values().next().value;
       if (typeof oldest !== "string") break;
       this.completedTurnIds.delete(oldest);
+      this.completedTurnOrigins.delete(oldest);
     }
   }
 }

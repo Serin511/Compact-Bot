@@ -288,7 +288,34 @@ rl.on("line", (line) => {
 	          },
 	        },
 	      });
+	      send({
+	        method: "thread/goal/updated",
+	        params: {
+	          threadId,
+	          goal: { objective: "native goal", status: "active" },
+	        },
+	      });
+	      setTimeout(() => {
+	        send({
+	          method: "turn/completed",
+	          params: {
+	            threadId,
+	            turn: { id: turnId, status: "completed", error: null },
+	          },
+	        });
+	        currentTurnId = "turn-native-goal-" + Date.now();
+	        send({
+	          method: "turn/started",
+	          params: {
+	            threadId,
+	            turn: { id: currentTurnId, status: "inProgress" },
+	          },
+	        });
+	        log({ event: "native-goal-automatic-start", turnId: currentTurnId });
+	      }, 750);
 	    }
+	  } else if (message.method === "turn/steer") {
+	    send({ id: message.id, result: {} });
   } else if (message.method === "model/list") {
     send({
       id: message.id,
@@ -548,6 +575,79 @@ rl.on("line", (line) => {
             message.request_id === "inert-guard-request",
         ),
       ).toMatchObject({ ok: true });
+
+      await waitFor(() =>
+        readEvents(logPath).some(
+          (event) => event.event === "native-goal-automatic-start",
+        )
+      );
+      peer.send({
+        type: "raw",
+        text: "SAME_ORIGIN_AFTER_NATIVE_GOAL",
+        request_id: "same-origin-after-native-goal",
+        origin: {
+          source: "slack",
+          chat_id: "channel-guard",
+          message_id: "guard-message-later",
+          user: "guard-user",
+          thread_ts: "guard-thread",
+        },
+      });
+      await waitFor(() =>
+        readEvents(logPath).some(
+          (event) =>
+            event.event === "request" &&
+            event.method === "turn/steer" &&
+            JSON.stringify(event.params).includes(
+              "SAME_ORIGIN_AFTER_NATIVE_GOAL",
+            ),
+        )
+      );
+
+      peer.send({
+        type: "raw",
+        text: "CROSS_ORIGIN_AFTER_NATIVE_GOAL",
+        request_id: "cross-origin-after-native-goal",
+        origin: {
+          source: "slack",
+          chat_id: "channel-guard",
+          message_id: "guard-message-wrong-user",
+          user: "other-user",
+          thread_ts: "guard-thread",
+        },
+      });
+      peer.send({
+        type: "raw",
+        text: "SAME_ORIGIN_AFTER_CROSS_ORIGIN",
+        request_id: "same-origin-after-cross-origin",
+        origin: {
+          source: "slack",
+          chat_id: "channel-guard",
+          message_id: "guard-message-sentinel",
+          user: "guard-user",
+          thread_ts: "guard-thread",
+        },
+      });
+      await waitFor(() =>
+        readEvents(logPath).some(
+          (event) =>
+            event.event === "request" &&
+            event.method === "turn/steer" &&
+            JSON.stringify(event.params).includes(
+              "SAME_ORIGIN_AFTER_CROSS_ORIGIN",
+            ),
+        )
+      );
+      expect(
+        readEvents(logPath).some(
+          (event) =>
+            event.event === "request" &&
+            event.method === "turn/steer" &&
+            JSON.stringify(event.params).includes(
+              "CROSS_ORIGIN_AFTER_NATIVE_GOAL",
+            ),
+        ),
+      ).toBe(false);
 
       writeFileSync(promptPath, "PROMPT_VERSION_B");
       peer.send({
