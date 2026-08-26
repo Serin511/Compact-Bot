@@ -46,6 +46,35 @@ async function waitFor(
   throw new Error("timed out waiting for relay fixture");
 }
 
+function roundTrip(socket: Socket, request: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let received = "";
+    const cleanup = (): void => {
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("close", onClose);
+    };
+    const onData = (chunk: Buffer): void => {
+      received += chunk.toString("utf8");
+      if (received.length < request.length) return;
+      cleanup();
+      resolve(received);
+    };
+    const onError = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = (): void => {
+      cleanup();
+      reject(new Error("relay socket closed before fixture response"));
+    };
+    socket.on("data", onData);
+    socket.once("error", onError);
+    socket.once("close", onClose);
+    socket.write(request);
+  });
+}
+
 function isProcessGone(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -166,6 +195,11 @@ process.stdin.on("end", () => {
   async function createRelay(
     dir: string,
     debug: string[] = [],
+    limits: {
+      maxConnections?: number;
+      maxSessions?: number;
+      maxSessionsPerPlatform?: number;
+    } = {},
   ): Promise<{
     relay: ClaudeMcpRelayServer;
     relayPath: string;
@@ -187,6 +221,7 @@ process.stdin.on("end", () => {
         COMPACT_BOT_IPC_AUTH_TOKEN: "stale-wrapper-env",
       },
       shutdownGraceMs: 250,
+      ...limits,
       onDebug: (message) => debug.push(message),
       onError: (message, error) => {
         debug.push(`${message}: ${String(error)}`);
@@ -384,7 +419,7 @@ process.stdin.on("end", () => {
     );
   });
 
-  it("allows one active lease per platform and keeps Discord and Slack isolated", async () => {
+  it("serves concurrent same-platform MCP clients with isolated byte streams", async () => {
     const dir = makeTempDir();
     const { relay, relayPath, logPath } = await createRelay(dir);
     await relay.startGeneration({
@@ -403,19 +438,183 @@ process.stdin.on("end", () => {
       },
     });
 
-    const discord = await connectClaudeMcpRelay(relayPath, "discord");
-    const slack = await connectClaudeMcpRelay(relayPath, "slack");
-    sockets.push(discord, slack);
+    const [firstDiscord, secondDiscord, slack] = await Promise.all([
+      connectClaudeMcpRelay(relayPath, "discord"),
+      connectClaudeMcpRelay(relayPath, "discord"),
+      connectClaudeMcpRelay(relayPath, "slack"),
+    ]);
+    sockets.push(firstDiscord, secondDiscord, slack);
+    await waitFor(
+      () => readEvents(logPath).filter((event) => event.event === "start").length === 3,
+    );
+
+    const firstRequest =
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":"first-discord"}}\n' +
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"client":"first-discord"}}\n';
+    const secondRequest =
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":"second-discord"}}\n' +
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"client":"second-discord"}}\n';
+    const slackRequest =
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":"slack"}}\n';
+
+    await expect(Promise.all([
+      roundTrip(firstDiscord, firstRequest),
+      roundTrip(secondDiscord, secondRequest),
+      roundTrip(slack, slackRequest),
+    ])).resolves.toEqual([firstRequest, secondRequest, slackRequest]);
+
+    const starts = readEvents(logPath).filter(
+      (event) => event.event === "start",
+    );
+    expect(new Set(starts.map((event) => event.pid)).size).toBe(3);
+  });
+
+  it("keeps sibling clients alive when one disconnects and stops all at generation end", async () => {
+    const dir = makeTempDir();
+    const { relay, relayPath, logPath } = await createRelay(dir);
+    await relay.startGeneration({
+      discord: {
+        TEST_LOG_PATH: logPath,
+        DISCORD_BOT_TOKEN: "discord-secret",
+        WRAPPER_SOCKET: join(dir, "wrapper.sock"),
+        COMPACT_BOT_IPC_AUTH_TOKEN: "ipc-secret",
+      },
+    });
+
+    const first = await connectClaudeMcpRelay(relayPath, "discord");
+    sockets.push(first);
+    const firstInitialize =
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":"first"}}\n';
+    await expect(roundTrip(first, firstInitialize)).resolves.toBe(
+      firstInitialize,
+    );
+    await waitFor(
+      () => readEvents(logPath).filter((event) => event.event === "start").length === 1,
+    );
+    const firstPid = readEvents(logPath).find(
+      (event) => event.event === "start",
+    )!.pid;
+
+    const second = await connectClaudeMcpRelay(relayPath, "discord");
+    sockets.push(second);
+    const secondInitialize =
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"client":"second"}}\n';
+    await expect(roundTrip(second, secondInitialize)).resolves.toBe(
+      secondInitialize,
+    );
     await waitFor(
       () => readEvents(logPath).filter((event) => event.event === "start").length === 2,
+    );
+    const secondPid = readEvents(logPath).filter(
+      (event) => event.event === "start",
+    )[1].pid;
+
+    first.destroy();
+    await waitFor(() => isProcessGone(firstPid));
+    expect(isProcessGone(secondPid)).toBe(false);
+
+    const siblingRequest =
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"client":"second"}}\n';
+    await expect(roundTrip(second, siblingRequest)).resolves.toBe(
+      siblingRequest,
+    );
+
+    await relay.stopGeneration();
+    await waitFor(() => isProcessGone(secondPid));
+  });
+
+  it("bounds concurrent MCP children without returning to a single-platform lease", async () => {
+    const dir = makeTempDir();
+    const { relay, relayPath, logPath } = await createRelay(dir, [], {
+      maxConnections: 4,
+      maxSessions: 3,
+      maxSessionsPerPlatform: 2,
+    });
+    await relay.startGeneration({
+      discord: {
+        TEST_LOG_PATH: logPath,
+        DISCORD_BOT_TOKEN: "discord-secret",
+        WRAPPER_SOCKET: join(dir, "wrapper.sock"),
+        COMPACT_BOT_IPC_AUTH_TOKEN: "ipc-secret",
+      },
+      slack: {
+        TEST_LOG_PATH: logPath,
+        SLACK_BOT_TOKEN: "slack-secret",
+        SLACK_APP_TOKEN: "slack-app-secret",
+        WRAPPER_SOCKET: join(dir, "wrapper.sock"),
+        COMPACT_BOT_IPC_AUTH_TOKEN: "ipc-secret",
+      },
+    });
+
+    const [firstDiscord, secondDiscord, firstSlack] = await Promise.all([
+      connectClaudeMcpRelay(relayPath, "discord"),
+      connectClaudeMcpRelay(relayPath, "discord"),
+      connectClaudeMcpRelay(relayPath, "slack"),
+    ]);
+    sockets.push(firstDiscord, secondDiscord, firstSlack);
+    await Promise.all([
+      roundTrip(
+        firstDiscord,
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}\n',
+      ),
+      roundTrip(
+        secondDiscord,
+        '{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}\n',
+      ),
+      roundTrip(
+        firstSlack,
+        '{"jsonrpc":"2.0","id":3,"method":"initialize","params":{}}\n',
+      ),
+    ]);
+    await waitFor(
+      () => readEvents(logPath).filter((event) => event.event === "start").length === 3,
     );
 
     await expect(
       connectClaudeMcpRelay(relayPath, "discord"),
-    ).rejects.toThrow(/closed|unavailable|acknowledgement/i);
+    ).rejects.toThrow(/closed|capacity|acknowledgement/i);
+    await expect(
+      connectClaudeMcpRelay(relayPath, "slack"),
+    ).rejects.toThrow(/closed|capacity|acknowledgement/i);
     expect(
       readEvents(logPath).filter((event) => event.event === "start"),
-    ).toHaveLength(2);
+    ).toHaveLength(3);
+  });
+
+  it("bounds sockets that never complete the relay handshake", async () => {
+    const dir = makeTempDir();
+    const { relay, relayPath, logPath } = await createRelay(dir, [], {
+      maxConnections: 2,
+    });
+    await relay.startGeneration({
+      discord: {
+        TEST_LOG_PATH: logPath,
+        DISCORD_BOT_TOKEN: "discord-secret",
+        WRAPPER_SOCKET: join(dir, "wrapper.sock"),
+        COMPACT_BOT_IPC_AUTH_TOKEN: "ipc-secret",
+      },
+    });
+
+    const openWithoutHandshake = (): Promise<Socket> =>
+      new Promise((resolve, reject) => {
+        const socket = createConnection(relayPath);
+        socket.once("connect", () => resolve(socket));
+        socket.once("error", reject);
+      });
+    const [first, second] = await Promise.all([
+      openWithoutHandshake(),
+      openWithoutHandshake(),
+    ]);
+    first.on("error", () => {});
+    second.on("error", () => {});
+    sockets.push(first, second);
+
+    await expect(
+      connectClaudeMcpRelay(relayPath, "discord"),
+    ).rejects.toThrow(/closed|capacity|acknowledgement|reset/i);
+    expect(
+      readEvents(logPath).filter((event) => event.event === "start"),
+    ).toHaveLength(0);
   });
 
   it("awaits a SIGTERM-ignoring child before enabling the next generation", async () => {

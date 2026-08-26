@@ -48,6 +48,9 @@ export interface ClaudeMcpRelayOptions {
   baseEnvironment?: NodeJS.ProcessEnv;
   shutdownGraceMs?: number;
   initializeTimeoutMs?: number;
+  maxConnections?: number;
+  maxSessions?: number;
+  maxSessionsPerPlatform?: number;
   onDebug?: (message: string) => void;
   onError?: (message: string, error: unknown) => void;
 }
@@ -78,6 +81,9 @@ const INITIALIZE_TIMEOUT_MS = 5_000;
 const MAX_INITIALIZE_BYTES = 1024 * 1024;
 const MAX_STDERR_BUFFER_BYTES = 64 * 1024;
 const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+const DEFAULT_MAX_CONNECTIONS = 64;
+const DEFAULT_MAX_SESSIONS = 32;
+const DEFAULT_MAX_SESSIONS_PER_PLATFORM = 16;
 export const MCP_RUNTIME_FD = 3;
 
 const PLATFORM_SECRET_ENV_KEYS = new Set([
@@ -92,6 +98,18 @@ const PLATFORM_SECRET_ENV_KEYS = new Set([
 
 function isPlatform(value: unknown): value is ClaudeMcpPlatform {
   return value === "discord" || value === "slack";
+}
+
+function positiveLimit(
+  value: number | undefined,
+  fallback: number,
+  name: string,
+): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive safe integer`);
+  }
+  return value;
 }
 
 function parseHandshake(line: Buffer): RelayHandshake | null {
@@ -209,16 +227,25 @@ export function buildCodexMcpProxyConfig(
 }
 
 /**
- * A Unix socket that exposes one MCP byte stream per configured platform.
+ * A Unix socket that exposes independent MCP byte streams for each proxy.
  *
  * Runtime payloads never cross this socket. They travel from the wrapper to
  * its own child over fd 3. A peer that discovers the relay can therefore reach
  * only the same MCP JSON-RPC surface Claude is intentionally given.
+ *
+ * Every proxy receives a dedicated MCP child so concurrent Codex parent and
+ * collaboration-agent sessions cannot collide on JSON-RPC IDs or responses.
+ * The platform MCP children separately coordinate their single-instance lock;
+ * only that lock's owner opens realtime Discord/Slack and announces `ready`,
+ * while non-owner children remain isolated stdio MCP servers.
  */
 export class ClaudeMcpRelayServer {
-  private readonly sessions = new Map<ClaudeMcpPlatform, RelaySession>();
+  private readonly sessions = new Set<RelaySession>();
   private readonly connections = new Set<Socket>();
   private readonly children = new Set<ChildProcess>();
+  private readonly maxConnections: number;
+  private readonly maxSessions: number;
+  private readonly maxSessionsPerPlatform: number;
   private payloads = new Map<
     ClaudeMcpPlatform,
     Readonly<Record<string, string>>
@@ -231,7 +258,23 @@ export class ClaudeMcpRelayServer {
     readonly socketPath: string,
     private readonly server: Server,
     private readonly options: ClaudeMcpRelayOptions,
-  ) {}
+  ) {
+    this.maxConnections = positiveLimit(
+      options.maxConnections,
+      DEFAULT_MAX_CONNECTIONS,
+      "maxConnections",
+    );
+    this.maxSessions = positiveLimit(
+      options.maxSessions,
+      DEFAULT_MAX_SESSIONS,
+      "maxSessions",
+    );
+    this.maxSessionsPerPlatform = positiveLimit(
+      options.maxSessionsPerPlatform,
+      DEFAULT_MAX_SESSIONS_PER_PLATFORM,
+      "maxSessionsPerPlatform",
+    );
+  }
 
   static async create(
     socketPath: string,
@@ -306,7 +349,7 @@ export class ClaudeMcpRelayServer {
     this.payloads.clear();
     const children = [...this.children];
     for (const socket of [...this.connections]) socket.destroy();
-    for (const session of [...this.sessions.values()]) {
+    for (const session of [...this.sessions]) {
       this.stopSession(session, "generation stopped");
     }
     await this.waitForChildren(children);
@@ -337,6 +380,13 @@ export class ClaudeMcpRelayServer {
   }
 
   private handleConnection(socket: Socket): void {
+    if (this.connections.size >= this.maxConnections) {
+      socket.on("error", () => {
+        // Capacity rejection is contained to this unauthenticated peer.
+      });
+      socket.destroy(new Error("Claude MCP relay connection capacity exceeded"));
+      return;
+    }
     this.connections.add(socket);
     const connectionGeneration = this.generation;
     let buffer = Buffer.alloc(0);
@@ -376,7 +426,7 @@ export class ClaudeMcpRelayServer {
         socket.destroy(new Error("Claude MCP relay is unavailable"));
         return;
       }
-      this.startOrQueueSession(
+      this.startSession(
         handshake.platform,
         connectionGeneration,
         socket,
@@ -388,7 +438,7 @@ export class ClaudeMcpRelayServer {
     socket.once("close", () => {
       cleanupHandshake();
       this.connections.delete(socket);
-      const session = [...this.sessions.values()].find(
+      const session = [...this.sessions].find(
         (candidate) => candidate.socket === socket,
       );
       if (session) this.stopSession(session, "proxy disconnected");
@@ -398,41 +448,22 @@ export class ClaudeMcpRelayServer {
     });
   }
 
-  private startOrQueueSession(
-    platform: ClaudeMcpPlatform,
-    generation: number,
-    socket: Socket,
-    initialMcpBytes: Buffer,
-  ): void {
-    const existing = this.sessions.get(platform);
-    if (!existing) {
-      this.startSession(platform, generation, socket, initialMcpBytes);
-      return;
-    }
-    if (!existing.closing) {
-      socket.destroy(new Error("Claude MCP relay is unavailable"));
-      return;
-    }
-    existing.child.once("close", () => {
-      if (
-        socket.destroyed ||
-        generation !== this.generation ||
-        !this.payloads.has(platform) ||
-        this.sessions.has(platform)
-      ) {
-        socket.destroy();
-        return;
-      }
-      this.startSession(platform, generation, socket, initialMcpBytes);
-    });
-  }
-
   private startSession(
     platform: ClaudeMcpPlatform,
     generation: number,
     socket: Socket,
     initialMcpBytes: Buffer,
   ): void {
+    const platformSessions = [...this.sessions].filter(
+      (session) => session.platform === platform,
+    ).length;
+    if (
+      this.sessions.size >= this.maxSessions ||
+      platformSessions >= this.maxSessionsPerPlatform
+    ) {
+      socket.destroy(new Error("Claude MCP relay session capacity exceeded"));
+      return;
+    }
     const payload = this.payloads.get(platform);
     if (!payload || generation !== this.generation) {
       socket.destroy();
@@ -475,7 +506,7 @@ export class ClaudeMcpRelayServer {
       stderrBuffer: "",
       closing: false,
     };
-    this.sessions.set(platform, session);
+    this.sessions.add(session);
     this.children.add(child);
 
     runtimePipe.on("error", (error) => {
@@ -584,9 +615,7 @@ export class ClaudeMcpRelayServer {
       this.children.delete(child);
       if (session.forceKillTimer) clearTimeout(session.forceKillTimer);
       session.forceKillTimer = null;
-      if (this.sessions.get(platform) === session) {
-        this.sessions.delete(platform);
-      }
+      this.sessions.delete(session);
       socket.destroy();
       if (!session.closing) {
         this.options.onError?.(
