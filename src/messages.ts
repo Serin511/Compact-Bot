@@ -17,33 +17,36 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { CONFIG_HOME } from "./paths.js";
+import { mcpRuntimeValue } from "./mcp-runtime-environment.js";
 
-const AGENT_NAME =
-  process.env.AGENT_PROVIDER === "codex" ? "Codex" : "Claude Code";
+const IS_CODEX = mcpRuntimeValue("AGENT_PROVIDER") === "codex";
+const AGENT_NAME = IS_CODEX ? "Codex" : "Claude Code";
+const command = (syntax: string): string =>
+  `\`/${syntax}\` (Slack: \`!${syntax}\`)`;
 const COMPACT_HELP =
-  process.env.AGENT_PROVIDER === "codex"
-    ? "`/compact [힌트]` — 컨텍스트 압축 (힌트는 압축 기록에 주입)"
-    : "`/compact [힌트]` — 컨텍스트 압축 (선택적 힌트로 중점 영역 지정)";
+  IS_CODEX
+    ? `${command("compact [힌트]")} — 컨텍스트 압축 (힌트는 압축 기록에 주입)`
+    : `${command("compact [힌트]")} — 컨텍스트 압축 (선택적 힌트로 중점 영역 지정)`;
 const MODEL_HELP =
-  process.env.AGENT_PROVIDER === "codex"
-    ? "`/model [name]` — Codex 모델 조회/변경 (전체 모델 ID)"
-    : "`/model [name]` — 모델 조회/변경 (sonnet, opus, haiku 또는 전체 ID)";
+  IS_CODEX
+    ? `${command("model [name]")} — Codex 모델 조회/변경 (전체 모델 ID)`
+    : `${command("model [name]")} — 모델 조회/변경 (sonnet, opus, haiku 또는 전체 ID)`;
 const EFFORT_HELP =
-  process.env.AGENT_PROVIDER === "codex"
-    ? "`/effort [level]` — reasoning effort 조회/변경"
-    : "`/effort` — Codex 모드에서만 사용 가능";
+  IS_CODEX
+    ? `${command("effort [level]")} — reasoning effort 조회/변경`
+    : `${command("effort")} — Codex 모드에서만 사용 가능`;
 const CAPTURE_HELP =
-  process.env.AGENT_PROVIDER === "codex"
-    ? "`/capture [--all]` — Codex 대화·실행 기록 캡처 (기본: 최근 50줄, `--all`: 현재 스레드 전체 기록)"
-    : "`/capture [--all]` — CLI 화면 캡처 (기본: 현재 화면, `--all`: 전체 스크롤백)";
+  IS_CODEX
+    ? `${command("capture [--all]")} — Codex 대화·실행 기록 캡처 (기본: 최근 50줄, \`--all\`: 현재 스레드의 최신 512 KiB)`
+    : `${command("capture [--all]")} — CLI 화면 캡처 (기본: 현재 화면, \`--all\`: 전체 스크롤백)`;
 const ESC_HELP =
-  process.env.AGENT_PROVIDER === "codex"
-    ? "`/esc` — 진행 중인 Codex 턴 중단"
-    : "`/esc` — ESC 키 전송 (진행 중인 작업 중단 · 멈춘 세션 복구용 안전망)";
+  IS_CODEX
+    ? `${command("esc")} — 진행 중인 Codex 턴 중단`
+    : `${command("esc")} — ESC 키 전송 (진행 중인 작업 중단 · 멈춘 세션 복구용 안전망)`;
 const RAW_HELP =
-  process.env.AGENT_PROVIDER === "codex"
-    ? "`/raw <text>` — 텍스트를 Codex 턴 입력으로 전송 (진행 중이면 steer, CLI 명령이 아님)"
-    : "`/raw <text>` — CLI에 텍스트를 그대로 입력 (예: `/raw /agents`, `/raw /config`)";
+  IS_CODEX
+    ? `${command("raw <text>")} — 텍스트를 Codex 턴 입력으로 전송 (진행 중이면 steer, CLI 명령이 아님)`
+    : `${command("raw <text>")} — CLI에 텍스트를 그대로 입력 (예: \`/raw /agents\`, \`/raw /config\`)`;
 
 const DEFAULTS: Record<string, string> = {
   processing: "⏳ 처리 중...",
@@ -67,32 +70,33 @@ const DEFAULTS: Record<string, string> = {
   cwdChanged: "✅ 작업 디렉토리 변경 완료: `{path}`.",
   help: [
     "📖 사용 가능한 명령어",
+    "Discord에서는 `/명령`, Slack에서는 `!명령` 형식을 사용하세요.",
     "",
     "━━ 세션 관리 ━━",
-    `\`/new\` — 새 ${AGENT_NAME} 세션 시작`,
-    "`/clear` — 세션 초기화",
+    `${command("new")} — 새 ${AGENT_NAME} 세션 시작`,
+    `${command("clear")} — 세션 초기화`,
     COMPACT_HELP,
     "",
     "━━ 설정 변경 ━━",
     MODEL_HELP,
     EFFORT_HELP,
-    "`/cwd [path]` — 작업 디렉토리 조회/변경",
+    `${command("cwd [path]")} — 작업 디렉토리 조회/변경`,
     "",
     "━━ 에이전트 제어 ━━",
     CAPTURE_HELP,
     ESC_HELP,
     RAW_HELP,
-    "`/goal <조건>` — 조건이 충족될 때까지 자동으로 턴 반복 (종료: `/goal clear`)",
+    `${command("goal <조건>")} — 조건이 충족될 때까지 자동으로 턴 반복 (종료: ${command("goal clear")})`,
     "",
     "━━ 도움말 ━━",
-    "`/help` — 이 도움말",
+    `${command("help")} — 이 도움말`,
     "",
     `그 외 메시지는 ${AGENT_NAME}에 전달됩니다.`,
   ].join("\n"),
 
   // Passthrough commands
   escSent:
-    process.env.AGENT_PROVIDER === "codex"
+    IS_CODEX
       ? "⏹️ 진행 중인 Codex 턴 중단 요청됨."
       : "⎋ ESC 전송됨.",
   rawSent: `⌨️ ${AGENT_NAME}에 입력 전송됨: \`{text}\``,
@@ -103,11 +107,11 @@ const DEFAULTS: Record<string, string> = {
 
   // Capture
   captureRequested:
-    process.env.AGENT_PROVIDER === "codex"
+    IS_CODEX
       ? "📸 Codex 대화·실행 기록 캡처 중..."
       : "📸 CLI 화면 캡처 중...",
   captureEmpty:
-    process.env.AGENT_PROVIDER === "codex"
+    IS_CODEX
       ? "⚠️ 캡처할 Codex 기록이 없습니다."
       : "⚠️ 캡처할 화면이 없습니다.",
   captureNoResponse: `⚠️ wrapper가 캡처 요청에 응답하지 않았습니다. ${AGENT_NAME}가 멈췄거나 재시작 중일 수 있습니다.`,
@@ -129,6 +133,8 @@ const DEFAULTS: Record<string, string> = {
   // User input prompts (AskUserQuestion relay)
   inputRequest: `❓ **${AGENT_NAME}의 질문**\n\n{question}\n\n💬 다음 메시지로 답변해주세요.`,
   inputResponseSent: "✅ 답변이 전달되었습니다.",
+  operatorOnly:
+    "⛔ 이 작업은 Compact Bot operator로 등록된 사용자만 실행할 수 있습니다.",
 };
 
 function loadCustomMessages(): Record<string, string> {

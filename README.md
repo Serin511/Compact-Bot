@@ -44,12 +44,18 @@ wrapper.ts (always-on)
   ├── Manages Claude Code lifecycle (spawn / kill / respawn)
   ├── Virtual terminal buffer (@xterm/headless) for screen capture
   ├── IPC socket for bidirectional control
+  ├── Wrapper-owned Discord / Slack MCP processes
+  │     └── Platform credentials injected over a private inherited FD
+  ├── Private MCP byte-stream relay
   └── Claude Code (node-pty)
-        ├── Discord MCP server
-        └── Slack MCP server
+        ├── Secretless Discord stdio proxy ─┐
+        └── Secretless Slack stdio proxy ───┴─ relay to wrapper-owned MCP
 ```
 
 The wrapper can restart Claude Code on command (`/new`, `/model`), forward CLI commands (`/compact`, `/clear`), and auto-respawn on crashes — all without losing the chat connection.
+Claude's local MCP JSON contains only the proxy executable, platform name, and
+private socket path. Platform tokens and the wrapper-control credential are not
+placed in Claude's PTY environment, command line, or local MCP configuration.
 
 For Codex, the wrapper uses its structured app-server API instead of scraping a
 terminal:
@@ -58,13 +64,21 @@ terminal:
 wrapper.ts (always-on)
   ├── Codex app-server JSON-RPC client
   │     ├── thread/start, turn/start, turn/steer
-  │     ├── thread/read transcript capture
+  │     ├── paginated thread/turns/list transcript capture
   │     ├── thread/compact/start, turn/interrupt, thread goals
   │     └── approval + request_user_input relay
+  ├── Wrapper-owned Discord / Slack MCP processes (private fd 3 config)
+  ├── Private MCP byte-stream relay
   └── Codex app-server
-        ├── Discord MCP server
-        └── Slack MCP server
+        ├── Secretless Discord stdio proxy ─┐
+        └── Secretless Slack stdio proxy ───┴─ relay to wrapper-owned MCP
 ```
+
+The Codex app-server environment is stripped of the same platform credentials,
+and normal Codex sessions use the `workspace-write` sandbox. Platform tokens
+must live in the protected Compact Bot configuration directory, not a
+project-local `.env`, so model-spawned shell commands cannot read the bot
+tokens or wrapper-control credential.
 
 ## Features
 
@@ -80,12 +94,17 @@ wrapper.ts (always-on)
 
 ## Prerequisites
 
-- **Node.js** >= 20
+- **Node.js** >= 20.19
 - At least one authenticated agent CLI:
   - **Claude Code** (`claude --version`, `claude login`)
   - **Codex** (`codex --version`, `codex login`)
 - **Build tools** — `build-essential` / `python3` for `node-pty` compilation
 - At least one of: **Discord Bot Token** or **Slack Bot Token**
+
+Codex support uses its structured
+[app-server protocol](https://learn.chatgpt.com/docs/app-server.md), including
+experimental thread settings and goal endpoints. Keep the Codex CLI current if
+those commands report an unsupported-method error.
 
 ## Quick Start
 
@@ -105,21 +124,28 @@ installations remain on Claude Code unless `AGENT_PROVIDER=codex` is added.
 git clone https://github.com/Serin511/Compact-Bot.git
 cd Compact-Bot
 npm install
-cp .env.example .env   # edit with your tokens
-npm run build
+npm run init            # writes owner-only config outside the agent workspace
 npm start
 ```
+
+`npm install` runs the TypeScript build automatically. Maintainers can verify a
+clean tarball install, its CLI, and an actual `node-pty` spawn with
+`npm run test:package`.
+
+Do not store Discord or Slack tokens in a project-local `.env` when using
+Codex. Workspace files are readable by the agent, so Codex mode fails closed
+when it finds platform credentials there. `compact-bot init` stores them in
+`~/.config/compact-bot/.env` with owner-only permissions instead. Enabling
+`DANGEROUSLY_SKIP_PERMISSIONS` deliberately removes the filesystem sandbox, so
+only use it with fully trusted channels and prompts.
 
 ## Setup
 
 ### Discord Bot
 
 1. Go to [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**
-2. **Bot** → Enable all **Privileged Gateway Intents**:
-   - Presence Intent
-   - Server Members Intent
-   - **Message Content Intent** (required)
-3. Copy the bot token → paste into `.env` as `DISCORD_BOT_TOKEN`
+2. **Bot** → Enable the **Message Content Intent** privileged intent
+3. Copy the bot token → enter it during `compact-bot init` as `DISCORD_BOT_TOKEN`
 4. **OAuth2** → **URL Generator** → Scopes: `bot` → Permissions:
    - Send Messages / Send Messages in Threads
    - Read Message History
@@ -138,8 +164,9 @@ npm start
 5. **Event Subscriptions** → Enable → Subscribe to bot events:
    - `message.channels`, `message.groups`, `message.im`, `message.mpim`
 6. **App Home** → Enable **Messages Tab** and allow messages from users
-7. Paste tokens into `.env` as `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`
+7. Enter both tokens during `compact-bot init` as `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN`
 8. Invite the bot to channels: `/invite @botname`
+9. Send `!help` in Slack to verify message delivery
 
 ### Environment Variables
 
@@ -151,38 +178,48 @@ AGENT_PROVIDER=codex                  # claude (default) or codex
 
 # Platform tokens (at least one required)
 DISCORD_BOT_TOKEN=
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
+SLACK_BOT_TOKEN=
+SLACK_APP_TOKEN=                       # required together with SLACK_BOT_TOKEN
 
 # Optional
 # DEFAULT_MODEL=                      # empty = selected CLI default
 # DEFAULT_REASONING_EFFORT=ultra       # Codex only; empty = Codex config
 # DEFAULT_CWD=~/projects              # empty = current directory
 MAX_TURNS=50                           # Claude Code only; 0 = unlimited
+FETCH_MESSAGE_LIMIT=20                 # 0 = maximum; always capped at 500
 ALLOWED_CHANNEL_IDS=                   # comma-separated, empty = all
+DISCORD_OPERATOR_USER_IDS=             # comma-separated, empty = all users in allowed channels
 SLACK_ALLOWED_CHANNEL_IDS=
+SLACK_OPERATOR_USER_IDS=               # comma-separated, empty = all users in allowed channels
 # DANGEROUSLY_SKIP_PERMISSIONS=true    # Claude flag / Codex never + full access
 SYSTEM_PROMPT_PATH=data/system-prompt.txt
 VERBOSE=false
 ```
 
+Operator IDs control who may run state-changing or session-disclosing commands
+and decide agent permission or approval requests. Leaving an operator list
+empty preserves compatibility by trusting every user in the corresponding
+allowed channels. Only leave it empty for private, trusted channels; otherwise
+set explicit Discord or Slack user IDs.
+
 ## Commands
 
-All commands work from both Discord and Slack.
+Discord commands use `/`; Slack commands use `!`. The command names and
+behavior are otherwise identical.
 
-| Command | Description |
-|---------|-------------|
-| `/new` | Start a fresh session/thread |
-| `/clear` | Clear current context (Claude CLI command / fresh Codex runtime and thread) |
-| `/compact [hint]` | Compress context. Claude forwards the hint to its CLI; Codex injects it into thread history before compaction |
-| `/model <name>` | Switch model. Claude supports `sonnet`/`opus`/`haiku` aliases; Codex accepts a full Codex model ID |
-| `/effort [level]` | Show or change Codex reasoning effort. Supported levels are validated against the current model |
-| `/cwd <path>` | Change the agent's working directory |
-| `/capture [--all]` | Claude: capture the CLI screen/scrollback. Codex: capture the last 50 lines/full current-thread transcript |
-| `/esc` | Claude: send ESC. Codex: interrupt the active turn |
-| `/raw <text>` | Claude: type into the CLI. Codex: submit/steer a normal turn (not a Codex TUI slash command) |
-| `/goal <condition>` | Set the agent goal; `/goal clear` clears it |
-| `/help` | Show available commands |
+| Discord | Slack | Description |
+|---------|-------|-------------|
+| `/new` | `!new` | Start a fresh session/thread |
+| `/clear` | `!clear` | Clear current context (Claude CLI command / fresh Codex runtime and thread) |
+| `/compact [hint]` | `!compact [hint]` | Compress context. Claude forwards the hint to its CLI; Codex injects it into thread history before compaction |
+| `/model <name>` | `!model <name>` | Switch model. Claude supports `sonnet`/`opus`/`haiku` aliases; Codex accepts a full Codex model ID |
+| `/effort [level]` | `!effort [level]` | Show or change the current Codex thread's reasoning effort. Supported levels are validated against the current model |
+| `/cwd <path>` | `!cwd <path>` | Change the agent's working directory |
+| `/capture [--all]` | `!capture [--all]` | Claude: capture the CLI screen/scrollback. Codex: capture the last 50 lines/current-thread transcript (newest 512 KiB) |
+| `/esc` | `!esc` | Claude: send ESC. Codex: interrupt the active turn |
+| `/raw <text>` | `!raw <text>` | Claude: type into the CLI. Codex: submit/steer a normal turn (not a Codex TUI slash command) |
+| `/goal <condition>` | `!goal <condition>` | Set the agent goal; append `clear` to clear it |
+| `/help` | `!help` | Show available commands |
 
 Any other message is forwarded to the selected agent.
 
@@ -191,8 +228,9 @@ literal terminal viewport. It includes available metadata, user/agent messages,
 reasoning summaries, plans, command output, file changes, and MCP calls. The
 active turn's streamed progress is merged in while it is running. The default
 form returns the last 50 rendered transcript lines to approximate a CLI
-viewport; `/capture --all` returns the available transcript for the entire
-current thread.
+viewport; `/capture --all` requests the current thread transcript and returns
+its newest 512 KiB. Older content is marked as omitted when that safety limit
+is reached.
 
 `/effort` is Codex-only. A change applies to the next new turn without
 restarting the thread; a turn already in progress keeps its original effort.
@@ -238,6 +276,9 @@ The content is injected via `--append-system-prompt` for Claude Code and as
 when it starts or restarts the agent runtime; editing it does not change an
 already-running session. `/new`, `/clear`, `/model`, and `/cwd` restart the
 Codex runtime and therefore load the current file contents.
+Relative `SYSTEM_PROMPT_PATH` values are resolved from the directory where
+Compact Bot is launched. `compact-bot init` avoids that ambiguity by copying
+the selected file to the user configuration directory.
 
 ## Troubleshooting
 
@@ -268,10 +309,13 @@ sudo apt install build-essential python3
 npm rebuild node-pty
 ```
 
+On macOS, Compact Bot's install hook locates the hoisted `node-pty` package and
+repairs the bundled `spawn-helper` executable bit. A failed repair now stops
+installation instead of being silently ignored.
+
 **Session feels stuck**
-- Send `/esc` to interrupt the active turn
-- Send `/new` to start a fresh agent session
-- Send `/clear` to reset the current context
+- Discord: send `/esc`, `/new`, or `/clear`
+- Slack: send `!esc`, `!new`, or `!clear`
 
 ## License
 

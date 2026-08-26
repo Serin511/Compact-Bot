@@ -8,10 +8,21 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireInstanceLock } from "../src/single-instance.js";
+import { createHash } from "node:crypto";
+import net from "node:net";
+import {
+  acquireInstanceLock,
+  waitForInstanceLock,
+} from "../src/single-instance.js";
 
 let dir: string;
 
@@ -74,5 +85,110 @@ describe("acquireInstanceLock", () => {
     const second = await acquireInstanceLock("slack", "xapp-token", dir);
     expect(second).not.toBeNull();
     second!.release();
+  });
+
+  it("grants exactly one owner when many callers reclaim a stale path", async () => {
+    const first = await acquireInstanceLock("slack", "racy-token", dir);
+    const path = first!.path;
+    first!.release();
+    writeFileSync(path, "stale");
+
+    const contenders = await Promise.all(
+      Array.from({ length: 20 }, () =>
+        acquireInstanceLock("slack", "racy-token", dir)
+      ),
+    );
+    const winners = contenders.filter((lock) => lock !== null);
+
+    expect(winners).toHaveLength(1);
+    winners[0]!.release();
+  });
+
+  it("reclaims through a later guard port when the first is unrelated", async () => {
+    const first = await acquireInstanceLock("slack", "port-collision", dir);
+    const path = first!.path;
+    first!.release();
+    writeFileSync(path, "stale");
+
+    const digest = createHash("sha256")
+      .update(`instance-reclaim\0${path}`)
+      .digest();
+    const firstGuardPort = 49_152 + (digest.readUInt16BE(0) % 16_384);
+    const unrelated = net.createServer((socket) => socket.end("unrelated\n"));
+    await new Promise<void>((resolve, reject) => {
+      unrelated.once("error", reject);
+      unrelated.listen(
+        { host: "127.0.0.1", port: firstGuardPort, exclusive: true },
+        () => resolve(),
+      );
+    });
+
+    try {
+      const lock = await acquireInstanceLock(
+        "slack",
+        "port-collision",
+        dir,
+      );
+      expect(lock).not.toBeNull();
+      lock!.release();
+    } finally {
+      await new Promise<void>((resolve) => unrelated.close(() => resolve()));
+    }
+  });
+
+  it.each(["slack", "discord"])(
+    "lets an inert %s peer take over after the owner releases without overlap",
+    async (platform) => {
+      const owner = await acquireInstanceLock(platform, "shared-token", dir);
+      expect(owner).not.toBeNull();
+
+      const abort = new AbortController();
+      const successorPromise = waitForInstanceLock(
+        platform,
+        "shared-token",
+        {
+          dir,
+          retryMs: 5,
+          signal: abort.signal,
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(
+        await acquireInstanceLock(platform, "shared-token", dir),
+      ).toBeNull();
+
+      owner!.release();
+      const successor = await Promise.race([
+        successorPromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("takeover timed out")), 1_000)
+        ),
+      ]);
+      expect(successor).not.toBeNull();
+      expect(
+        await acquireInstanceLock(platform, "shared-token", dir),
+      ).toBeNull();
+
+      successor!.release();
+      abort.abort();
+    },
+  );
+
+  it("forces private directory and socket modes under umask 022", async () => {
+    chmodSync(dir, 0o777);
+    const previousUmask = process.umask(0o022);
+    try {
+      const lock = await acquireInstanceLock(
+        "slack",
+        "permission-token",
+        dir,
+      );
+      expect(lock).not.toBeNull();
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(statSync(lock!.path).mode & 0o777).toBe(0o600);
+      lock!.release();
+    } finally {
+      process.umask(previousUmask);
+    }
   });
 });

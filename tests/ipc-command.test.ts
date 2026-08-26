@@ -1,7 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+  announceRealtimeNotReady,
   announceRealtimeReady,
   IpcCommandTracker,
+  IpcRoutedResultTracker,
+  IpcOutboundAuthorizationTracker,
   isAllowedInputAnswer,
   isOriginForPlatform,
   isMatchingInputRequest,
@@ -137,6 +140,15 @@ describe("realtime platform readiness", () => {
 
   it("does not throw when wrapper IPC is unavailable", () => {
     expect(announceRealtimeReady(null, "discord", true)).toBe(false);
+    expect(announceRealtimeNotReady(null, "discord")).toBe(false);
+  });
+
+  it("unregisters the exact realtime platform on disconnect", () => {
+    const sender = new FakeSender();
+    expect(announceRealtimeNotReady(sender, "slack")).toBe(true);
+    expect(sender.messages).toEqual([
+      { type: "not_ready", source: "slack" },
+    ]);
   });
 });
 
@@ -206,5 +218,202 @@ describe("IpcCommandTracker", () => {
       origin: slackOrigin,
       error: "wrapper 연결 없음",
     });
+  });
+});
+
+describe("IpcRoutedResultTracker", () => {
+  type CaptureResult = Extract<
+    WrapperToMcp,
+    { type: "capture_result" }
+  >;
+
+  it("preserves a routed request origin and suppresses a local duplicate", async () => {
+    const sender = new FakeSender();
+    const tracker = new IpcRoutedResultTracker<CaptureResult>();
+    const pending = tracker.request(sender, {
+      type: "capture",
+      request_id: "capture-local",
+      all: true,
+      origin: slackOrigin,
+    });
+
+    expect(sender.messages).toEqual([{
+      type: "capture",
+      request_id: "capture-local",
+      all: true,
+      origin: slackOrigin,
+    }]);
+
+    const result: CaptureResult = {
+      type: "capture_result",
+      request_id: "capture-local",
+      text: "captured",
+      all: true,
+      origin: slackOrigin,
+    };
+    expect(tracker.settle(result)).toBe(true);
+    await expect(pending).resolves.toEqual(result);
+    expect(tracker.settle(result)).toBe(true);
+  });
+
+  it("leaves an old-child result unknown in a replacement process", () => {
+    const tracker = new IpcRoutedResultTracker<CaptureResult>();
+    expect(
+      tracker.settle({
+        type: "capture_result",
+        request_id: "capture-from-old-child",
+        text: "captured",
+        origin: slackOrigin,
+      }),
+    ).toBe(false);
+  });
+
+  it("accepts an uncorrelated legacy result only for one pending request", async () => {
+    const sender = new FakeSender();
+    const single = new IpcRoutedResultTracker<CaptureResult>();
+    const pending = single.request(sender, {
+      type: "capture",
+      request_id: "only-request",
+      origin: slackOrigin,
+    });
+    const legacy: CaptureResult = {
+      type: "capture_result",
+      text: "legacy",
+    };
+    expect(single.settle(legacy)).toBe(true);
+    await expect(pending).resolves.toEqual(legacy);
+
+    const ambiguous = new IpcRoutedResultTracker<CaptureResult>();
+    void ambiguous.request(sender, {
+      type: "capture",
+      request_id: "request-a",
+      origin: slackOrigin,
+    });
+    void ambiguous.request(sender, {
+      type: "capture",
+      request_id: "request-b",
+      origin: slackOrigin,
+    });
+    expect(ambiguous.settle(legacy)).toBe(false);
+  });
+
+  it("returns null immediately when wrapper IPC is unavailable", async () => {
+    const tracker = new IpcRoutedResultTracker<CaptureResult>();
+    await expect(
+      tracker.request(null, {
+        type: "capture",
+        request_id: "capture-offline",
+        origin: slackOrigin,
+      }),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("IpcOutboundAuthorizationTracker", () => {
+  it("correlates a direct authorization response without realtime readiness", async () => {
+    const sender = new FakeSender();
+    const tracker = new IpcOutboundAuthorizationTracker();
+    const pending = tracker.request(sender, {
+      source: "slack",
+      server: "compact_bot_slack",
+      tool: "reply",
+      arguments: {
+        chat_id: slackOrigin.chat_id,
+        thread_ts: slackOrigin.thread_ts,
+        text: "hello",
+      },
+    });
+    const request = sender.messages[0];
+    if (!request || request.type !== "authorize_outbound") {
+      throw new Error("authorization request was not sent");
+    }
+    const result = {
+      type: "outbound_authorization_result" as const,
+      request_id: request.request_id,
+      ok: true,
+    };
+    expect(tracker.settle(result)).toBe(true);
+    await expect(pending).resolves.toEqual(result);
+  });
+
+  it("denies when IPC is absent or disconnects with a pending request", async () => {
+    const tracker = new IpcOutboundAuthorizationTracker();
+    await expect(
+      tracker.request(null, {
+        source: "discord",
+        server: "compact_bot_discord",
+        tool: "react",
+        arguments: {
+          chat_id: "discord-a",
+          message_id: "message-a",
+          emoji: "👍",
+        },
+      }),
+    ).resolves.toMatchObject({ ok: false, error: "wrapper 연결 없음" });
+
+    const sender = new FakeSender();
+    const pending = tracker.request(sender, {
+      source: "discord",
+      server: "compact_bot_discord",
+      tool: "edit_message",
+      arguments: {
+        chat_id: "discord-a",
+        message_id: "message-a",
+        text: "edit",
+      },
+    });
+    tracker.denyAll("socket closed");
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      error: "socket closed",
+    });
+  });
+
+  it("denies immediately when sending on the IPC socket throws", async () => {
+    const tracker = new IpcOutboundAuthorizationTracker();
+    const throwingSender: IpcMessageSender = {
+      send(): void {
+        throw new Error("socket already closed");
+      },
+    };
+    await expect(
+      tracker.request(throwingSender, {
+        source: "slack",
+        server: "compact_bot_slack",
+        tool: "reply",
+        arguments: { chat_id: "C123", text: "hello" },
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      error: "socket already closed",
+    });
+  });
+
+  it("keeps the outer IPC deadline longer than the guard decision window", async () => {
+    vi.useFakeTimers();
+    try {
+      const tracker = new IpcOutboundAuthorizationTracker();
+      const sender = new FakeSender();
+      let settled = false;
+      const pending = tracker.request(sender, {
+        source: "discord",
+        server: "compact_bot_discord",
+        tool: "reply",
+        arguments: { chat_id: "discord-a", text: "hello" },
+      }).then((result) => {
+        settled = true;
+        return result;
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({
+        ok: false,
+        error: "outbound authorization timeout",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

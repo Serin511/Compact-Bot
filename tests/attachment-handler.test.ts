@@ -8,15 +8,20 @@
 
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { existsSync, rmSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, sep } from "node:path";
 import type { Message } from "discord.js";
 import {
   downloadAttachments,
   cleanupAttachments,
 } from "../src/attachment-handler.js";
 
-const ATTACHMENTS_DIR = resolve(process.cwd(), "data", "attachments");
+const ATTACHMENTS_DIR = join(
+  tmpdir(),
+  `compact-bot-discord-attachments-${process.pid}`,
+);
 const TEST_MESSAGE_ID = "msg-test-attachment-handler";
+const TEN_MB = 10 * 1024 * 1024;
 
 interface FakeAttachment {
   id: string;
@@ -44,15 +49,19 @@ const makeMessage = (attachments: FakeAttachment[]): Message =>
     attachments: new Map(attachments.map((a) => [a.id, a])),
   }) as unknown as Message;
 
+const downloadTestAttachments = (message: Message) =>
+  downloadAttachments(message, ATTACHMENTS_DIR);
+
 describe("downloadAttachments", () => {
   afterEach(() => {
     vi.restoreAllMocks();
-    const dir = join(ATTACHMENTS_DIR, TEST_MESSAGE_ID);
-    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+    if (existsSync(ATTACHMENTS_DIR)) {
+      rmSync(ATTACHMENTS_DIR, { recursive: true, force: true });
+    }
   });
 
   it("returns empty result for a message with no attachments", async () => {
-    const result = await downloadAttachments(makeMessage([]));
+    const result = await downloadTestAttachments(makeMessage([]));
     expect(result.promptPrefix).toBe("");
     expect(result.paths).toEqual([]);
     expect(result.metadata).toEqual([]);
@@ -60,7 +69,7 @@ describe("downloadAttachments", () => {
 
   it("skips files exceeding the size limit", async () => {
     const att = makeAttachment({ size: 11 * 1024 * 1024 });
-    const result = await downloadAttachments(makeMessage([att]));
+    const result = await downloadTestAttachments(makeMessage([att]));
     expect(result.promptPrefix).toContain("test.txt");
     expect(result.promptPrefix).toMatch(/10\s*MB|크기 제한/);
     expect(result.paths).toEqual([]);
@@ -71,7 +80,7 @@ describe("downloadAttachments", () => {
       new Response(Buffer.from("hello"), { status: 200 }),
     );
 
-    const result = await downloadAttachments(makeMessage([makeAttachment()]));
+    const result = await downloadTestAttachments(makeMessage([makeAttachment()]));
 
     expect(result.paths.length).toBe(1);
     expect(result.promptPrefix).toContain("첨부 파일:");
@@ -84,9 +93,24 @@ describe("downloadAttachments", () => {
     );
 
     const att = makeAttachment({ name: "photo.png", contentType: "image/png" });
-    const result = await downloadAttachments(makeMessage([att]));
+    const result = await downloadTestAttachments(makeMessage([att]));
 
     expect(result.promptPrefix).toContain("첨부 이미지:");
+  });
+
+  it("stores path-like uploader filenames inside the message directory", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(Buffer.from("safe"), { status: 200 }),
+    );
+
+    const result = await downloadTestAttachments(
+      makeMessage([makeAttachment({ name: "../../../escaped.txt" })]),
+    );
+    const expectedRoot = join(ATTACHMENTS_DIR, TEST_MESSAGE_ID) + sep;
+
+    expect(result.paths).toHaveLength(1);
+    expect(result.paths[0]?.startsWith(expectedRoot)).toBe(true);
+    expect(result.paths[0]).toContain(".._.._.._escaped.txt");
   });
 
   it("handles download failure gracefully", async () => {
@@ -94,15 +118,38 @@ describe("downloadAttachments", () => {
       new Response(null, { status: 404 }),
     );
 
-    const result = await downloadAttachments(makeMessage([makeAttachment()]));
+    const result = await downloadTestAttachments(makeMessage([makeAttachment()]));
 
     expect(result.promptPrefix).toContain("다운로드 실패");
     expect(result.paths).toEqual([]);
+  });
+
+  it("enforces the aggregate download limit for one message", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () => new Response(Buffer.alloc(TEN_MB), { status: 200 }),
+    );
+    const attachments = Array.from({ length: 6 }, (_, index) =>
+      makeAttachment({
+        id: `A${index}`,
+        name: `part-${index}.bin`,
+        size: TEN_MB,
+        url: `https://cdn.discordapp.com/part-${index}.bin`,
+      }),
+    );
+
+    const result = await downloadTestAttachments(makeMessage(attachments));
+
+    expect(fetchSpy).toHaveBeenCalledTimes(5);
+    expect(result.paths).toHaveLength(5);
+    expect(result.promptPrefix).toContain("총 다운로드 제한(50MB)");
+    expect(result.promptPrefix).toContain("part-5.bin");
   });
 });
 
 describe("cleanupAttachments", () => {
   it("does not throw when the directory does not exist", () => {
-    expect(() => cleanupAttachments("nonexistent-message-id")).not.toThrow();
+    expect(() =>
+      cleanupAttachments("nonexistent-message-id", ATTACHMENTS_DIR)
+    ).not.toThrow();
   });
 });

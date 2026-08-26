@@ -32,6 +32,10 @@ import {
   type IpcCommandRequest,
   type IpcCommandResult,
   IpcCommandTracker,
+  IpcRoutedResultTracker,
+  IpcOutboundAuthorizationTracker,
+  type IpcOutboundWriteTool,
+  announceRealtimeNotReady,
   announceRealtimeReady,
   isOriginForPlatform,
   sameConversationOrigin,
@@ -41,27 +45,73 @@ import {
 import { routeMessage } from "./message-router.js";
 import { downloadAttachments } from "./attachment-handler.js";
 import { msg } from "./messages.js";
-import { isSendablePath } from "./sanitize.js";
+import {
+  MAX_MESSAGE_ATTACHMENT_BYTES,
+  readSendableFile,
+  type SendableFile,
+} from "./sanitize.js";
+import {
+  isAllowedChannel,
+  isOperator,
+  isPrivilegedCommand,
+} from "./access-control.js";
 import { chunkCodeBlock, chunkText } from "./chunk.js";
-import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
+import {
+  acquireInstanceLock,
+  waitForInstanceLock,
+  type InstanceLock,
+} from "./single-instance.js";
 import {
   KNOWN_REASONING_EFFORTS,
   normalizeReasoningEffort,
 } from "./reasoning-effort.js";
-import { statSync } from "node:fs";
+import { DISCORD_MCP_SERVER_INFO } from "./version.js";
+import {
+  attemptNotificationDelivery,
+  disconnectThenRelease,
+  requiresWrapperIpc,
+} from "./runtime-coordination.js";
+import {
+  PendingDiscordPermissions,
+  type PendingDiscordPermission,
+} from "./discord-permissions.js";
 import { randomUUID } from "node:crypto";
+import {
+  MAX_FETCH_MESSAGE_LIMIT,
+  normalizeFetchMessageLimit,
+} from "./fetch-limit.js";
+import {
+  mcpRuntimeValue,
+  requireMcpRuntimeValue,
+} from "./mcp-runtime-environment.js";
 
-// ── env (injected by wrapper via mcp-config.json) ─────────────────────
+// ── runtime configuration ─────────────────────────────────────────────
+//
+// Codex supplies these values through its filtered MCP child environment.
+// Claude's secretless launcher installs them in process-local memory before
+// importing this module, so they never appear in Claude's local MCP JSON,
+// model shell environment, or process arguments.
 
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN!;
-const WRAPPER_SOCKET = process.env.WRAPPER_SOCKET!;
-const ALLOWED_CHANNEL_IDS = (process.env.ALLOWED_CHANNEL_IDS || "")
+const DISCORD_BOT_TOKEN = requireMcpRuntimeValue("DISCORD_BOT_TOKEN");
+const WRAPPER_SOCKET = requireMcpRuntimeValue("WRAPPER_SOCKET");
+const IPC_AUTH_TOKEN = requireMcpRuntimeValue(
+  "COMPACT_BOT_IPC_AUTH_TOKEN",
+);
+const ALLOWED_CHANNEL_IDS = (mcpRuntimeValue("ALLOWED_CHANNEL_IDS") || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
+const OPERATOR_USER_IDS = (
+  mcpRuntimeValue("DISCORD_OPERATOR_USER_IDS") || ""
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const FETCH_MESSAGE_LIMIT = normalizeFetchMessageLimit(
+  mcpRuntimeValue("FETCH_MESSAGE_LIMIT"),
+);
 const AGENT_PROVIDER =
-  process.env.AGENT_PROVIDER === "codex" ? "codex" : "claude";
+  mcpRuntimeValue("AGENT_PROVIDER") === "codex" ? "codex" : "claude";
 
 /** Max time a tool invocation may take before it is treated as hung. */
 const TOOL_TIMEOUT_MS = 20_000;
@@ -88,7 +138,13 @@ let currentEffort = "";
 let availableEfforts: string[] = [];
 let currentCwd = "";
 let lastActiveChannelId: string | null = null;
+type CaptureResult = Extract<WrapperToMcp, { type: "capture_result" }>;
+type EffortResult = Extract<WrapperToMcp, { type: "effort_result" }>;
 const commandTracker = new IpcCommandTracker();
+const captureTracker = new IpcRoutedResultTracker<CaptureResult>();
+const effortTracker = new IpcRoutedResultTracker<EffortResult>();
+const outboundAuthorizationTracker =
+  new IpcOutboundAuthorizationTracker();
 
 /** Pending user input request — when set, the next user message is treated as the answer. */
 let pendingInputRequest: {
@@ -96,12 +152,17 @@ let pendingInputRequest: {
   channelId: string;
   userId?: string;
   origin?: IpcOrigin;
+  promptMessage?: Message;
 } | null = null;
 const cancelledInputRequests = new Set<string>();
 const INPUT_REQUEST_TOMBSTONE_MS = 10 * 60 * 1000;
 
 type AgentReply = Extract<WrapperToMcp, { type: "agent_reply" }>;
-type RoutedOutput = IpcCommandResult | AgentReply;
+type RoutedOutput =
+  | IpcCommandResult
+  | AgentReply
+  | CaptureResult
+  | EffortResult;
 const deferredRoutedOutput: RoutedOutput[] = [];
 
 function discordOrigin(message: Message): IpcOrigin {
@@ -157,10 +218,36 @@ async function deliverRoutedOutput(output: RoutedOutput): Promise<void> {
     if (deferredRoutedOutput.length > 100) deferredRoutedOutput.shift();
     return;
   }
+  if (output.type === "capture_result") {
+    if (output.text === "") {
+      await postDiscordOrigin(output.origin, msg("captureEmpty"), true);
+      return;
+    }
+    const chunks = chunkCodeBlock(output.text, 1900, "ansi");
+    const toSend = output.all || AGENT_PROVIDER === "codex"
+      ? chunks
+      : chunks.slice(-1);
+    for (const chunk of toSend) {
+      await postDiscordOrigin(output.origin, chunk);
+    }
+    return;
+  }
   const text = output.type === "agent_reply"
     ? output.text
+    : output.type === "effort_result"
+    ? (
+      output.ok
+        ? msg("effortChanged", { effort: output.effort })
+        : msg("effortChangeFailed", {
+          reason: output.error || "변경을 적용하지 못했습니다.",
+        })
+    )
     : commandResultText(output);
-  await postDiscordOrigin(output.origin, text, output.type === "command_result");
+  await postDiscordOrigin(
+    output.origin,
+    text,
+    output.type === "command_result" || output.type === "effort_result",
+  );
 }
 
 async function flushDeferredRoutedOutput(): Promise<void> {
@@ -198,90 +285,45 @@ async function runDiscordCommand(
  *   Callers must distinguish the two — a null signals a likely wrapper
  *   stall or crash, whereas "" is a real capture outcome.
  */
-function requestCapture(all = false): Promise<string | null> {
-  return new Promise((resolve) => {
-    const requestId = randomUUID();
-    if (!ipc) {
-      resolve(null);
-      return;
-    }
-    const localIpc = ipc;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      localIpc.removeListener("message", handler);
-    };
-    const handler = (msg: WrapperToMcp) => {
-      if (
-        msg.type === "capture_result" &&
-        // A missing ID is accepted from older wrappers.
-        (!msg.request_id || msg.request_id === requestId)
-      ) {
-        cleanup();
-        resolve(msg.text);
-      }
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      resolve(null);
-    }, 65_000);
-    localIpc.on("message", handler);
-    localIpc.send({
+function requestCapture(
+  origin: IpcOrigin,
+  all = false,
+): Promise<CaptureResult | null> {
+  const requestId = randomUUID();
+  return captureTracker.request(
+    ipc,
+    {
       type: "capture",
       all,
       request_id: requestId,
-    } satisfies McpToWrapper);
-  });
+      origin,
+    } satisfies McpToWrapper & { request_id: string },
+  );
 }
 
-type EffortResult = Extract<WrapperToMcp, { type: "effort_result" }>;
-
 /** Ask the wrapper to apply an effort change and wait for its validation. */
-function requestEffortChange(effort: string): Promise<EffortResult> {
-  return new Promise((resolve) => {
-    const requestId = randomUUID();
-    if (!ipc) {
-      resolve({
-        type: "effort_result",
-        request_id: requestId,
-        ok: false,
-        effort: currentEffort,
-        availableEfforts,
-        error: "wrapper 연결 없음",
-      });
-      return;
-    }
-    const localIpc = ipc;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      localIpc.removeListener("message", handler);
-    };
-    const handler = (message: WrapperToMcp) => {
-      if (
-        message.type === "effort_result" &&
-        message.request_id === requestId
-      ) {
-        cleanup();
-        resolve(message);
-      }
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      resolve({
-        type: "effort_result",
-        request_id: requestId,
-        ok: false,
-        effort: currentEffort,
-        availableEfforts,
-        error: "wrapper 응답 시간 초과",
-      });
-    }, 180_000);
-    localIpc.on("message", handler);
-    localIpc.send({
+async function requestEffortChange(
+  origin: IpcOrigin,
+  effort: string,
+): Promise<EffortResult> {
+  const requestId = randomUUID();
+  const result = await effortTracker.request(
+    ipc,
+    {
       type: "effort",
       request_id: requestId,
       effort,
-    } satisfies McpToWrapper);
-  });
+      origin,
+    } satisfies McpToWrapper & { request_id: string },
+  );
+  return result ?? {
+    type: "effort_result",
+    request_id: requestId,
+    ok: false,
+    effort: currentEffort,
+    availableEfforts,
+    error: ipc ? "wrapper 응답 시간 초과" : "wrapper 연결 없음",
+  };
 }
 
 /**
@@ -293,8 +335,7 @@ function isCaptureAll(args: string | undefined): boolean {
 }
 
 function isAllowed(channelId: string): boolean {
-  if (ALLOWED_CHANNEL_IDS.length === 0) return true;
-  return ALLOWED_CHANNEL_IDS.includes(channelId);
+  return isAllowedChannel(channelId, ALLOWED_CHANNEL_IDS);
 }
 
 /**
@@ -338,11 +379,16 @@ const discord = new Client({
  * the process lifetime; released on shutdown.
  */
 let instanceLock: InstanceLock | null = null;
+let ownershipTask: Promise<void> | null = null;
+const ownershipAbort = new AbortController();
+let shuttingDown = false;
+let shutdownTask: Promise<void> | null = null;
+let wrapperRealtimeReady = false;
 
 // ── MCP server ────────────────────────────────────────────────────────
 
 const mcp = new McpServer(
-  { name: "discord-bot", version: "0.1.0" },
+  DISCORD_MCP_SERVER_INFO,
   {
     capabilities: {
       tools: {},
@@ -426,17 +472,55 @@ type ToolResult = {
   isError?: boolean;
 };
 
+async function authorizePlatformWrite(
+  tool: IpcOutboundWriteTool,
+  args: Record<string, unknown>,
+): Promise<ToolResult | null> {
+  // Claude Code owns its MCP channel routing and does not emit Codex
+  // item/started notifications. Preserve that existing path unchanged.
+  if (AGENT_PROVIDER !== "codex") return null;
+  const result = await outboundAuthorizationTracker.request(ipc, {
+    source: "discord",
+    server: "compact_bot_discord",
+    tool,
+    arguments: args,
+  });
+  if (result.ok) return null;
+  return {
+    content: [{
+      type: "text",
+      text: `${tool} blocked by turn-scoped outbound guard: ${
+        result.error || "authorization denied"
+      }`,
+    }],
+    isError: true,
+  };
+}
+
 /**
  * Wrap a tool body so every failure mode becomes an ``isError`` response.
  *
  * Catches thrown errors, timeouts, and rejected promises, and refuses to
- * run tools before the Discord Gateway is ready — the earlier
- * implementation leaked all three as hung sessions.
+ * run tools before the Discord Gateway is ready or against a channel outside
+ * the configured allowlist.
  */
-async function runTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
+async function runTool(
+  name: string,
+  channelId: string,
+  fn: () => Promise<ToolResult>,
+): Promise<ToolResult> {
   if (!discord.isReady()) {
     return {
       content: [{ type: "text" as const, text: `${name} failed: Discord gateway not ready` }],
+      isError: true,
+    };
+  }
+  if (!isAllowed(channelId)) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `${name} failed: Discord channel is outside ALLOWED_CHANNEL_IDS`,
+      }],
       isError: true,
     };
   }
@@ -475,8 +559,11 @@ mcp.tool(
       .optional()
       .describe("Absolute file paths to attach (images, logs, etc). Max 10 files, 25MB each."),
   },
-  async ({ chat_id, text, reply_to, files }) =>
-    runTool("reply", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("reply", args);
+    if (denied) return denied;
+    const { chat_id, text, reply_to, files } = args;
+    return runTool("reply", chat_id, async () => {
       const channel = await discord.channels.fetch(chat_id);
       if (!channel?.isTextBased()) {
         return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
@@ -494,45 +581,46 @@ mcp.tool(
             isError: true,
           };
         }
-        for (const f of files) {
-          if (!isSendablePath(f)) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `refusing to send bot state file: ${f}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          // Discord rejects >25MB uploads with an opaque 413 — pre-check
-          // so the model sees a useful message instead of "Request entity
-          // too large" after a long upload attempt.
-          try {
-            const st = statSync(f);
-            if (st.size > MAX_ATTACHMENT_BYTES) {
-              return {
-                content: [
-                  {
-                    type: "text" as const,
-                    text: `file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 25MB)`,
-                  },
-                ],
-                isError: true,
-              };
-            }
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `cannot read file: ${f} (${err instanceof Error ? err.message : String(err)})`,
-                },
-              ],
-              isError: true,
-            };
-          }
+      }
+
+      const preparedFiles: SendableFile[] = [];
+      let preparedBytes = 0;
+      for (const f of files ?? []) {
+        const remainingBytes =
+          MAX_MESSAGE_ATTACHMENT_BYTES - preparedBytes;
+        if (remainingBytes <= 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `refusing to send more than ` +
+                  `${MAX_MESSAGE_ATTACHMENT_BYTES / 1024 / 1024}MB of attachments`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        try {
+          const prepared = readSendableFile(
+            f,
+            [currentCwd || process.cwd()],
+            Math.min(MAX_ATTACHMENT_BYTES, remainingBytes),
+          );
+          preparedFiles.push(prepared);
+          preparedBytes += prepared.size;
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `refusing to send file: ${f} ` +
+                  `(${err instanceof Error ? err.message : String(err)})`,
+              },
+            ],
+            isError: true,
+          };
         }
       }
 
@@ -547,8 +635,13 @@ mcp.tool(
             ...(i === 0 && reply_to
               ? { reply: { messageReference: reply_to, failIfNotExists: false } }
               : {}),
-            ...(i === 0 && files?.length
-              ? { files: files.map((f) => ({ attachment: f })) }
+            ...(i === 0 && preparedFiles.length > 0
+              ? {
+                files: preparedFiles.map((file) => ({
+                  attachment: file.data,
+                  name: file.filename,
+                })),
+              }
               : {}),
           });
           sentIds.push(sent.id);
@@ -570,7 +663,8 @@ mcp.tool(
           },
         ],
       };
-    }),
+    });
+  },
 );
 
 mcp.tool(
@@ -581,8 +675,11 @@ mcp.tool(
     message_id: z.string().describe("Message ID"),
     emoji: z.string().describe("Emoji to react with"),
   },
-  async ({ chat_id, message_id, emoji }) =>
-    runTool("react", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("react", args);
+    if (denied) return denied;
+    const { chat_id, message_id, emoji } = args;
+    return runTool("react", chat_id, async () => {
       const channel = await discord.channels.fetch(chat_id);
       if (!channel?.isTextBased()) {
         return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
@@ -590,7 +687,8 @@ mcp.tool(
       const msg = await (channel as TextChannel).messages.fetch(message_id);
       await msg.react(emoji);
       return { content: [{ type: "text" as const, text: "Reaction added" }] };
-    }),
+    });
+  },
 );
 
 mcp.tool(
@@ -601,8 +699,11 @@ mcp.tool(
     message_id: z.string().describe("Message ID to edit"),
     text: z.string().describe("New message text"),
   },
-  async ({ chat_id, message_id, text }) =>
-    runTool("edit_message", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("edit_message", args);
+    if (denied) return denied;
+    const { chat_id, message_id, text } = args;
+    return runTool("edit_message", chat_id, async () => {
       const channel = await discord.channels.fetch(chat_id);
       if (!channel?.isTextBased()) {
         return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
@@ -610,7 +711,8 @@ mcp.tool(
       const msg = await (channel as TextChannel).messages.fetch(message_id);
       await msg.edit(text);
       return { content: [{ type: "text" as const, text: "Message edited" }] };
-    }),
+    });
+  },
 );
 
 mcp.tool(
@@ -620,17 +722,26 @@ mcp.tool(
     channel: z.string().describe("Discord channel ID"),
     limit: z
       .number()
+      .int()
+      .min(0)
+      .max(MAX_FETCH_MESSAGE_LIMIT)
       .optional()
-      .default(FETCH_MESSAGE_LIMIT)
       .describe(`Max messages to fetch (default ${FETCH_MESSAGE_LIMIT}, 0 for max 500). Paginates automatically above 100.`),
   },
-  async ({ channel: channelId, limit }) =>
-    runTool("fetch_messages", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("fetch_messages", args);
+    if (denied) return denied;
+    const { channel: channelId } = args;
+    const limit = normalizeFetchMessageLimit(
+      args.limit,
+      FETCH_MESSAGE_LIMIT,
+    );
+    return runTool("fetch_messages", channelId, async () => {
       const ch = await discord.channels.fetch(channelId);
       if (!ch?.isTextBased()) {
         return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
       }
-      const target = limit === 0 ? 500 : limit;
+      const target = limit;
       const allMessages: Message[] = [];
       let before: string | undefined;
 
@@ -658,7 +769,8 @@ mcp.tool(
       return {
         content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
       };
-    }),
+    });
+  },
 );
 
 mcp.tool(
@@ -668,8 +780,11 @@ mcp.tool(
     chat_id: z.string().describe("Discord channel ID"),
     message_id: z.string().describe("Message ID with attachments"),
   },
-  async ({ chat_id, message_id }) =>
-    runTool("download_attachment", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("download_attachment", args);
+    if (denied) return denied;
+    const { chat_id, message_id } = args;
+    return runTool("download_attachment", chat_id, async () => {
       const channel = await discord.channels.fetch(chat_id);
       if (!channel?.isTextBased()) {
         return { content: [{ type: "text" as const, text: "Invalid channel" }], isError: true };
@@ -686,7 +801,8 @@ mcp.tool(
           { type: "text" as const, text: promptPrefix || "Attachments downloaded" },
         ],
       };
-    }),
+    });
+  },
 );
 
 // ── permission prompt handling (MCP Channel protocol) ───────────────
@@ -782,10 +898,10 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
  * notifications short. Full input_preview / description are fetched on
  * demand when the user taps "상세보기".
  */
-const pendingPermissions = new Map<
-  string,
-  { tool_name: string; description: string; input_preview: string }
->();
+const pendingPermissions = new PendingDiscordPermissions({
+  sendDeny: (requestId) => sendPermissionVerdict(requestId, "deny"),
+  onError: (error) => stderr(`Failed to expire Discord permission: ${error}`),
+});
 
 function buildPermissionRow(requestId: string): ActionRowBuilder<ButtonBuilder> {
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -837,6 +953,14 @@ async function handlePermissionRequest(params: {
 }): Promise<void> {
   stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
 
+  if (!wrapperRealtimeReady) {
+    // A duplicate/inert MCP process cannot receive the button interaction, so
+    // posting from it would route the verdict to a different Claude session.
+    stderr("No Discord realtime ownership for permission request — auto-denying");
+    await sendPermissionVerdict(params.request_id, "deny");
+    return;
+  }
+
   const channelId = resolveDefaultChannelId();
   if (!channelId) {
     // No one to ask. Auto-deny so Claude Code doesn't block forever waiting
@@ -854,19 +978,29 @@ async function handlePermissionRequest(params: {
       return;
     }
 
-    pendingPermissions.set(params.request_id, {
+    const pending: PendingDiscordPermission = {
       tool_name: params.tool_name,
       description: params.description,
       input_preview: params.input_preview,
-    });
+    };
+    pendingPermissions.set(params.request_id, pending);
 
     const summary = `🔐 **권한 요청**: \`${params.tool_name}\``;
     const hint = `💬 또는 \`yes ${params.request_id}\` / \`no ${params.request_id}\`로 답할 수 있어요.`;
 
-    await (channel as TextChannel).send({
+    const promptMessage = await (channel as TextChannel).send({
       content: `${summary}\n${hint}`,
       components: [buildPermissionRow(params.request_id)],
     });
+    if (pendingPermissions.get(params.request_id) === pending) {
+      pending.promptMessage = promptMessage;
+    } else {
+      await promptMessage.edit({
+        content:
+          `${promptMessage.content}\n\n*이미 처리되었거나 만료된 권한 요청입니다.*`,
+        components: [],
+      }).catch(() => {});
+    }
   } catch (err) {
     stderr(`Failed to send permission request to Discord: ${err} — auto-denying`);
     pendingPermissions.delete(params.request_id);
@@ -880,16 +1014,19 @@ async function handlePermissionRequest(params: {
 async function sendPermissionVerdict(
   requestId: string,
   behavior: "allow" | "deny",
-): Promise<void> {
-  try {
-    await mcp.server.notification({
-      method: "notifications/claude/channel/permission",
-      params: { request_id: requestId, behavior },
-    });
+): Promise<boolean> {
+  const delivered = await attemptNotificationDelivery(
+    () =>
+      mcp.server.notification({
+        method: "notifications/claude/channel/permission",
+        params: { request_id: requestId, behavior },
+      }),
+    (error) => stderr(`Failed to send permission verdict: ${error}`),
+  );
+  if (delivered) {
     stderr(`Permission verdict sent: ${requestId} → ${behavior}`);
-  } catch (err) {
-    stderr(`Failed to send permission verdict: ${err}`);
   }
+  return delivered;
 }
 
 // ── user input request handling (PTY prompt relay) ───────────────────
@@ -1040,7 +1177,7 @@ async function handleInputRequest(
       if (isLast && widget) {
         const hasActions =
           widget.options.length > 0 || widget.allowOther !== false;
-        await ch.send(
+        const sent = await ch.send(
           hasActions
             ? {
                 content: chunks[i],
@@ -1048,6 +1185,16 @@ async function handleInputRequest(
               }
             : { content: chunks[i] },
         );
+        if (cancelledInputRequests.has(requestId)) {
+          await sent.edit({
+            content: `${sent.content}\n\n*요청이 취소되었거나 만료되었습니다.*`,
+            components: [],
+          }).catch(() => {});
+          return;
+        }
+        if (pendingInputRequest?.request_id === requestId) {
+          pendingInputRequest.promptMessage = sent;
+        }
       } else {
         await ch.send(chunks[i]);
       }
@@ -1066,6 +1213,30 @@ async function handleInputRequest(
   }
 }
 
+function cancelLocalInputRequest(requestId: string): void {
+  cancelledInputRequests.add(requestId);
+  setTimeout(
+    () => cancelledInputRequests.delete(requestId),
+    INPUT_REQUEST_TOMBSTONE_MS,
+  ).unref();
+  pendingAskUserQuestion.delete(requestId);
+
+  if (!isMatchingInputRequest(pendingInputRequest?.request_id, requestId)) {
+    return;
+  }
+  const pending = pendingInputRequest!;
+  pendingInputRequest = null;
+  if (pending.promptMessage) {
+    void pending.promptMessage.edit({
+      content:
+        `${pending.promptMessage.content}\n\n*요청이 취소되었거나 만료되었습니다.*`,
+      components: [],
+    }).catch((error) => {
+      stderr(`Failed to deactivate cancelled input request: ${error}`);
+    });
+  }
+}
+
 // ── Discord message handler ───────────────────────────────────────────
 
 async function sendChannelNotification(
@@ -1080,6 +1251,18 @@ async function sendChannelNotification(
       meta,
     } satisfies McpToWrapper);
     return;
+  }
+  if (meta.chat_id && meta.message_id) {
+    ipc?.send({
+      type: "channel_activity",
+      origin: {
+        source: "discord",
+        chat_id: meta.chat_id,
+        message_id: meta.message_id,
+        ...(meta.user_id ? { user: meta.user_id } : {}),
+        ...(meta.ts ? { ts: meta.ts } : {}),
+      },
+    } satisfies McpToWrapper);
   }
   await mcp.server.notification({
     method: "notifications/claude/channel",
@@ -1098,16 +1281,52 @@ async function handleDiscordMessage(message: Message): Promise<void> {
   // notification where button-tap isn't convenient. The request_id is
   // generated by Claude Code as 5 lowercase letters (a-z minus 'l').
   const permMatch = PERMISSION_REPLY_RE.exec(message.content);
-  if (permMatch && pendingPermissions.has(permMatch[2]!.toLowerCase())) {
+  if (permMatch) {
+    if (!isOperator(message.author.id, OPERATOR_USER_IDS)) {
+      await message.reply(msg("operatorOnly"));
+      return;
+    }
     const requestId = permMatch[2]!.toLowerCase();
     const allow = permMatch[1]!.toLowerCase().startsWith("y");
-    pendingPermissions.delete(requestId);
-    await sendPermissionVerdict(requestId, allow ? "allow" : "deny");
+    const claim = pendingPermissions.take(requestId);
+    if (!claim) {
+      await message.reply("이미 처리되었거나 만료된 권한 요청입니다.");
+      return;
+    }
+    const { permission } = claim;
+    const delivered = await sendPermissionVerdict(
+      requestId,
+      allow ? "allow" : "deny",
+    );
+    if (!delivered) {
+      pendingPermissions.restore(claim);
+      await message.reply(
+        "⚠️ 권한 응답을 agent에 전달하지 못했습니다. 잠시 후 다시 시도해주세요.",
+      );
+      return;
+    }
+    if (permission.promptMessage) {
+      const label = allow
+        ? msg("permissionAllowed", { tool: permission.tool_name })
+        : msg("permissionDenied", { tool: permission.tool_name });
+      await permission.promptMessage.edit({
+        content: `${permission.promptMessage.content}\n\n${label}`,
+        components: [],
+      }).catch(() => {});
+    }
     await message.react(allow ? "✅" : "❌").catch(() => {});
     return;
   }
 
   const route = routeMessage(message.content);
+
+  if (
+    isPrivilegedCommand(route.type) &&
+    !isOperator(message.author.id, OPERATOR_USER_IDS)
+  ) {
+    await message.reply(msg("operatorOnly"));
+    return;
+  }
 
   // Only plain chat messages answer a pending input request. Slash commands
   // remain commands, so users can inspect, interrupt, or restart while Codex
@@ -1121,7 +1340,8 @@ async function handleDiscordMessage(message: Message): Promise<void> {
         )
       : message.channelId === pendingInputRequest.channelId &&
         (!pendingInputRequest.userId ||
-          message.author.id === pendingInputRequest.userId)) &&
+          message.author.id === pendingInputRequest.userId) &&
+        isOperator(message.author.id, OPERATOR_USER_IDS)) &&
     route.type === "message"
   ) {
     const { request_id } = pendingInputRequest;
@@ -1229,7 +1449,7 @@ async function handleDiscordMessage(message: Message): Promise<void> {
         );
         return;
       }
-      const result = await requestEffortChange(effort);
+      const result = await requestEffortChange(discordOrigin(message), effort);
       currentEffort = result.effort;
       availableEfforts = result.availableEfforts;
       if (!result.ok) {
@@ -1301,11 +1521,12 @@ async function handleDiscordMessage(message: Message): Promise<void> {
     case "capture": {
       const all = isCaptureAll(route.args);
       await message.reply(msg("captureRequested"));
-      const screen = await requestCapture(all);
-      if (screen === null) {
+      const capture = await requestCapture(discordOrigin(message), all);
+      if (capture === null) {
         await message.reply(msg("captureNoResponse"));
         return;
       }
+      const screen = capture.text;
       if (screen === "") {
         await message.reply(msg("captureEmpty"));
         return;
@@ -1390,6 +1611,12 @@ discord.on("interactionCreate", async (interaction) => {
   const kind = parts[0];
 
   if (kind === "perm") {
+    if (!isOperator(interaction.user.id, OPERATOR_USER_IDS)) {
+      await interaction
+        .reply({ content: msg("operatorOnly"), ephemeral: true })
+        .catch(() => {});
+      return;
+    }
     const [, behavior, requestId] = parts as [string, string, string];
     if (!requestId) return;
 
@@ -1397,7 +1624,10 @@ discord.on("interactionCreate", async (interaction) => {
       const details = pendingPermissions.get(requestId);
       if (!details) {
         await interaction
-          .reply({ content: "이미 처리된 권한 요청입니다.", ephemeral: true })
+          .reply({
+            content: "이미 처리되었거나 만료된 권한 요청입니다.",
+            ephemeral: true,
+          })
           .catch(() => {});
         return;
       }
@@ -1427,15 +1657,38 @@ discord.on("interactionCreate", async (interaction) => {
     }
 
     if (behavior !== "allow" && behavior !== "deny") return;
+    const claim = pendingPermissions.take(requestId);
+    if (!claim) {
+      await interaction
+        .update({
+          content:
+            `${interaction.message.content}\n\n*이미 처리되었거나 만료된 권한 요청입니다.*`,
+          components: [],
+        })
+        .catch(() => {});
+      return;
+    }
+    const { permission } = claim;
     const allow = behavior === "allow";
     stderr(`Button clicked: ${behavior} for request_id=${requestId}`);
 
-    await sendPermissionVerdict(requestId, behavior);
-    pendingPermissions.delete(requestId);
+    const delivered = await sendPermissionVerdict(requestId, behavior);
+    if (!delivered) {
+      pendingPermissions.restore(claim);
+      await interaction
+        .update({
+          content:
+            `${interaction.message.content}\n\n` +
+            "⚠️ 권한 응답 전달에 실패했습니다. 다시 시도해주세요.",
+          components: [buildPermissionDecisionRow(requestId)],
+        })
+        .catch(() => {});
+      return;
+    }
 
     const label = allow
-      ? msg("permissionAllowed", { tool: "" })
-      : msg("permissionDenied", { tool: "" });
+      ? msg("permissionAllowed", { tool: permission.tool_name })
+      : msg("permissionDenied", { tool: permission.tool_name });
     await interaction
       .update({
         content: `${interaction.message.content}\n\n${label}`,
@@ -1460,18 +1713,29 @@ discord.on("interactionCreate", async (interaction) => {
     // cannot satisfy a later question.
     if (
       !pendingInputRequest ||
-      pendingInputRequest.request_id !== requestId ||
-      (pendingInputRequest.origin
+      pendingInputRequest.request_id !== requestId
+    ) {
+      await interaction
+        .update({
+          content: `${interaction.message.content}\n\n*이미 처리되었거나 만료된 질문입니다.*`,
+          components: [],
+        })
+        .catch(() => {});
+      return;
+    }
+    if (
+      pendingInputRequest.origin
         ? !sameConversationOrigin(
             pendingInputRequest.origin,
             interactionOrigin,
           )
         : interaction.channelId !== pendingInputRequest.channelId ||
           (pendingInputRequest.userId !== undefined &&
-            interaction.user.id !== pendingInputRequest.userId))
+            interaction.user.id !== pendingInputRequest.userId) ||
+          !isOperator(interaction.user.id, OPERATOR_USER_IDS)
     ) {
       await interaction
-        .reply({ content: "이미 처리된 질문입니다.", ephemeral: true })
+        .reply({ content: "이 질문을 제출할 권한이 없습니다.", ephemeral: true })
         .catch(() => {});
       return;
     }
@@ -1532,9 +1796,94 @@ discord.on("interactionCreate", async (interaction) => {
   }
 });
 
-discord.once("ready", (c) => {
+async function activateDiscordRealtime(lock: InstanceLock): Promise<void> {
+  instanceLock = lock;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onReady = (): void => resolve();
+      discord.once("ready", onReady);
+      discord.login(DISCORD_BOT_TOKEN).catch((error) => {
+        discord.off("ready", onReady);
+        reject(error);
+      });
+    });
+  } catch (error) {
+    if (instanceLock === lock) instanceLock = null;
+    lock.release();
+    throw error;
+  }
+}
+
+function startOwnershipTakeover(): void {
+  if (ownershipTask || shuttingDown || instanceLock) return;
+  const task = (async () => {
+    while (!shuttingDown && !instanceLock) {
+      const lock = await waitForInstanceLock("discord", DISCORD_BOT_TOKEN, {
+        signal: ownershipAbort.signal,
+      });
+      if (!lock) return;
+      if (shuttingDown) {
+        lock.release();
+        return;
+      }
+      try {
+        stderr("Realtime lock became available — taking over Discord Gateway");
+        await activateDiscordRealtime(lock);
+        return;
+      } catch (error) {
+        stderr(`Discord takeover connection failed: ${error}`);
+      }
+    }
+  })();
+  ownershipTask = task;
+  void task
+    .catch((error) => stderr(`Discord ownership retry failed: ${error}`))
+    .finally(() => {
+      if (ownershipTask === task) ownershipTask = null;
+    });
+}
+
+function announceDiscordReady(): void {
+  if (
+    !wrapperRealtimeReady &&
+    announceRealtimeReady(
+      ipc,
+      "discord",
+      instanceLock !== null && discord.isReady() && !shuttingDown,
+    )
+  ) {
+    wrapperRealtimeReady = true;
+  }
+}
+
+function announceDiscordNotReady(): void {
+  if (!wrapperRealtimeReady) return;
+  announceRealtimeNotReady(ipc, "discord");
+  wrapperRealtimeReady = false;
+}
+
+discord.on("ready", (c) => {
   stderr(`Discord connected as ${c.user.tag}`);
+  announceDiscordReady();
   void flushDeferredRoutedOutput();
+});
+
+discord.on("shardReady", () => {
+  announceDiscordReady();
+  void flushDeferredRoutedOutput();
+});
+
+discord.on("shardResume", () => {
+  announceDiscordReady();
+  void flushDeferredRoutedOutput();
+});
+
+discord.on("shardDisconnect", () => {
+  announceDiscordNotReady();
+});
+
+discord.on("invalidated", () => {
+  announceDiscordNotReady();
 });
 
 discord.on("error", (err) => {
@@ -1547,14 +1896,30 @@ discord.on("error", (err) => {
 // handlers the Discord gateway keeps the process alive as a zombie —
 // holding a websocket and a PTY slot the next session can't reclaim.
 
-let shuttingDown = false;
 function shutdown(reason: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   stderr(`Shutting down: ${reason}`);
-  instanceLock?.release();
-  setTimeout(() => process.exit(0), 2000).unref();
-  void Promise.resolve(discord.destroy()).finally(() => process.exit(0));
+  pendingPermissions.dispose();
+  ownershipAbort.abort();
+  announceDiscordNotReady();
+  const ownedLock = instanceLock;
+  const forceExit = setTimeout(() => process.exit(0), 2_000);
+  forceExit.unref();
+  shutdownTask = disconnectThenRelease(
+    () => Promise.resolve(discord.destroy()),
+    () => {
+      ownedLock?.release();
+      if (instanceLock === ownedLock) instanceLock = null;
+    },
+  ).catch((error) => {
+    // Do not release after a failed disconnect: exiting lets the OS tear down
+    // the gateway and lock together without an overlap window.
+    stderr(`Discord disconnect during shutdown failed: ${error}`);
+  }).finally(() => {
+    clearTimeout(forceExit);
+    process.exit(0);
+  });
 }
 
 process.stdin.on("end", () => shutdown("stdin end"));
@@ -1567,9 +1932,11 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 async function main(): Promise<void> {
   // Connect IPC to wrapper
   try {
-    ipc = await connectToWrapper(WRAPPER_SOCKET);
+    ipc = await connectToWrapper(WRAPPER_SOCKET, IPC_AUTH_TOKEN);
     ipc.on("message", (ipcMsg: WrapperToMcp) => {
-      if (ipcMsg.type === "config") {
+      if (ipcMsg.type === "outbound_authorization_result") {
+        outboundAuthorizationTracker.settle(ipcMsg);
+      } else if (ipcMsg.type === "config") {
         currentModel = ipcMsg.model;
         currentEffort = ipcMsg.effort;
         availableEfforts = ipcMsg.availableEfforts;
@@ -1587,19 +1954,20 @@ async function main(): Promise<void> {
           stderr(`Input request handler error: ${err}`);
         });
       } else if (ipcMsg.type === "input_request_cancel") {
-        cancelledInputRequests.add(ipcMsg.request_id);
-        setTimeout(
-          () => cancelledInputRequests.delete(ipcMsg.request_id),
-          INPUT_REQUEST_TOMBSTONE_MS,
-        ).unref();
-        pendingAskUserQuestion.delete(ipcMsg.request_id);
-        if (
-          isMatchingInputRequest(
-            pendingInputRequest?.request_id,
-            ipcMsg.request_id,
-          )
-        ) {
-          pendingInputRequest = null;
+        cancelLocalInputRequest(ipcMsg.request_id);
+      } else if (ipcMsg.type === "capture_result") {
+        if (!captureTracker.settle(ipcMsg)) {
+          deliverRoutedOutput(ipcMsg).catch((err) => {
+            stderr(`Capture result delivery error: ${err}`);
+          });
+        }
+      } else if (ipcMsg.type === "effort_result") {
+        currentEffort = ipcMsg.effort;
+        availableEfforts = ipcMsg.availableEfforts;
+        if (!effortTracker.settle(ipcMsg)) {
+          deliverRoutedOutput(ipcMsg).catch((err) => {
+            stderr(`Effort result delivery error: ${err}`);
+          });
         }
       } else if (ipcMsg.type === "command_result") {
         if (!commandTracker.settle(ipcMsg)) {
@@ -1614,16 +1982,29 @@ async function main(): Promise<void> {
       }
     });
     ipc.on("close", () => {
+      outboundAuthorizationTracker.denyAll("wrapper IPC disconnected");
       stderr("Wrapper IPC disconnected — exiting to avoid zombie state");
       ipc = null;
       // Exiting prevents this mcp from staying connected to Discord Gateway
       // after its wrapper is gone (or after a new wrapper takes over the socket).
       // Without this, stale mcps hijack a portion of incoming messages and reply
       // with captureNoResponse / lose user msgs.
-      setTimeout(() => process.exit(0), 100);
+      shutdown("wrapper IPC disconnected");
+    });
+    ipc.on("error", (error) => {
+      outboundAuthorizationTracker.denyAll(
+        `wrapper IPC error: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     });
   } catch (err) {
     stderr(`IPC connect failed: ${err}`);
+    if (requiresWrapperIpc(AGENT_PROVIDER)) {
+      throw new Error(
+        `Codex mode requires wrapper IPC before Discord realtime startup: ${err}`,
+      );
+    }
   }
 
   // Single-instance guard: only one live Gateway connection may exist per
@@ -1638,24 +2019,16 @@ async function main(): Promise<void> {
         "skipping Gateway login to avoid duplicate event handling. " +
         "Running as an inert MCP server.",
     );
+    startOwnershipTakeover();
   } else {
     // Connect Discord — discord.login() resolves after REST token validation,
     // not when the Gateway is ready. Block on the "ready" event so that any
     // tool call arriving on the freshly-connected MCP transport will find a
     // usable cache and websocket. Without this wait, early calls to
     // channels.fetch()/send() can queue forever and lock the session.
-    await new Promise<void>((resolve, reject) => {
-      discord.once("ready", () => resolve());
-      discord.login(DISCORD_BOT_TOKEN).catch(reject);
-    });
+    const initialLock = instanceLock;
+    await activateDiscordRealtime(initialLock);
   }
-  // Only the Gateway owner can receive button interactions. Do not register
-  // inert duplicate MCP children as wrapper routing targets.
-  announceRealtimeReady(
-    ipc,
-    "discord",
-    instanceLock !== null && discord.isReady(),
-  );
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();

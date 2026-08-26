@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { CodexDeliveryTracker } from "../src/codex-delivery.js";
+import {
+  canMutateCodexGoal,
+  canUseActiveCodexTurn,
+  CodexDeliveryTracker,
+} from "../src/codex-delivery.js";
 import type { IpcOrigin } from "../src/ipc.js";
 
 const discordOrigin: IpcOrigin = {
@@ -62,7 +66,10 @@ function replyItem(
       server: "compact_bot_discord",
       tool: "reply",
       status: "completed",
-      arguments: { chat_id: discordOrigin.chat_id },
+      arguments: {
+        chat_id: discordOrigin.chat_id,
+        text: `final for ${turnId}`,
+      },
       result: { content: [{ type: "text", text: "sent" }] },
       error: null,
       ...overrides,
@@ -71,6 +78,61 @@ function replyItem(
 }
 
 describe("CodexDeliveryTracker", () => {
+  it("allows only the exact owner to steer an active turn", () => {
+    expect(
+      canUseActiveCodexTurn(slackOrigin, {
+        ...slackOrigin,
+        message_id: "later-message",
+      }),
+    ).toBe(true);
+    expect(
+      canUseActiveCodexTurn(slackOrigin, {
+        ...slackOrigin,
+        thread_ts: "other-thread",
+      }),
+    ).toBe(false);
+    expect(
+      canUseActiveCodexTurn(slackOrigin, {
+        ...slackOrigin,
+        user: "other-user",
+      }),
+    ).toBe(false);
+    expect(canUseActiveCodexTurn(null, slackOrigin)).toBe(false);
+    expect(canUseActiveCodexTurn(slackOrigin, undefined)).toBe(false);
+  });
+
+  it("allows only the owner to replace or clear an active native goal", () => {
+    const snapshot = { origin: slackOrigin, active: true };
+    expect(
+      canMutateCodexGoal(snapshot, {
+        ...slackOrigin,
+        message_id: "later-message",
+      }),
+    ).toBe(true);
+    expect(
+      canMutateCodexGoal(snapshot, {
+        ...slackOrigin,
+        thread_ts: "other-thread",
+      }),
+    ).toBe(false);
+    expect(
+      canMutateCodexGoal(snapshot, {
+        ...slackOrigin,
+        user: "other-user",
+      }),
+    ).toBe(false);
+    expect(canMutateCodexGoal(snapshot, undefined)).toBe(false);
+    expect(
+      canMutateCodexGoal({ origin: null, active: true }, slackOrigin),
+    ).toBe(false);
+    expect(
+      canMutateCodexGoal({ ...snapshot, active: false }, {
+        ...slackOrigin,
+        thread_ts: "other-thread",
+      }),
+    ).toBe(true);
+  });
+
   it("suppresses fallback after a successful reply to the exact Discord target", () => {
     const tracker = new CodexDeliveryTracker();
     startTurn(tracker, "turn-success", discordOrigin);
@@ -111,6 +173,7 @@ describe("CodexDeliveryTracker", () => {
         arguments: {
           chat_id: slackOrigin.chat_id,
           thread_ts: slackOrigin.thread_ts,
+          text: "final for turn-exact-thread",
         },
       }),
     );
@@ -161,6 +224,36 @@ describe("CodexDeliveryTracker", () => {
     expect(completeTurn(tracker, "turn-steered")).toEqual({
       origin: slackOrigin,
       text: "final for turn-steered",
+    });
+  });
+
+  it("does not move a completing turn when a fresh submission is only pending", () => {
+    const tracker = new CodexDeliveryTracker();
+    startTurn(tracker, "turn-finishing", discordOrigin);
+    tracker.setCurrentOrigin(slackOrigin);
+
+    expect(completeTurn(tracker, "turn-finishing")).toEqual({
+      origin: discordOrigin,
+      text: "final for turn-finishing",
+    });
+  });
+
+  it("falls back with the final answer when only a progress reply was delivered", () => {
+    const tracker = new CodexDeliveryTracker();
+    startTurn(tracker, "turn-progress-only", discordOrigin);
+    tracker.observe(
+      "item/completed",
+      replyItem("turn-progress-only", {
+        arguments: {
+          chat_id: discordOrigin.chat_id,
+          text: "작업 중입니다.",
+        },
+      }),
+    );
+
+    expect(completeTurn(tracker, "turn-progress-only")).toEqual({
+      origin: discordOrigin,
+      text: "final for turn-progress-only",
     });
   });
 
@@ -235,6 +328,28 @@ describe("CodexDeliveryTracker", () => {
     ).toBeNull();
   });
 
+  it("does not resurrect delivery state after completion beats submit response", () => {
+    const tracker = new CodexDeliveryTracker();
+    startTurn(tracker, "turn-completed-first", discordOrigin);
+    expect(completeTurn(tracker, "turn-completed-first")).toEqual({
+      origin: discordOrigin,
+      text: "final for turn-completed-first",
+    });
+
+    tracker.setOriginForTurn("turn-completed-first", slackOrigin);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "turn-completed-first", status: "inProgress" },
+    });
+    const laterOrigin: IpcOrigin = {
+      ...discordOrigin,
+      message_id: "later-message",
+    };
+    tracker.setCurrentOrigin(laterOrigin);
+
+    expect(tracker.originForTurn("turn-completed-first")).toEqual(laterOrigin);
+  });
+
   it.each([
     [
       "failed status",
@@ -288,5 +403,285 @@ describe("CodexDeliveryTracker", () => {
     });
 
     expect(completeTurn(tracker, "turn-commentary")).toBeNull();
+  });
+
+  it("keeps later automatic goal turns bound to the goal creator", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setGoalOrigin(discordOrigin);
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: null,
+      goal: { status: "active" },
+    });
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "goal-turn-1" },
+    });
+
+    const steered = tracker.beginExplicitSubmission(slackOrigin);
+    tracker.acceptExplicitSubmission(steered, "goal-turn-1");
+    expect(tracker.originForTurn("goal-turn-1")).toEqual(slackOrigin);
+    completeTurn(tracker, "goal-turn-1");
+
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: "goal-turn-1",
+      goal: { status: "active" },
+    });
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "goal-turn-2" },
+    });
+
+    expect(tracker.originForTurn("goal-turn-2")).toEqual(discordOrigin);
+  });
+
+  it("uses a pending explicit origin before the accepted turn id is returned", () => {
+    const tracker = new CodexDeliveryTracker();
+    const submission = tracker.beginExplicitSubmission(slackOrigin);
+
+    // Server requests and item completion can precede turn/started and the
+    // turn/start response. Both must already route to the explicit sender.
+    tracker.observe("item/completed", {
+      threadId: "thread-1",
+      turnId: "explicit-turn",
+      item: {
+        type: "agentMessage",
+        phase: "final_answer",
+        text: "explicit answer",
+      },
+    });
+    expect(tracker.originForTurn("explicit-turn")).toEqual(slackOrigin);
+    expect(
+      tracker.authorizationOriginForTurn("explicit-turn"),
+    ).toBeNull();
+
+    expect(completeTurn(tracker, "explicit-turn")).toBeNull();
+    expect(
+      tracker.acceptExplicitSubmission(submission, "explicit-turn"),
+    ).toEqual([{
+      origin: slackOrigin,
+      text: "explicit answer",
+    }]);
+  });
+
+  it("never leaks a completed automatic goal turn to a pending sender", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setCurrentOrigin(discordOrigin);
+    tracker.setGoalOrigin(discordOrigin);
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: null,
+      goal: { status: "active" },
+    });
+    const submission = tracker.beginExplicitSubmission(slackOrigin);
+
+    // A server request is allowed to race the lifecycle stream. Until an
+    // observed turn can be classified, neither the goal owner nor the pending
+    // sender is a safe destination.
+    expect(tracker.originForTurn("not-yet-observed")).toBeNull();
+
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "automatic-goal-turn" },
+    });
+    tracker.observe("item/completed", {
+      threadId: "thread-1",
+      turnId: "automatic-goal-turn",
+      item: {
+        type: "agentMessage",
+        phase: "final_answer",
+        text: "automatic answer",
+      },
+    });
+    expect(tracker.originForTurn("automatic-goal-turn")).toBeNull();
+    expect(
+      tracker.authorizationOriginForTurn("automatic-goal-turn"),
+    ).toBeNull();
+    expect(
+      tracker.observe("turn/completed", {
+        threadId: "thread-1",
+        turn: { id: "automatic-goal-turn", status: "completed" },
+      }),
+    ).toBeNull();
+
+    expect(
+      tracker.acceptExplicitSubmission(submission, "returned-explicit-turn"),
+    ).toEqual([{
+      origin: discordOrigin,
+      text: "automatic answer",
+    }]);
+
+    expect(tracker.originForTurn("returned-explicit-turn")).toEqual(slackOrigin);
+    expect(
+      tracker.authorizationOriginForTurn("returned-explicit-turn"),
+    ).toEqual(slackOrigin);
+  });
+
+  it("flushes an explicit turn that completes before turn/start returns to its sender", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setCurrentOrigin(discordOrigin);
+    tracker.setGoalOrigin(discordOrigin);
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: null,
+      goal: { status: "active" },
+    });
+    const submission = tracker.beginExplicitSubmission(slackOrigin);
+
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "explicit-before-response" },
+    });
+    tracker.observe("item/completed", {
+      threadId: "thread-1",
+      turnId: "explicit-before-response",
+      item: {
+        type: "agentMessage",
+        phase: "final_answer",
+        text: "explicit answer",
+      },
+    });
+    expect(
+      tracker.observe("turn/completed", {
+        threadId: "thread-1",
+        turn: { id: "explicit-before-response", status: "completed" },
+      }),
+    ).toBeNull();
+
+    expect(
+      tracker.acceptExplicitSubmission(
+        submission,
+        "explicit-before-response",
+      ),
+    ).toEqual([{
+      origin: slackOrigin,
+      text: "explicit answer",
+    }]);
+  });
+
+  it("restores the previous goal owner when a replacement is rejected", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setGoalOrigin(discordOrigin);
+    const previous = tracker.snapshotGoalOrigin();
+
+    tracker.setGoalOrigin(slackOrigin);
+    tracker.restoreGoalOrigin(previous);
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "continuing-old-goal" },
+    });
+
+    expect(tracker.originForTurn("continuing-old-goal")).toEqual(discordOrigin);
+  });
+
+  it("clears the goal owner on clear and session reset", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setGoalOrigin(discordOrigin);
+    tracker.observe("thread/goal/cleared", { threadId: "thread-1" });
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "after-clear" },
+    });
+    expect(tracker.originForTurn("after-clear")).toBeNull();
+
+    tracker.setGoalOrigin(discordOrigin);
+    tracker.clearTurns();
+    tracker.observe("turn/started", {
+      threadId: "thread-2",
+      turn: { id: "after-reset" },
+    });
+    expect(tracker.originForTurn("after-reset")).toBeNull();
+  });
+
+  it("does not carry a prior conversation into an originless new session", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setCurrentOrigin(slackOrigin);
+    tracker.clearTurns();
+
+    tracker.observe("turn/started", {
+      threadId: "fresh-thread",
+      turn: { id: "originless-fresh-turn" },
+    });
+
+    expect(tracker.originForTurn("originless-fresh-turn")).toBeNull();
+    expect(
+      tracker.authorizationOriginForTurn("originless-fresh-turn"),
+    ).toBeNull();
+  });
+
+  it.each([
+    "complete",
+    "completed",
+    "failed",
+    "cancelled",
+    "canceled",
+  ])("clears the goal owner while status is terminal: %s", (status) => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setGoalOrigin(discordOrigin);
+
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: "goal-turn",
+      goal: { status },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: false,
+    });
+  });
+
+  it("keeps an active goal with no known owner fail-closed", () => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setCurrentOrigin(discordOrigin);
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      goal: { status: "active" },
+    });
+
+    expect(tracker.snapshotGoalOrigin()).toEqual({
+      origin: null,
+      active: true,
+    });
+    expect(tracker.originForTurn("not-yet-observed")).toBeNull();
+
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "ownerless-goal-turn" },
+    });
+    expect(tracker.originForTurn("ownerless-goal-turn")).toBeNull();
+    expect(
+      tracker.authorizationOriginForTurn("ownerless-goal-turn"),
+    ).toBeNull();
+
+    // Even if the goal later terminates, the already-classified turn must not
+    // inherit whichever channel happened to be current.
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      goal: { status: "failed" },
+    });
+    expect(tracker.originForTurn("ownerless-goal-turn")).toBeNull();
+  });
+
+  it.each([
+    "paused",
+    "blocked",
+    "usageLimited",
+    "budgetLimited",
+  ])("retains the goal owner while status is %s", (status) => {
+    const tracker = new CodexDeliveryTracker();
+    tracker.setGoalOrigin(discordOrigin);
+    tracker.observe("thread/goal/updated", {
+      threadId: "thread-1",
+      turnId: null,
+      goal: { status },
+    });
+    tracker.observe("turn/started", {
+      threadId: "thread-1",
+      turn: { id: `resumed-${status}` },
+    });
+
+    expect(tracker.originForTurn(`resumed-${status}`)).toEqual(discordOrigin);
   });
 });

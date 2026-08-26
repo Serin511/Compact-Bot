@@ -17,10 +17,21 @@ import {
   KNOWN_REASONING_EFFORTS,
   normalizeReasoningEffort,
 } from "./reasoning-effort.js";
+import { normalizeFetchMessageLimit } from "./fetch-limit.js";
+import { parseMaxTurns } from "./turn-limit.js";
 
-// CWD .env first (higher priority), then global .env (fills missing vars)
-dotenv.config();
-dotenv.config({ path: join(CONFIG_HOME, ".env") });
+// CWD .env first (higher priority), then global .env (fills missing vars).
+// Keep the parsed local values so Codex mode can reject platform credentials
+// stored in a model-readable workspace file.
+const localEnvPath = resolve(process.cwd(), ".env");
+const localEnvResult = dotenv.config({ path: localEnvPath, quiet: true });
+dotenv.config({ path: join(CONFIG_HOME, ".env"), quiet: true });
+
+const PLATFORM_CREDENTIAL_KEYS = [
+  "DISCORD_BOT_TOKEN",
+  "SLACK_BOT_TOKEN",
+  "SLACK_APP_TOKEN",
+] as const;
 
 export interface Config {
   agentProvider: "claude" | "codex";
@@ -35,10 +46,12 @@ export interface Config {
   maxTurns: number;
   fetchMessageLimit: number;
   allowedChannelIds: string[];
+  discordOperatorUserIds: string[];
 
   slackBotToken: string;
   slackAppToken: string;
   slackAllowedChannelIds: string[];
+  slackOperatorUserIds: string[];
 
   systemPromptPath: string;
 }
@@ -54,6 +67,12 @@ function requireEnv(key: string): string {
 
 function optionalEnv(key: string, fallback: string): string {
   return process.env[key] || fallback;
+}
+
+function optionalEnvPreservingEmpty(key: string, fallback: string): string {
+  return Object.prototype.hasOwnProperty.call(process.env, key)
+    ? process.env[key] ?? ""
+    : fallback;
 }
 
 function expandTilde(path: string): string {
@@ -83,8 +102,30 @@ if (
   );
 }
 
+const agentProvider = parseAgentProvider(
+  optionalEnv("AGENT_PROVIDER", "claude"),
+);
+const localPlatformCredentialKeys = PLATFORM_CREDENTIAL_KEYS.filter(
+  (key) => Boolean(localEnvResult.parsed?.[key]?.trim()),
+);
+if (agentProvider === "codex" && localPlatformCredentialKeys.length > 0) {
+  throw new Error(
+    `Codex mode refuses platform credentials from ${localEnvPath} because workspace files are readable by the agent. ` +
+      `Run "compact-bot init" to store them under ${CONFIG_HOME}, then remove the token values from the local .env. ` +
+      `Unsafe keys: ${localPlatformCredentialKeys.join(", ")}.`,
+  );
+}
+const maxTurnsValue = optionalEnv("MAX_TURNS", "50");
+const parsedMaxTurns = parseMaxTurns(maxTurnsValue);
+if (agentProvider === "claude" && parsedMaxTurns === null) {
+  throw new Error(
+    `Invalid MAX_TURNS: ${maxTurnsValue}. Expected zero or a positive integer.`,
+  );
+}
+const maxTurns = agentProvider === "claude" ? parsedMaxTurns! : 0;
+
 const _config: Config = {
-  agentProvider: parseAgentProvider(optionalEnv("AGENT_PROVIDER", "claude")),
+  agentProvider,
   verbose: optionalEnv("VERBOSE", "false") === "true",
   dangerouslySkipPermissions:
     optionalEnv("DANGEROUSLY_SKIP_PERMISSIONS", "false") === "true",
@@ -94,9 +135,15 @@ const _config: Config = {
   defaultModel: optionalEnv("DEFAULT_MODEL", ""),
   defaultReasoningEffort,
   defaultCwd: expandTilde(optionalEnv("DEFAULT_CWD", process.cwd())),
-  maxTurns: Number(optionalEnv("MAX_TURNS", "50")),
-  fetchMessageLimit: Number(optionalEnv("FETCH_MESSAGE_LIMIT", "20")),
+  maxTurns,
+  fetchMessageLimit: normalizeFetchMessageLimit(
+    optionalEnv("FETCH_MESSAGE_LIMIT", "20"),
+  ),
   allowedChannelIds: optionalEnv("ALLOWED_CHANNEL_IDS", "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+  discordOperatorUserIds: optionalEnv("DISCORD_OPERATOR_USER_IDS", "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
@@ -107,14 +154,24 @@ const _config: Config = {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  slackOperatorUserIds: optionalEnv("SLACK_OPERATOR_USER_IDS", "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
 
-  systemPromptPath: optionalEnv(
+  systemPromptPath: optionalEnvPreservingEmpty(
     "SYSTEM_PROMPT_PATH",
     existsSync(join(CONFIG_HOME, "system-prompt.txt"))
       ? join(CONFIG_HOME, "system-prompt.txt")
       : "data/system-prompt.txt",
   ),
 };
+
+if (Boolean(_config.slackBotToken) !== Boolean(_config.slackAppToken)) {
+  throw new Error(
+    "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set together.",
+  );
+}
 
 if (!_config.discordBotToken && !_config.slackBotToken) {
   throw new Error(
@@ -131,6 +188,7 @@ export const config: Config = Object.freeze(_config);
  *   The file contents as a string, or empty string if the file doesn't exist.
  */
 export function loadSystemPrompt(): string {
+  if (!config.systemPromptPath) return "";
   const filePath = resolve(config.systemPromptPath);
   if (!existsSync(filePath)) return "";
   try {

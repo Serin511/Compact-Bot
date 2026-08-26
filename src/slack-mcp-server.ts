@@ -27,6 +27,10 @@ import {
   type IpcCommandRequest,
   type IpcCommandResult,
   IpcCommandTracker,
+  IpcRoutedResultTracker,
+  IpcOutboundAuthorizationTracker,
+  type IpcOutboundWriteTool,
+  announceRealtimeNotReady,
   announceRealtimeReady,
   isOriginForPlatform,
   sameConversationOrigin,
@@ -39,32 +43,90 @@ import {
   type SlackFile,
 } from "./slack-attachment-handler.js";
 import { msg } from "./messages.js";
-import { isSendablePath } from "./sanitize.js";
+import {
+  MAX_MESSAGE_ATTACHMENT_BYTES,
+  readSendableFile,
+  type SendableFile,
+} from "./sanitize.js";
+import {
+  isAllowedChannel,
+  isOperator,
+  isPrivilegedCommand,
+} from "./access-control.js";
 import {
   isProcessableSlackMessage,
   resolveSlackBlockActionContext,
 } from "./slack-events.js";
 import { chunkCodeBlock, chunkText } from "./chunk.js";
-import { acquireInstanceLock, type InstanceLock } from "./single-instance.js";
+import {
+  acquireInstanceLock,
+  waitForInstanceLock,
+  type InstanceLock,
+} from "./single-instance.js";
 import {
   KNOWN_REASONING_EFFORTS,
   normalizeReasoningEffort,
 } from "./reasoning-effort.js";
-import { statSync } from "node:fs";
+import { SLACK_MCP_SERVER_INFO } from "./version.js";
+import {
+  attemptNotificationDelivery,
+  disconnectThenRelease,
+  isRealtimeUnavailableLifecycle,
+  requiresWrapperIpc,
+} from "./runtime-coordination.js";
+import {
+  buildSlackMrkdwnSections,
+  truncateSlackFallbackText,
+} from "./slack-ui.js";
+import { uploadSlackReplyFiles } from "./slack-reply.js";
+import {
+  PendingSlackPermissions,
+  type PendingSlackPermission,
+} from "./slack-permissions.js";
 import { randomUUID } from "node:crypto";
+import {
+  MAX_FETCH_MESSAGE_LIMIT,
+  normalizeFetchMessageLimit,
+} from "./fetch-limit.js";
+import {
+  mcpRuntimeValue,
+  requireMcpRuntimeValue,
+} from "./mcp-runtime-environment.js";
+import {
+  findSlackConversationMessage,
+  type SlackConversationApi,
+} from "./slack-conversation.js";
 
-// ── env (injected by wrapper via mcp-config.json) ─────────────────────
+// ── runtime configuration ─────────────────────────────────────────────
+//
+// Codex supplies these values through its filtered MCP child environment.
+// Claude's secretless launcher installs them in process-local memory before
+// importing this module, so they never appear in Claude's local MCP JSON,
+// model shell environment, or process arguments.
 
-const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
-const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN!;
-const WRAPPER_SOCKET = process.env.WRAPPER_SOCKET!;
-const ALLOWED_CHANNEL_IDS = (process.env.SLACK_ALLOWED_CHANNEL_IDS || "")
+const SLACK_BOT_TOKEN = requireMcpRuntimeValue("SLACK_BOT_TOKEN");
+const SLACK_APP_TOKEN = requireMcpRuntimeValue("SLACK_APP_TOKEN");
+const WRAPPER_SOCKET = requireMcpRuntimeValue("WRAPPER_SOCKET");
+const IPC_AUTH_TOKEN = requireMcpRuntimeValue(
+  "COMPACT_BOT_IPC_AUTH_TOKEN",
+);
+const ALLOWED_CHANNEL_IDS = (
+  mcpRuntimeValue("SLACK_ALLOWED_CHANNEL_IDS") || ""
+)
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const FETCH_MESSAGE_LIMIT = Number(process.env.FETCH_MESSAGE_LIMIT || "20");
+const OPERATOR_USER_IDS = (
+  mcpRuntimeValue("SLACK_OPERATOR_USER_IDS") || ""
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const FETCH_MESSAGE_LIMIT = normalizeFetchMessageLimit(
+  mcpRuntimeValue("FETCH_MESSAGE_LIMIT"),
+);
 const AGENT_PROVIDER =
-  process.env.AGENT_PROVIDER === "codex" ? "codex" : "claude";
+  mcpRuntimeValue("AGENT_PROVIDER") === "codex" ? "codex" : "claude";
 
 /** Max time a tool invocation may take before it is treated as hung. */
 const TOOL_TIMEOUT_MS = 20_000;
@@ -77,6 +139,7 @@ const TOOL_TIMEOUT_MS = 20_000;
  * before we fail fast rather than letting the API stall.
  */
 const MAX_ATTACHMENTS_PER_MESSAGE = 10;
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled rejection, leaving Claude Code waiting for a tool response forever.
@@ -100,7 +163,13 @@ let currentCwd = "";
 let botUserId = "";
 let lastActiveChannelId: string | null = null;
 let lastActiveThreadTs: string | undefined = undefined;
+type CaptureResult = Extract<WrapperToMcp, { type: "capture_result" }>;
+type EffortResult = Extract<WrapperToMcp, { type: "effort_result" }>;
 const commandTracker = new IpcCommandTracker();
+const captureTracker = new IpcRoutedResultTracker<CaptureResult>();
+const effortTracker = new IpcRoutedResultTracker<EffortResult>();
+const outboundAuthorizationTracker =
+  new IpcOutboundAuthorizationTracker();
 
 /** Pending user input request — when set, the next user message is treated as the answer. */
 let pendingInputRequest: {
@@ -109,12 +178,18 @@ let pendingInputRequest: {
   threadTs?: string;
   userId?: string;
   origin?: IpcOrigin;
+  promptTs?: string;
+  promptText?: string;
 } | null = null;
 const cancelledInputRequests = new Set<string>();
 const INPUT_REQUEST_TOMBSTONE_MS = 10 * 60 * 1000;
 
 type AgentReply = Extract<WrapperToMcp, { type: "agent_reply" }>;
-type RoutedOutput = IpcCommandResult | AgentReply;
+type RoutedOutput =
+  | IpcCommandResult
+  | AgentReply
+  | CaptureResult
+  | EffortResult;
 const deferredRoutedOutput: RoutedOutput[] = [];
 
 function slackOrigin(
@@ -170,8 +245,30 @@ async function deliverRoutedOutput(output: RoutedOutput): Promise<void> {
     if (deferredRoutedOutput.length > 100) deferredRoutedOutput.shift();
     return;
   }
+  if (output.type === "capture_result") {
+    if (output.text === "") {
+      await postSlackOrigin(output.origin, msg("captureEmpty"));
+      return;
+    }
+    const chunks = chunkCodeBlock(output.text, 39000);
+    const toSend = output.all || AGENT_PROVIDER === "codex"
+      ? chunks
+      : chunks.slice(-1);
+    for (const chunk of toSend) {
+      await postSlackOrigin(output.origin, chunk);
+    }
+    return;
+  }
   const text = output.type === "agent_reply"
     ? output.text
+    : output.type === "effort_result"
+    ? (
+      output.ok
+        ? msg("effortChanged", { effort: output.effort })
+        : msg("effortChangeFailed", {
+          reason: output.error || "변경을 적용하지 못했습니다.",
+        })
+    )
     : commandResultText(output);
   await postSlackOrigin(output.origin, text);
 }
@@ -212,90 +309,45 @@ async function runSlackCommand(
  *   Callers must distinguish the two — a null signals a likely wrapper
  *   stall or crash, whereas "" is a real capture outcome.
  */
-function requestCapture(all = false): Promise<string | null> {
-  return new Promise((resolve) => {
-    const requestId = randomUUID();
-    if (!ipc) {
-      resolve(null);
-      return;
-    }
-    const localIpc = ipc;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      localIpc.removeListener("message", handler);
-    };
-    const handler = (msg: WrapperToMcp) => {
-      if (
-        msg.type === "capture_result" &&
-        // A missing ID is accepted from older wrappers.
-        (!msg.request_id || msg.request_id === requestId)
-      ) {
-        cleanup();
-        resolve(msg.text);
-      }
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      resolve(null);
-    }, 65_000);
-    localIpc.on("message", handler);
-    localIpc.send({
+function requestCapture(
+  origin: IpcOrigin,
+  all = false,
+): Promise<CaptureResult | null> {
+  const requestId = randomUUID();
+  return captureTracker.request(
+    ipc,
+    {
       type: "capture",
       all,
       request_id: requestId,
-    } satisfies McpToWrapper);
-  });
+      origin,
+    } satisfies McpToWrapper & { request_id: string },
+  );
 }
 
-type EffortResult = Extract<WrapperToMcp, { type: "effort_result" }>;
-
 /** Ask the wrapper to apply an effort change and wait for its validation. */
-function requestEffortChange(effort: string): Promise<EffortResult> {
-  return new Promise((resolve) => {
-    const requestId = randomUUID();
-    if (!ipc) {
-      resolve({
-        type: "effort_result",
-        request_id: requestId,
-        ok: false,
-        effort: currentEffort,
-        availableEfforts,
-        error: "wrapper 연결 없음",
-      });
-      return;
-    }
-    const localIpc = ipc;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      localIpc.removeListener("message", handler);
-    };
-    const handler = (message: WrapperToMcp) => {
-      if (
-        message.type === "effort_result" &&
-        message.request_id === requestId
-      ) {
-        cleanup();
-        resolve(message);
-      }
-    };
-    const timeout = setTimeout(() => {
-      cleanup();
-      resolve({
-        type: "effort_result",
-        request_id: requestId,
-        ok: false,
-        effort: currentEffort,
-        availableEfforts,
-        error: "wrapper 응답 시간 초과",
-      });
-    }, 180_000);
-    localIpc.on("message", handler);
-    localIpc.send({
+async function requestEffortChange(
+  origin: IpcOrigin,
+  effort: string,
+): Promise<EffortResult> {
+  const requestId = randomUUID();
+  const result = await effortTracker.request(
+    ipc,
+    {
       type: "effort",
       request_id: requestId,
       effort,
-    } satisfies McpToWrapper);
-  });
+      origin,
+    } satisfies McpToWrapper & { request_id: string },
+  );
+  return result ?? {
+    type: "effort_result",
+    request_id: requestId,
+    ok: false,
+    effort: currentEffort,
+    availableEfforts,
+    error: ipc ? "wrapper 응답 시간 초과" : "wrapper 연결 없음",
+  };
 }
 
 /**
@@ -307,8 +359,7 @@ function isCaptureAll(args: string | undefined): boolean {
 }
 
 function isAllowed(channelId: string): boolean {
-  if (ALLOWED_CHANNEL_IDS.length === 0) return true;
-  return ALLOWED_CHANNEL_IDS.includes(channelId);
+  return isAllowedChannel(channelId, ALLOWED_CHANNEL_IDS);
 }
 
 /**
@@ -337,6 +388,10 @@ function stderr(msg: string): void {
 
 const web = new WebClient(SLACK_BOT_TOKEN);
 const socketMode = new SocketModeClient({ appToken: SLACK_APP_TOKEN });
+const conversationApi: SlackConversationApi = {
+  replies: (args) => web.conversations.replies(args),
+  history: (args) => web.conversations.history(args),
+};
 
 /**
  * Holds the single-instance lock for this app token while connected.
@@ -345,6 +400,11 @@ const socketMode = new SocketModeClient({ appToken: SLACK_APP_TOKEN });
  * the process lifetime; released on shutdown.
  */
 let instanceLock: InstanceLock | null = null;
+let ownershipTask: Promise<void> | null = null;
+const ownershipAbort = new AbortController();
+let shuttingDown = false;
+let shutdownTask: Promise<void> | null = null;
+let wrapperRealtimeReady = false;
 
 // ── user display name cache ──────────────────────────────────────────
 
@@ -371,7 +431,7 @@ async function getUserDisplayName(userId: string): Promise<string> {
 // ── MCP server ────────────────────────────────────────────────────────
 
 const mcp = new McpServer(
-  { name: "slack-bot", version: "0.1.0" },
+  SLACK_MCP_SERVER_INFO,
   {
     capabilities: {
       tools: {},
@@ -458,17 +518,53 @@ type ToolResult = {
   isError?: boolean;
 };
 
+async function authorizePlatformWrite(
+  tool: IpcOutboundWriteTool,
+  args: Record<string, unknown>,
+): Promise<ToolResult | null> {
+  if (AGENT_PROVIDER !== "codex") return null;
+  const result = await outboundAuthorizationTracker.request(ipc, {
+    source: "slack",
+    server: "compact_bot_slack",
+    tool,
+    arguments: args,
+  });
+  if (result.ok) return null;
+  return {
+    content: [{
+      type: "text",
+      text: `${tool} blocked by turn-scoped outbound guard: ${
+        result.error || "authorization denied"
+      }`,
+    }],
+    isError: true,
+  };
+}
+
 /**
  * Wrap a tool body so every failure mode becomes an ``isError`` response.
  *
  * Catches thrown errors, timeouts, and rejected promises, and refuses to
- * run tools before Slack Socket Mode has connected — otherwise Claude
- * Code can block indefinitely on the first tool response.
+ * run tools before Slack Socket Mode has connected or against a channel
+ * outside the configured allowlist.
  */
-async function runTool(name: string, fn: () => Promise<ToolResult>): Promise<ToolResult> {
+async function runTool(
+  name: string,
+  channelId: string,
+  fn: () => Promise<ToolResult>,
+): Promise<ToolResult> {
   if (!slackReady) {
     return {
       content: [{ type: "text" as const, text: `${name} failed: Slack not ready` }],
+      isError: true,
+    };
+  }
+  if (!isAllowed(channelId)) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: `${name} failed: Slack channel is outside SLACK_ALLOWED_CHANNEL_IDS`,
+      }],
       isError: true,
     };
   }
@@ -513,8 +609,11 @@ mcp.tool(
       .optional()
       .describe("Absolute file paths to attach (images, logs, etc). Max 10 files."),
   },
-  async ({ chat_id, text, thread_ts, files }) =>
-    runTool("reply", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("reply", args);
+    if (denied) return denied;
+    const { chat_id, text, thread_ts, files } = args;
+    return runTool("reply", chat_id, async () => {
       if (files?.length) {
         if (files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
           return {
@@ -527,33 +626,46 @@ mcp.tool(
             isError: true,
           };
         }
-        for (const f of files) {
-          if (!isSendablePath(f)) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `refusing to send bot state file: ${f}`,
-                },
-              ],
-              isError: true,
-            };
-          }
-          // Surface missing/unreadable paths immediately — filesUploadV2
-          // otherwise fails deep inside the SDK with a generic error.
-          try {
-            statSync(f);
-          } catch (err) {
-            return {
-              content: [
-                {
-                  type: "text" as const,
-                  text: `cannot read file: ${f} (${err instanceof Error ? err.message : String(err)})`,
-                },
-              ],
-              isError: true,
-            };
-          }
+      }
+
+      const preparedFiles: SendableFile[] = [];
+      let preparedBytes = 0;
+      for (const f of files ?? []) {
+        const remainingBytes =
+          MAX_MESSAGE_ATTACHMENT_BYTES - preparedBytes;
+        if (remainingBytes <= 0) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `refusing to send more than ` +
+                  `${MAX_MESSAGE_ATTACHMENT_BYTES / 1024 / 1024}MB of attachments`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        try {
+          const prepared = readSendableFile(
+            f,
+            [currentCwd || process.cwd()],
+            Math.min(MAX_ATTACHMENT_BYTES, remainingBytes),
+          );
+          preparedFiles.push(prepared);
+          preparedBytes += prepared.size;
+        } catch (err) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `refusing to send file: ${f} ` +
+                  `(${err instanceof Error ? err.message : String(err)})`,
+              },
+            ],
+            isError: true,
+          };
         }
       }
 
@@ -578,19 +690,19 @@ mcp.tool(
         );
       }
 
-      if (files?.length) {
-        try {
-          await web.filesUploadV2({
-            channel_id: chat_id,
-            thread_ts,
-            file_uploads: files.map((f) => ({
-              file: f,
-              filename: f.split("/").pop() ?? "file",
-            })),
-          });
-        } catch (err) {
-          stderr(`File upload failed: ${err}`);
-        }
+      const uploadFailure = await uploadSlackReplyFiles({
+        channelId: chat_id,
+        threadTs: thread_ts,
+        files: preparedFiles.map((file) => ({
+          file: file.data,
+          filename: file.filename,
+        })),
+        sentTimestamps,
+        upload: (input) => web.filesUploadV2(input),
+        onError: (error) => stderr(`File upload failed: ${error}`),
+      });
+      if (uploadFailure) {
+        return uploadFailure;
       }
 
       return {
@@ -601,19 +713,42 @@ mcp.tool(
           },
         ],
       };
-    }),
+    });
+  },
 );
 
 mcp.tool(
   "react",
-  "Add an emoji reaction to a Slack message. Use emoji names without colons (e.g. 'thumbsup', not ':thumbsup:').",
+  "Add an emoji reaction to a Slack message. Use emoji names without colons (e.g. 'thumbsup', not ':thumbsup:'). When the inbound channel tag has thread_ts, copy it verbatim.",
   {
     chat_id: z.string().describe("Slack channel ID"),
     message_id: z.string().describe("Message timestamp"),
     emoji: z.string().describe("Emoji name without colons (e.g. 'thumbsup')"),
+    thread_ts: z
+      .string()
+      .optional()
+      .describe("Inbound Slack thread timestamp, when present. Used to enforce conversation ownership."),
   },
-  async ({ chat_id, message_id, emoji }) =>
-    runTool("react", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("react", args);
+    if (denied) return denied;
+    const { chat_id, message_id, emoji, thread_ts } = args;
+    return runTool("react", chat_id, async () => {
+      const target = await findSlackConversationMessage(
+        conversationApi,
+        chat_id,
+        message_id,
+        thread_ts,
+      );
+      if (!target) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: "Message is outside the owning Slack conversation",
+          }],
+          isError: true,
+        };
+      }
       const name = emoji.replace(/^:|:$/g, "");
       await web.reactions.add({
         channel: chat_id,
@@ -621,51 +756,97 @@ mcp.tool(
         name,
       });
       return { content: [{ type: "text" as const, text: "Reaction added" }] };
-    }),
+    });
+  },
 );
 
 mcp.tool(
   "edit_message",
-  "Edit a message the bot previously sent. Useful for interim progress updates. Edits don't trigger push notifications — send a new reply when a long task completes so the user's device pings.",
+  "Edit a message the bot previously sent. Useful for interim progress updates. Edits don't trigger push notifications — send a new reply when a long task completes so the user's device pings. When the inbound channel tag has thread_ts, copy it verbatim.",
   {
     chat_id: z.string().describe("Slack channel ID"),
     message_id: z.string().describe("Message timestamp to edit"),
     text: z.string().describe("New message text (Slack mrkdwn format)"),
+    thread_ts: z
+      .string()
+      .optional()
+      .describe("Inbound Slack thread timestamp, when present. Used to enforce conversation ownership."),
   },
-  async ({ chat_id, message_id, text }) =>
-    runTool("edit_message", async () => {
+  async (args) => {
+    const denied = await authorizePlatformWrite("edit_message", args);
+    if (denied) return denied;
+    const { chat_id, message_id, text, thread_ts } = args;
+    return runTool("edit_message", chat_id, async () => {
+      const target = await findSlackConversationMessage(
+        conversationApi,
+        chat_id,
+        message_id,
+        thread_ts,
+      );
+      if (!target || !botUserId || target.user !== botUserId) {
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              "Message is outside the owning Slack conversation or was not sent by this bot",
+          }],
+          isError: true,
+        };
+      }
       await web.chat.update({
         channel: chat_id,
         ts: message_id,
         text,
       });
       return { content: [{ type: "text" as const, text: "Message edited" }] };
-    }),
+    });
+  },
 );
 
 mcp.tool(
   "fetch_messages",
-  "Fetch recent messages from a Slack channel. Returns oldest-first with message timestamps as IDs. Supports pagination for more than 100 messages (0 for max).",
+  "Fetch recent messages from the current Slack conversation. Pass thread_ts when the inbound channel tag has it; threaded requests are restricted to that thread. Returns oldest-first with message timestamps as IDs.",
   {
     channel: z.string().describe("Slack channel ID"),
+    thread_ts: z
+      .string()
+      .optional()
+      .describe("Inbound Slack thread timestamp, when present."),
     limit: z
       .number()
+      .int()
+      .min(0)
+      .max(MAX_FETCH_MESSAGE_LIMIT)
       .optional()
-      .default(FETCH_MESSAGE_LIMIT)
       .describe(`Max messages to fetch (default ${FETCH_MESSAGE_LIMIT}, 0 for max 500). Paginates automatically above 100.`),
   },
-  async ({ channel: channelId, limit }) =>
-    runTool("fetch_messages", async () => {
-      const target = limit === 0 ? 500 : limit;
+  async (args) => {
+    const denied = await authorizePlatformWrite("fetch_messages", args);
+    if (denied) return denied;
+    const { channel: channelId, thread_ts } = args;
+    const limit = normalizeFetchMessageLimit(
+      args.limit,
+      FETCH_MESSAGE_LIMIT,
+    );
+    return runTool("fetch_messages", channelId, async () => {
+      const target = limit;
       const allMessages: Array<{ ts: string; user?: string; text?: string; files?: unknown[] }> = [];
       let cursor: string | undefined;
 
       while (allMessages.length < target) {
-        const result = await web.conversations.history({
-          channel: channelId,
-          limit: Math.min(target - allMessages.length, 100),
-          ...(cursor ? { cursor } : {}),
-        });
+        const pageSize = Math.min(target - allMessages.length, 100);
+        const result = thread_ts
+          ? await web.conversations.replies({
+              channel: channelId,
+              ts: thread_ts,
+              limit: pageSize,
+              ...(cursor ? { cursor } : {}),
+            })
+          : await web.conversations.history({
+              channel: channelId,
+              limit: pageSize,
+              ...(cursor ? { cursor } : {}),
+            });
         if (!result.messages || result.messages.length === 0) break;
         allMessages.push(...(result.messages as typeof allMessages));
         cursor = result.response_metadata?.next_cursor;
@@ -673,45 +854,59 @@ mcp.tool(
       }
 
       const lines = await Promise.all(
-        allMessages.reverse().map(async (m) => {
-          const author = m.user
-            ? m.user === botUserId
-              ? "BOT"
-              : await getUserDisplayName(m.user)
-            : "unknown";
-          const att = m.files && (m.files as unknown[]).length > 0
-            ? ` +${(m.files as unknown[]).length}att`
-            : "";
-          // Tool result is newline-joined; scrub embedded newlines so a
-          // multi-line message can't forge an adjacent history row.
-          const text = (m.text ?? "").replace(/[\r\n]+/g, " ⏎ ").slice(0, 200);
-          return `[${m.ts}] ${author}: ${text}${att}`;
-        }),
+        allMessages
+          .sort((left, right) => Number(left.ts) - Number(right.ts))
+          .map(async (m) => {
+            const author = m.user
+              ? m.user === botUserId
+                ? "BOT"
+                : await getUserDisplayName(m.user)
+              : "unknown";
+            const att = m.files && (m.files as unknown[]).length > 0
+              ? ` +${(m.files as unknown[]).length}att`
+              : "";
+            // Tool result is newline-joined; scrub embedded newlines so a
+            // multi-line message can't forge an adjacent history row.
+            const text = (m.text ?? "")
+              .replace(/[\r\n]+/g, " ⏎ ")
+              .slice(0, 200);
+            return `[${m.ts}] ${author}: ${text}${att}`;
+          }),
       );
 
       return {
         content: [{ type: "text" as const, text: lines.join("\n") || "(empty)" }],
       };
-    }),
+    });
+  },
 );
 
 mcp.tool(
   "download_attachment",
-  "Download attachments from a specific Slack message. Returns file paths ready to Read.",
+  "Download attachments from a specific message in the current Slack conversation. Pass thread_ts when the inbound channel tag has it.",
   {
     chat_id: z.string().describe("Slack channel ID"),
     message_id: z.string().describe("Message timestamp with attachments"),
+    thread_ts: z
+      .string()
+      .optional()
+      .describe("Inbound Slack thread timestamp, when present."),
   },
-  async ({ chat_id, message_id }) =>
-    runTool("download_attachment", async () => {
-      const result = await web.conversations.history({
-        channel: chat_id,
-        latest: message_id,
-        inclusive: true,
-        limit: 1,
-      });
+  async (args) => {
+    const denied = await authorizePlatformWrite(
+      "download_attachment",
+      args,
+    );
+    if (denied) return denied;
+    const { chat_id, message_id, thread_ts } = args;
+    return runTool("download_attachment", chat_id, async () => {
+      const message = await findSlackConversationMessage(
+        conversationApi,
+        chat_id,
+        message_id,
+        thread_ts,
+      );
 
-      const message = result.messages?.[0];
       if (!message?.files || message.files.length === 0) {
         return {
           content: [{ type: "text" as const, text: "No attachments found" }],
@@ -726,10 +921,14 @@ mcp.tool(
 
       return {
         content: [
-          { type: "text" as const, text: promptPrefix || "Attachments downloaded" },
+          {
+            type: "text" as const,
+            text: promptPrefix || "Attachments downloaded",
+          },
         ],
       };
-    }),
+    });
+  },
 );
 
 // ── permission prompt handling (MCP Channel protocol) ───────────────
@@ -821,10 +1020,11 @@ const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i;
  * pushes short. Tapping "상세보기" loads description + input_preview from
  * this map and replaces the message in place.
  */
-const pendingPermissions = new Map<
-  string,
-  { tool_name: string; description: string; input_preview: string }
->();
+const pendingPermissions = new PendingSlackPermissions({
+  sendDeny: (requestId) => sendPermissionVerdict(requestId, "deny"),
+  updatePrompt: (update) => web.chat.update(update),
+  onError: (error) => stderr(`Failed to expire permission request: ${error}`),
+});
 
 /**
  * Block Kit ``actions`` element subset we actually use.
@@ -884,6 +1084,14 @@ async function handlePermissionRequest(params: {
 }): Promise<void> {
   stderr(`Permission request: ${params.tool_name} (id=${params.request_id})`);
 
+  if (!wrapperRealtimeReady) {
+    // Slack Web API calls work in an inert duplicate, but its button events go
+    // to the realtime owner and therefore cannot resolve this Claude session.
+    stderr("No Slack realtime ownership for permission request — auto-denying");
+    await sendPermissionVerdict(params.request_id, "deny");
+    return;
+  }
+
   const target = resolveDefaultChannel();
   if (!target) {
     stderr("No active channel for permission request — auto-denying");
@@ -892,24 +1100,22 @@ async function handlePermissionRequest(params: {
   }
 
   try {
-    pendingPermissions.set(params.request_id, {
+    const pending: PendingSlackPermission = {
       tool_name: params.tool_name,
       description: params.description,
       input_preview: params.input_preview,
-    });
+    };
+    pendingPermissions.set(params.request_id, pending);
 
     const summary = `:lock: *권한 요청*: \`${params.tool_name}\``;
     const hint = `:speech_balloon: 또는 \`yes ${params.request_id}\` / \`no ${params.request_id}\`로 답할 수 있어요.`;
     const text = `${summary}\n${hint}`;
 
-    await web.chat.postMessage({
+    const posted = await web.chat.postMessage({
       channel: target.channelId,
       text,
       blocks: [
-        {
-          type: "section",
-          text: { type: "mrkdwn", text },
-        },
+        ...buildSlackMrkdwnSections(text),
         {
           type: "actions",
           elements: buildInitialPermissionElements(params.request_id),
@@ -917,6 +1123,21 @@ async function handlePermissionRequest(params: {
       ],
       ...(target.threadTs ? { thread_ts: target.threadTs } : {}),
     });
+    if (
+      posted.ts &&
+      pendingPermissions.get(params.request_id) === pending
+    ) {
+      pending.channelId = target.channelId;
+      pending.promptTs = posted.ts;
+      pending.promptText = text;
+    } else if (posted.ts) {
+      await web.chat.update({
+        channel: target.channelId,
+        ts: posted.ts,
+        text: `${text}\n\n_이미 처리되었거나 만료된 권한 요청입니다._`,
+        blocks: [],
+      }).catch(() => {});
+    }
   } catch (err) {
     stderr(`Failed to send permission request to Slack: ${err} — auto-denying`);
     pendingPermissions.delete(params.request_id);
@@ -930,16 +1151,19 @@ async function handlePermissionRequest(params: {
 async function sendPermissionVerdict(
   requestId: string,
   behavior: "allow" | "deny",
-): Promise<void> {
-  try {
-    await mcp.server.notification({
-      method: "notifications/claude/channel/permission",
-      params: { request_id: requestId, behavior },
-    });
+): Promise<boolean> {
+  const delivered = await attemptNotificationDelivery(
+    () =>
+      mcp.server.notification({
+        method: "notifications/claude/channel/permission",
+        params: { request_id: requestId, behavior },
+      }),
+    (error) => stderr(`Failed to send permission verdict: ${error}`),
+  );
+  if (delivered) {
     stderr(`Permission verdict sent: ${requestId} → ${behavior}`);
-  } catch (err) {
-    stderr(`Failed to send permission verdict: ${err}`);
   }
+  return delivered;
 }
 
 // ── user input request handling (PTY prompt relay) ───────────────────
@@ -1074,20 +1298,33 @@ async function handleInputRequest(
       const isLast = i === chunks.length - 1;
       if (isLast && widget) {
         const elements = buildAskUserQuestionElements(requestId, widget);
-        await web.chat.postMessage({
+        const posted = await web.chat.postMessage({
           channel: target.channelId,
           text: chunks[i],
           blocks: [
-            {
-              type: "section",
-              text: { type: "mrkdwn", text: chunks[i] },
-            },
+            ...buildSlackMrkdwnSections(chunks[i]),
             ...(elements.length > 0
               ? [{ type: "actions" as const, elements }]
               : []),
           ],
           ...(target.threadTs ? { thread_ts: target.threadTs } : {}),
         });
+        if (posted.ts && cancelledInputRequests.has(requestId)) {
+          await web.chat.update({
+            channel: target.channelId,
+            ts: posted.ts,
+            text: `${chunks[i]}\n\n_요청이 취소되었거나 만료되었습니다._`,
+            blocks: [],
+          }).catch(() => {});
+          return;
+        }
+        if (
+          posted.ts &&
+          pendingInputRequest?.request_id === requestId
+        ) {
+          pendingInputRequest.promptTs = posted.ts;
+          pendingInputRequest.promptText = chunks[i];
+        }
       } else {
         await web.chat.postMessage({
           channel: target.channelId,
@@ -1110,6 +1347,31 @@ async function handleInputRequest(
   }
 }
 
+function cancelLocalInputRequest(requestId: string): void {
+  cancelledInputRequests.add(requestId);
+  setTimeout(
+    () => cancelledInputRequests.delete(requestId),
+    INPUT_REQUEST_TOMBSTONE_MS,
+  ).unref();
+  pendingAskUserQuestion.delete(requestId);
+
+  if (!isMatchingInputRequest(pendingInputRequest?.request_id, requestId)) {
+    return;
+  }
+  const pending = pendingInputRequest!;
+  pendingInputRequest = null;
+  if (pending.promptTs && pending.promptText) {
+    void web.chat.update({
+      channel: pending.channelId,
+      ts: pending.promptTs,
+      text: `${pending.promptText}\n\n_요청이 취소되었거나 만료되었습니다._`,
+      blocks: [],
+    }).catch((error) => {
+      stderr(`Failed to deactivate cancelled input request: ${error}`);
+    });
+  }
+}
+
 // ── Slack message handler ────────────────────────────────────────────
 
 async function sendChannelNotification(
@@ -1124,6 +1386,19 @@ async function sendChannelNotification(
       meta,
     } satisfies McpToWrapper);
     return;
+  }
+  if (meta.chat_id && meta.message_id) {
+    ipc?.send({
+      type: "channel_activity",
+      origin: {
+        source: "slack",
+        chat_id: meta.chat_id,
+        message_id: meta.message_id,
+        ...(meta.user_id ? { user: meta.user_id } : {}),
+        ...(meta.ts ? { ts: meta.ts } : {}),
+        ...(meta.thread_ts ? { thread_ts: meta.thread_ts } : {}),
+      },
+    } satisfies McpToWrapper);
   }
   await mcp.server.notification({
     method: "notifications/claude/channel",
@@ -1153,10 +1428,49 @@ async function handleSlackMessage(event: {
   // where button-tap isn't convenient.
   const permMatch = PERMISSION_REPLY_RE.exec(event.text ?? "");
   if (permMatch && pendingPermissions.has(permMatch[2]!.toLowerCase())) {
+    if (!isOperator(event.user, OPERATOR_USER_IDS)) {
+      await web.chat.postMessage({
+        channel: event.channel,
+        text: msg("operatorOnly"),
+        ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+      });
+      return;
+    }
     const requestId = permMatch[2]!.toLowerCase();
     const allow = permMatch[1]!.toLowerCase().startsWith("y");
-    pendingPermissions.delete(requestId);
-    await sendPermissionVerdict(requestId, allow ? "allow" : "deny");
+    const claim = pendingPermissions.take(requestId);
+    if (!claim) return;
+    const permission = claim.permission;
+    const delivered = await sendPermissionVerdict(
+      requestId,
+      allow ? "allow" : "deny",
+    );
+    if (!delivered) {
+      pendingPermissions.restore(claim);
+      await web.chat.postMessage({
+        channel: event.channel,
+        text:
+          ":warning: 권한 응답을 agent에 전달하지 못했습니다. " +
+          "잠시 후 다시 시도해주세요.",
+        ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+      });
+      return;
+    }
+    if (
+      permission.channelId &&
+      permission.promptTs &&
+      permission.promptText
+    ) {
+      const result = allow
+        ? `:white_check_mark: 권한 허용됨: \`${permission.tool_name}\``
+        : `:x: 권한 거부됨: \`${permission.tool_name}\``;
+      await web.chat.update({
+        channel: permission.channelId,
+        ts: permission.promptTs,
+        text: `${permission.promptText}\n\n${result}`,
+        blocks: [],
+      }).catch(() => {});
+    }
     try {
       await web.reactions.add({
         channel: event.channel,
@@ -1172,6 +1486,18 @@ async function handleSlackMessage(event: {
   const route = routeMessage(event.text ?? "");
   const displayName = await getUserDisplayName(event.user);
 
+  if (
+    isPrivilegedCommand(route.type) &&
+    !isOperator(event.user, OPERATOR_USER_IDS)
+  ) {
+    await web.chat.postMessage({
+      channel: event.channel,
+      text: msg("operatorOnly"),
+      ...(event.thread_ts ? { thread_ts: event.thread_ts } : {}),
+    });
+    return;
+  }
+
   // Only plain chat messages answer a pending input request. Slash commands
   // remain commands, so users can inspect, interrupt, or restart while Codex
   // is waiting without accidentally submitting the command text as an answer.
@@ -1184,7 +1510,8 @@ async function handleSlackMessage(event: {
         )
       : sameSlackTarget(event, pendingInputRequest) &&
         (!pendingInputRequest.userId ||
-          event.user === pendingInputRequest.userId)) &&
+          event.user === pendingInputRequest.userId) &&
+        isOperator(event.user, OPERATOR_USER_IDS)) &&
     route.type === "message"
   ) {
     const { request_id } = pendingInputRequest;
@@ -1313,7 +1640,10 @@ async function handleSlackMessage(event: {
         );
         return;
       }
-      const result = await requestEffortChange(effort);
+      const result = await requestEffortChange(
+        slackOrigin(event, event.user),
+        effort,
+      );
       currentEffort = result.effort;
       availableEfforts = result.availableEfforts;
       if (!result.ok) {
@@ -1389,11 +1719,15 @@ async function handleSlackMessage(event: {
     case "capture": {
       const all = isCaptureAll(route.args);
       await replyText(msg("captureRequested"));
-      const screen = await requestCapture(all);
-      if (screen === null) {
+      const capture = await requestCapture(
+        slackOrigin(event, event.user),
+        all,
+      );
+      if (capture === null) {
         await replyText(msg("captureNoResponse"));
         return;
       }
+      const screen = capture.text;
       if (screen === "") {
         await replyText(msg("captureEmpty"));
         return;
@@ -1496,6 +1830,16 @@ socketMode.on("interactive", async ({ body, ack }) => {
   } = resolveSlackBlockActionContext(body);
 
   if (kind === "perm") {
+    if (!isOperator(interactionUserId, OPERATOR_USER_IDS)) {
+      if (channel && interactionUserId) {
+        await web.chat.postEphemeral({
+          channel,
+          user: interactionUserId,
+          text: msg("operatorOnly"),
+        }).catch(() => {});
+      }
+      return;
+    }
     const [, behavior, requestId] = parts as [string, string, string];
     if (!requestId) return;
 
@@ -1512,9 +1856,9 @@ socketMode.on("interactive", async ({ body, ack }) => {
         await web.chat.update({
           channel,
           ts,
-          text: expanded,
+          text: truncateSlackFallbackText(expanded),
           blocks: [
-            { type: "section", text: { type: "mrkdwn", text: expanded } },
+            ...buildSlackMrkdwnSections(expanded),
             { type: "actions", elements: buildDecisionButtons(requestId) },
           ],
         });
@@ -1525,14 +1869,50 @@ socketMode.on("interactive", async ({ body, ack }) => {
     }
 
     if (behavior !== "allow" && behavior !== "deny") return;
+    const claim = pendingPermissions.take(requestId);
+    if (!claim) {
+      if (channel && ts) {
+        await web.chat.update({
+          channel,
+          ts,
+          text:
+            `${originalText}\n\n_이미 처리되었거나 만료된 권한 요청입니다._`,
+          blocks: [],
+        }).catch(() => {});
+      }
+      return;
+    }
+    const permission = claim.permission;
     const allow = behavior === "allow";
     stderr(`Button clicked: ${behavior} for request_id=${requestId}`);
-    await sendPermissionVerdict(requestId, behavior);
-    pendingPermissions.delete(requestId);
+    const delivered = await sendPermissionVerdict(requestId, behavior);
+    if (!delivered) {
+      pendingPermissions.restore(claim);
+      if (channel && ts) {
+        const failedText =
+          `${originalText}\n\n` +
+          ":warning: 권한 응답 전달에 실패했습니다. 다시 시도해주세요.";
+        await web.chat.update({
+          channel,
+          ts,
+          text: truncateSlackFallbackText(failedText),
+          blocks: [
+            ...buildSlackMrkdwnSections(failedText),
+            {
+              type: "actions",
+              elements: buildDecisionButtons(requestId),
+            },
+          ],
+        }).catch(() => {});
+      }
+      return;
+    }
 
     if (channel && ts) {
       try {
-        const result = allow ? ":white_check_mark: 권한 허용됨" : ":x: 권한 거부됨";
+        const result = allow
+          ? `:white_check_mark: 권한 허용됨: \`${permission.tool_name}\``
+          : `:x: 권한 거부됨: \`${permission.tool_name}\``;
         await web.chat.update({
           channel,
           ts,
@@ -1561,8 +1941,22 @@ socketMode.on("interactive", async ({ body, ack }) => {
 
     if (
       !pendingInputRequest ||
-      pendingInputRequest.request_id !== requestId ||
-      (pendingInputRequest.origin
+      pendingInputRequest.request_id !== requestId
+    ) {
+      stderr(
+        `Ignoring stale AskUserQuestion click ${requestId} ` +
+          `(pending=${pendingInputRequest?.request_id ?? "none"})`,
+      );
+      await web.chat.update({
+        channel,
+        ts,
+        text: `${originalText}\n\n_이미 처리되었거나 만료된 질문입니다._`,
+        blocks: [],
+      }).catch(() => {});
+      return;
+    }
+    if (
+      pendingInputRequest.origin
         ? !sameConversationOrigin(
             pendingInputRequest.origin,
             interactionOrigin,
@@ -1572,12 +1966,10 @@ socketMode.on("interactive", async ({ body, ack }) => {
             pendingInputRequest,
           ) ||
           (pendingInputRequest.userId !== undefined &&
-            interactionUserId !== pendingInputRequest.userId))
+            interactionUserId !== pendingInputRequest.userId) ||
+          !isOperator(interactionUserId, OPERATOR_USER_IDS)
     ) {
-      stderr(
-        `Ignoring stale AskUserQuestion click ${requestId} ` +
-          `(pending=${pendingInputRequest?.request_id ?? "none"})`,
-      );
+      stderr(`Ignoring AskUserQuestion click from wrong origin ${requestId}`);
       return;
     }
 
@@ -1640,15 +2032,81 @@ socketMode.on("interactive", async ({ body, ack }) => {
   }
 });
 
+async function activateSlackRealtime(lock: InstanceLock): Promise<void> {
+  instanceLock = lock;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      socketMode.once("connected", () => resolve());
+      socketMode.start().catch(reject);
+    });
+  } catch (error) {
+    if (instanceLock === lock) instanceLock = null;
+    lock.release();
+    throw error;
+  }
+}
+
+function startOwnershipTakeover(): void {
+  if (ownershipTask || shuttingDown || instanceLock) return;
+  const task = (async () => {
+    while (!shuttingDown && !instanceLock) {
+      const lock = await waitForInstanceLock("slack", SLACK_APP_TOKEN, {
+        signal: ownershipAbort.signal,
+      });
+      if (!lock) return;
+      if (shuttingDown) {
+        lock.release();
+        return;
+      }
+      try {
+        stderr("Realtime lock became available — taking over Slack Socket Mode");
+        await activateSlackRealtime(lock);
+        return;
+      } catch (error) {
+        stderr(`Slack takeover connection failed: ${error}`);
+      }
+    }
+  })();
+  ownershipTask = task;
+  void task
+    .catch((error) => stderr(`Slack ownership retry failed: ${error}`))
+    .finally(() => {
+      if (ownershipTask === task) ownershipTask = null;
+    });
+}
+
 socketMode.on("connected", () => {
   slackReady = true;
   stderr("Slack Socket Mode connected");
+  if (
+    !wrapperRealtimeReady &&
+    announceRealtimeReady(ipc, "slack", instanceLock !== null && !shuttingDown)
+  ) {
+    wrapperRealtimeReady = true;
+  }
   void flushDeferredRoutedOutput();
 });
 
-socketMode.on("disconnected", () => {
+function markSlackRealtimeUnavailable(state: string): void {
+  if (!isRealtimeUnavailableLifecycle(state)) return;
   slackReady = false;
-  stderr("Slack Socket Mode disconnected");
+  stderr(`Slack Socket Mode ${state}`);
+  if (wrapperRealtimeReady) {
+    announceRealtimeNotReady(ipc, "slack");
+    wrapperRealtimeReady = false;
+  }
+}
+
+socketMode.on("reconnecting", () => {
+  markSlackRealtimeUnavailable("reconnecting");
+});
+
+socketMode.on("disconnecting", () => {
+  markSlackRealtimeUnavailable("disconnecting");
+});
+
+socketMode.on("disconnected", () => {
+  markSlackRealtimeUnavailable("disconnected");
 });
 
 socketMode.on("error", (err) => {
@@ -1660,14 +2118,32 @@ socketMode.on("error", (err) => {
 // Claude Code closes the MCP transport by ending our stdin. Without these
 // handlers the Slack websocket keeps the process alive as a zombie.
 
-let shuttingDown = false;
 function shutdown(reason: string): void {
   if (shuttingDown) return;
   shuttingDown = true;
   stderr(`Shutting down: ${reason}`);
-  instanceLock?.release();
-  setTimeout(() => process.exit(0), 2000).unref();
-  void Promise.resolve(socketMode.disconnect()).finally(() => process.exit(0));
+  ownershipAbort.abort();
+  if (wrapperRealtimeReady) {
+    announceRealtimeNotReady(ipc, "slack");
+    wrapperRealtimeReady = false;
+  }
+  const ownedLock = instanceLock;
+  const forceExit = setTimeout(() => process.exit(0), 2_000);
+  forceExit.unref();
+  shutdownTask = disconnectThenRelease(
+    () => Promise.resolve(socketMode.disconnect()),
+    () => {
+      ownedLock?.release();
+      if (instanceLock === ownedLock) instanceLock = null;
+    },
+  ).catch((error) => {
+    // Do not release after a failed disconnect: exiting lets the OS tear down
+    // Socket Mode and the lock together without an overlap window.
+    stderr(`Slack disconnect during shutdown failed: ${error}`);
+  }).finally(() => {
+    clearTimeout(forceExit);
+    process.exit(0);
+  });
 }
 
 process.stdin.on("end", () => shutdown("stdin end"));
@@ -1680,9 +2156,11 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 async function main(): Promise<void> {
   // Connect IPC to wrapper
   try {
-    ipc = await connectToWrapper(WRAPPER_SOCKET);
+    ipc = await connectToWrapper(WRAPPER_SOCKET, IPC_AUTH_TOKEN);
     ipc.on("message", (ipcMsg: WrapperToMcp) => {
-      if (ipcMsg.type === "config") {
+      if (ipcMsg.type === "outbound_authorization_result") {
+        outboundAuthorizationTracker.settle(ipcMsg);
+      } else if (ipcMsg.type === "config") {
         currentModel = ipcMsg.model;
         currentEffort = ipcMsg.effort;
         availableEfforts = ipcMsg.availableEfforts;
@@ -1700,19 +2178,20 @@ async function main(): Promise<void> {
           stderr(`Input request handler error: ${err}`);
         });
       } else if (ipcMsg.type === "input_request_cancel") {
-        cancelledInputRequests.add(ipcMsg.request_id);
-        setTimeout(
-          () => cancelledInputRequests.delete(ipcMsg.request_id),
-          INPUT_REQUEST_TOMBSTONE_MS,
-        ).unref();
-        pendingAskUserQuestion.delete(ipcMsg.request_id);
-        if (
-          isMatchingInputRequest(
-            pendingInputRequest?.request_id,
-            ipcMsg.request_id,
-          )
-        ) {
-          pendingInputRequest = null;
+        cancelLocalInputRequest(ipcMsg.request_id);
+      } else if (ipcMsg.type === "capture_result") {
+        if (!captureTracker.settle(ipcMsg)) {
+          deliverRoutedOutput(ipcMsg).catch((err) => {
+            stderr(`Capture result delivery error: ${err}`);
+          });
+        }
+      } else if (ipcMsg.type === "effort_result") {
+        currentEffort = ipcMsg.effort;
+        availableEfforts = ipcMsg.availableEfforts;
+        if (!effortTracker.settle(ipcMsg)) {
+          deliverRoutedOutput(ipcMsg).catch((err) => {
+            stderr(`Effort result delivery error: ${err}`);
+          });
         }
       } else if (ipcMsg.type === "command_result") {
         if (!commandTracker.settle(ipcMsg)) {
@@ -1727,16 +2206,29 @@ async function main(): Promise<void> {
       }
     });
     ipc.on("close", () => {
+      outboundAuthorizationTracker.denyAll("wrapper IPC disconnected");
       stderr("Wrapper IPC disconnected — exiting to avoid zombie state");
       ipc = null;
       // Exiting prevents this mcp from staying connected to Slack Socket Mode
       // after its wrapper is gone (or after a new wrapper takes over the socket).
       // Without this, stale mcps hijack a portion of incoming messages via
       // Socket Mode round-robin and reply with captureNoResponse / lose user msgs.
-      setTimeout(() => process.exit(0), 100);
+      shutdown("wrapper IPC disconnected");
+    });
+    ipc.on("error", (error) => {
+      outboundAuthorizationTracker.denyAll(
+        `wrapper IPC error: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
     });
   } catch (err) {
     stderr(`IPC connect failed: ${err}`);
+    if (requiresWrapperIpc(AGENT_PROVIDER)) {
+      throw new Error(
+        `Codex mode requires wrapper IPC before Slack realtime startup: ${err}`,
+      );
+    }
   }
 
   // Get bot user ID for self-message filtering
@@ -1761,25 +2253,16 @@ async function main(): Promise<void> {
         "skipping Socket Mode to avoid stealing messages via round-robin. " +
         "Running as an inert MCP server.",
     );
+    startOwnershipTakeover();
   } else {
     // Connect Slack Socket Mode — wait for the handshake to complete before
     // starting the MCP transport. Otherwise early tool calls can hit a
     // half-open websocket and queue forever. The ``connected`` listener
     // above sets ``slackReady``; runTool rejects tool calls until then as
     // a belt-and-braces guard.
-    await new Promise<void>((resolve, reject) => {
-      socketMode.once("connected", () => resolve());
-      socketMode.start().catch(reject);
-    });
+    const initialLock = instanceLock;
+    await activateSlackRealtime(initialLock);
   }
-  // Only the process that owns the Socket Mode connection can receive button
-  // events. Inert duplicate MCP children must never become wrapper routing
-  // targets, even though they remain connected over stdio for Codex.
-  announceRealtimeReady(
-    ipc,
-    "slack",
-    instanceLock !== null && slackReady,
-  );
 
   // Start MCP stdio transport (must be last — blocks on stdio)
   const transport = new StdioServerTransport();

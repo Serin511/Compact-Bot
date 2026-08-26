@@ -2,7 +2,9 @@
  * Shared path constants for config and runtime data.
  *
  * Uses XDG Base Directory spec: defaults to ~/.config/compact-bot.
- * CWD .env is still supported and takes priority over the global one.
+ * CWD .env is still supported and takes priority over the global one, but
+ * Codex mode refuses platform credentials there because workspace files are
+ * model-readable.
  *
  * Exports:
  *   CONFIG_HOME — user-global config directory (~/.config/compact-bot).

@@ -1,53 +1,88 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { spawnSync } from "node:child_process";
+import {
+  closeSync,
+  mkdtempSync,
+  openSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { describe, expect, it } from "vitest";
 
-async function loadMessages(provider: "claude" | "codex") {
-  vi.resetModules();
-  vi.stubEnv("AGENT_PROVIDER", provider);
-  vi.stubEnv(
-    "XDG_CONFIG_HOME",
-    `/tmp/compact-bot-messages-test-${process.pid}`,
-  );
-  return import("../src/messages.js");
-}
-
-afterEach(() => {
-  vi.unstubAllEnvs();
-  vi.resetModules();
-});
-
-describe("provider-specific command help", () => {
-  it("describes Codex capture as a transcript instead of a CLI viewport", async () => {
-    const { msg } = await loadMessages("codex");
-
-    expect(msg("help")).toContain("Codex 대화·실행 기록 캡처");
-    expect(msg("help")).toContain("기본: 최근 50줄");
-    expect(msg("help")).toContain("`--all`: 현재 스레드 전체 기록");
-    expect(msg("help")).not.toContain("CLI 화면 캡처");
-    expect(msg("captureRequested")).toBe(
-      "📸 Codex 대화·실행 기록 캡처 중...",
+describe("command help", () => {
+  it("shows the usable Discord and Slack command prefixes", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "compact-bot-help-"));
+    const modulePath = resolve("src", "messages.ts");
+    const tsxLoader = resolve("node_modules", "tsx", "dist", "loader.mjs");
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--import",
+        tsxLoader,
+        "--eval",
+        `const { msg } = await import(${JSON.stringify(modulePath)}); console.log(msg("help"));`,
+      ],
+      {
+        cwd,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          XDG_CONFIG_HOME: join(cwd, "xdg"),
+        },
+      },
     );
-    expect(msg("captureEmpty")).toBe("⚠️ 캡처할 Codex 기록이 없습니다.");
+    rmSync(cwd, { recursive: true, force: true });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("`/new`");
+    expect(result.stdout).toContain("`!new`");
+    expect(result.stdout).toContain("`/capture [--all]`");
+    expect(result.stdout).toContain("`!capture [--all]`");
   });
 
-  it("describes Codex interrupt and raw turn semantics precisely", async () => {
-    const { msg } = await loadMessages("codex");
-
-    expect(msg("help")).toContain("`/esc` — 진행 중인 Codex 턴 중단");
-    expect(msg("help")).not.toContain("ESC 키 전송");
-    expect(msg("help")).toContain(
-      "`/raw <text>` — 텍스트를 Codex 턴 입력으로 전송 (진행 중이면 steer, CLI 명령이 아님)",
+  it("uses the inherited fd runtime provider before rendering Codex help", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "compact-bot-help-runtime-"));
+    const modulePath = resolve("src", "messages.ts");
+    const tsxLoader = resolve("node_modules", "tsx", "dist", "loader.mjs");
+    const runtimePayloadPath = join(cwd, "runtime.json");
+    writeFileSync(
+      runtimePayloadPath,
+      JSON.stringify({ AGENT_PROVIDER: "codex" }),
+      { mode: 0o600 },
     );
-    expect(msg("escSent")).toBe("⏹️ 진행 중인 Codex 턴 중단 요청됨.");
-  });
+    const runtimeFd = openSync(runtimePayloadPath, "r");
+    let result: ReturnType<typeof spawnSync>;
+    try {
+      result = spawnSync(
+        process.execPath,
+        [
+          "--import",
+          tsxLoader,
+          "--eval",
+          `const { msg } = await import(${JSON.stringify(modulePath)}); console.log(msg("help"));`,
+        ],
+        {
+          cwd,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            AGENT_PROVIDER: "claude",
+            COMPACT_BOT_MCP_RUNTIME_FD: "3",
+            XDG_CONFIG_HOME: join(cwd, "xdg"),
+          },
+          stdio: ["ignore", "pipe", "pipe", runtimeFd],
+        },
+      );
+    } finally {
+      closeSync(runtimeFd);
+      rmSync(cwd, { recursive: true, force: true });
+    }
 
-  it("preserves Claude Code PTY command descriptions", async () => {
-    const { msg } = await loadMessages("claude");
-
-    expect(msg("help")).toContain("CLI 화면 캡처");
-    expect(msg("help")).toContain("ESC 키 전송");
-    expect(msg("help")).toContain("CLI에 텍스트를 그대로 입력");
-    expect(msg("captureRequested")).toBe("📸 CLI 화면 캡처 중...");
-    expect(msg("captureEmpty")).toBe("⚠️ 캡처할 화면이 없습니다.");
-    expect(msg("escSent")).toBe("⎋ ESC 전송됨.");
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Codex 모델");
+    expect(result.stdout).toContain("reasoning effort 조회/변경");
+    expect(result.stdout).toContain("최신 512 KiB");
+    expect(result.stdout).not.toContain("CLI 화면 캡처");
   });
 });

@@ -132,4 +132,27 @@ describe("routeMessage", () => {
   it("routes /goal without args (caller must show usage)", () => {
     expect(routeMessage("/goal")).toEqual({ type: "goal" });
   });
+
+  it.each([
+    ["!new", { type: "new" }],
+    ["!clear", { type: "clear" }],
+    ["!compact focus", { type: "compact", args: "focus" }],
+    ["!model gpt-5.6-sol", { type: "model", args: "gpt-5.6-sol" }],
+    ["!effort ultra", { type: "effort", args: "ultra" }],
+    ["!cwd /tmp/project", { type: "cwd", args: "/tmp/project" }],
+    ["!capture --all", { type: "capture", args: "--all" }],
+    ["!esc", { type: "esc" }],
+    ["!raw /agents", { type: "raw", args: "/agents" }],
+    ["!goal ship safely", { type: "goal", args: "ship safely" }],
+    ["!help", { type: "help" }],
+  ])("routes Slack-safe alias %s", (content, expected) => {
+    expect(routeMessage(content)).toEqual(expected);
+  });
+
+  it("does not match partial exclamation aliases", () => {
+    expect(routeMessage("!clearly")).toEqual({
+      type: "message",
+      args: "!clearly",
+    });
+  });
 });

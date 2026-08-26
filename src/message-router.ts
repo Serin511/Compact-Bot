@@ -29,17 +29,17 @@ export interface RouteResult {
 }
 
 const COMMAND_MAP: Record<string, RouteType> = {
-  "/compact": "compact",
-  "/clear": "clear",
-  "/model": "model",
-  "/effort": "effort",
-  "/cwd": "cwd",
-  "/help": "help",
-  "/new": "new",
-  "/capture": "capture",
-  "/esc": "esc",
-  "/raw": "raw",
-  "/goal": "goal",
+  compact: "compact",
+  clear: "clear",
+  model: "model",
+  effort: "effort",
+  cwd: "cwd",
+  help: "help",
+  new: "new",
+  capture: "capture",
+  esc: "esc",
+  raw: "raw",
+  goal: "goal",
 };
 
 /**
@@ -54,12 +54,15 @@ const COMMAND_MAP: Record<string, RouteType> = {
 export function routeMessage(content: string): RouteResult {
   const trimmed = content.trim();
 
-  for (const [prefix, type] of Object.entries(COMMAND_MAP)) {
-    if (trimmed === prefix) {
-      return { type };
-    }
-    if (trimmed.startsWith(prefix + " ")) {
-      return { type, args: trimmed.slice(prefix.length + 1).trim() };
+  for (const [name, type] of Object.entries(COMMAND_MAP)) {
+    for (const marker of ["/", "!"]) {
+      const prefix = `${marker}${name}`;
+      if (trimmed === prefix) {
+        return { type };
+      }
+      if (trimmed.startsWith(prefix + " ")) {
+        return { type, args: trimmed.slice(prefix.length + 1).trim() };
+      }
     }
   }
 

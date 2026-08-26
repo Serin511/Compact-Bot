@@ -15,6 +15,7 @@ import {
 import {
   normalizeReasoningEffort,
 } from "./reasoning-effort.js";
+import { COMPACT_BOT_VERSION } from "./version.js";
 
 export type JsonRpcId = string | number;
 
@@ -26,6 +27,15 @@ export interface CodexMcpServerConfig {
 }
 
 export interface CodexQuestion {
+  /** App-server request id used to correlate resolution/cancellation. */
+  requestId?: JsonRpcId;
+  /**
+   * Aborted when app-server reports `serverRequest/resolved` before the chat
+   * surface answers. Consumers may use this to remove stale question UI.
+   */
+  signal?: AbortSignal;
+  /** Whether only a configured platform operator may answer this request. */
+  operatorOnly?: boolean;
   threadId?: string;
   turnId?: string;
   itemId?: string;
@@ -79,9 +89,39 @@ interface JsonRpcMessage {
 }
 
 interface PendingRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
+  /**
+   * Runs while parsing the success response, before later notification lines
+   * from the same stdout chunk can be dispatched.
+   */
+  onSuccess?: (value: unknown) => void;
+}
+
+interface NotificationWaiter {
+  generation: number;
+  label: string;
+  predicate: (
+    method: string,
+    params: Record<string, unknown>,
+  ) => boolean;
+  resolve: (matched: boolean) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+interface NotificationBarrier {
+  promise: Promise<void>;
+  cancel: () => void;
+}
+
+interface ActiveServerRequest {
+  generation: number;
+  method: string;
+  threadId?: string;
+  controller: AbortController;
 }
 
 interface ThreadStartResult {
@@ -89,6 +129,7 @@ interface ThreadStartResult {
     id?: string;
   };
   model?: string;
+  cwd?: string;
   reasoningEffort?: string | null;
 }
 
@@ -110,22 +151,109 @@ interface ModelListResult {
   nextCursor?: string | null;
 }
 
-interface ThreadReadResult {
-  thread?: {
-    id?: string;
-    turns?: Array<{
-      id?: string;
-      status?: string;
-      error?: { message?: string } | null;
-      items?: Array<Record<string, unknown>>;
-    }>;
-  };
+interface ThreadTurn {
+  id?: string;
+  status?: string;
+  error?: { message?: string } | null;
+  items?: Array<Record<string, unknown>>;
+}
+
+interface ThreadTurnsListResult {
+  data?: ThreadTurn[];
+  nextCursor?: string | null;
 }
 
 const REQUEST_TIMEOUT_MS = 60_000;
 const STOP_TIMEOUT_MS = 5_000;
 const SESSION_CLEANUP_TIMEOUT_MS = 2_000;
+const GOAL_START_TIMEOUT_MS = 15_000;
+const COMPACTION_TIMEOUT_MS = 5 * 60_000;
 const CAPTURE_VIEWPORT_LINES = 50;
+const MAX_CAPTURE_HISTORY_LINES = 200;
+const MAX_CAPTURE_BODY_CHARS = 512 * 1024;
+const MAX_CAPTURE_EVENT_CHARS = 64 * 1024;
+const THREAD_TURNS_PAGE_LIMIT = 50;
+const MAX_CAPTURE_PAGE_COUNT = 100;
+const MAX_APP_SERVER_JSON_LINE_CHARS = 16 * 1024 * 1024;
+const MAX_PROTOCOL_ID_PREFIX_CHARS = 4 * 1024;
+const MAX_COMPLETED_TURN_IDS = 256;
+const SERVER_REQUEST_RESOLVED = Symbol("server-request-resolved");
+const INTERRUPT_ABANDON_METHODS = new Set([
+  "turn/start",
+  "turn/steer",
+  "thread/inject_items",
+  "thread/compact/start",
+  "thread/goal/set",
+]);
+const GOAL_CLEAR_ABANDON_METHODS = new Set([
+  "thread/inject_items",
+  "thread/compact/start",
+  "thread/goal/set",
+]);
+const SESSION_REPLACEMENT_ABANDON_METHODS = new Set([
+  ...INTERRUPT_ABANDON_METHODS,
+  "thread/settings/update",
+]);
+
+interface DirectChildExitTarget {
+  exitCode: number | null;
+  signalCode: NodeJS.Signals | null;
+  once(event: "exit", listener: () => void): unknown;
+}
+
+/**
+ * Terminate a non-process-group child and report whether its exit was observed.
+ *
+ * Windows does not provide the POSIX group probe used by the main stop path.
+ * Returning false after the hard deadline lets the caller fence that exact
+ * generation before starting a replacement instead of racing a late exit.
+ */
+export function waitForDirectChildExit(
+  child: DirectChildExitTarget,
+  terminate: (signal: NodeJS.Signals) => void,
+  stopTimeoutMs = STOP_TIMEOUT_MS,
+): Promise<boolean> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (exited: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(hardTimer);
+      resolve(exited);
+    };
+    const forceTimer = setTimeout(
+      () => terminate("SIGKILL"),
+      stopTimeoutMs,
+    );
+    const hardTimer = setTimeout(() => {
+      terminate("SIGKILL");
+      finish(false);
+    }, stopTimeoutMs + 1_000);
+    child.once("exit", () => finish(true));
+    terminate("SIGTERM");
+  });
+}
+
+class CodexControlInterruptionError extends Error {
+  constructor(
+    message: string,
+    readonly skipGoalRollback = false,
+  ) {
+    super(message);
+    this.name = "CodexControlInterruptionError";
+  }
+}
+
+class CodexRequestTimeoutError extends Error {
+  constructor(readonly method: string) {
+    super(`Codex request timed out: ${method}`);
+    this.name = "CodexRequestTimeoutError";
+  }
+}
 
 function tomlString(value: string): string {
   // JSON string syntax is valid TOML basic-string syntax for the characters
@@ -140,14 +268,19 @@ function tomlStringArray(values: string[]): string {
 /**
  * Build process-local MCP overrides for `codex app-server`.
  *
- * We forward tokens by environment-variable name instead of embedding secret
- * values in argv. `approve` keeps the bot's own reply/react tools from asking
- * for approval every time Codex needs to communicate with the user.
+ * Compact Bot configures only a secretless stdio proxy here. The wrapper owns
+ * the real platform MCP child and injects its credentials through an inherited
+ * fd, so neither app-server argv nor its environment contains platform
+ * secrets. `approve` keeps reply/react tools from prompting on every call.
  */
 export function buildCodexAppServerArgs(
   servers: CodexMcpServerConfig[],
 ): string[] {
-  const args = ["app-server"];
+  const args = [
+    "app-server",
+    "-c",
+    "shell_environment_policy.ignore_default_excludes=false",
+  ];
   for (const server of servers) {
     const prefix = `mcp_servers.${server.name}`;
     args.push("-c", `${prefix}.command=${tomlString(server.command)}`);
@@ -283,6 +416,10 @@ function approvalDetail(label: string, value: unknown): string {
 
 function normalizeChoice(answer: string, options: CodexQuestion["options"]): string {
   const trimmed = answer.trim();
+  // The wrapper resolves button clicks to their label before returning here.
+  // Prefer an exact label over the legacy numeric-index shorthand so labels
+  // such as "1" or "2" are not interpreted a second time as a different row.
+  if (options.some((option) => option.label === trimmed)) return trimmed;
   const match = /^(\d+)$/.exec(trimmed);
   if (match) {
     const index = Number(match[1]) - 1;
@@ -297,7 +434,9 @@ function isStaleTurnError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return (
     /no active turn/i.test(message) ||
-    /turn.+(?:not active|inactive|completed|not found)/i.test(message) ||
+    /turn.+(?:not active|no longer active|inactive|completed|not found)/i.test(
+      message,
+    ) ||
     /expected.+turn/i.test(message)
   );
 }
@@ -481,29 +620,76 @@ function renderThreadItem(item: Record<string, unknown>): string {
   }
 }
 
-function renderThreadTranscript(result: ThreadReadResult): string {
-  const turns = result.thread?.turns ?? [];
-  const sections: string[] = [];
-  for (let index = 0; index < turns.length; index++) {
-    const turn = turns[index];
-    const items = (turn.items ?? [])
-      .map(renderThreadItem)
-      .filter(Boolean);
-    const error = turn.error?.message ? `ERROR\n${turn.error.message}` : "";
-    const body = [...items, error].filter(Boolean).join("\n\n");
-    if (!body) continue;
-    sections.push(
-      [
-        `── TURN ${index + 1} (${turn.status ?? "unknown"}) ──`,
-        body,
-      ].join("\n"),
+const CAPTURE_TRUNCATION_NOTICE = "… older transcript content omitted …";
+
+function appendBoundedCaptureText(
+  current: string,
+  addition: string,
+  maxChars = MAX_CAPTURE_BODY_CHARS,
+): string {
+  if (!addition) return current;
+  const combined = current ? `${current}\n\n${addition}` : addition;
+  if (combined.length <= maxChars) return combined;
+  const remaining = Math.max(
+    0,
+    maxChars - CAPTURE_TRUNCATION_NOTICE.length - 1,
+  );
+  if (remaining === 0) return CAPTURE_TRUNCATION_NOTICE.slice(0, maxChars);
+  return `${CAPTURE_TRUNCATION_NOTICE}\n${combined.slice(-remaining)}`;
+}
+
+function renderThreadTurn(
+  turn: ThreadTurn,
+  maxChars = MAX_CAPTURE_BODY_CHARS,
+): string {
+  const header = `── TURN ${turn.id ?? "unknown"} (${turn.status ?? "unknown"}) ──`;
+  const bodyLimit = Math.max(0, maxChars - header.length - 1);
+  let body = "";
+  for (const item of turn.items ?? []) {
+    body = appendBoundedCaptureText(
+      body,
+      renderThreadItem(item),
+      bodyLimit,
     );
   }
+  if (turn.error?.message) {
+    body = appendBoundedCaptureText(
+      body,
+      `ERROR\n${turn.error.message}`,
+      bodyLimit,
+    );
+  }
+  return body ? `${header}\n${body}` : "";
+}
 
-  const transcript = sections.length > 0
-    ? sections.join("\n\n")
-    : "(no transcript yet)";
-  return transcript;
+function boundCaptureEntry(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  const notice = "\n… event content truncated …\n";
+  if (notice.length >= maxChars) return notice.slice(0, maxChars);
+  const remaining = maxChars - notice.length;
+  const leading = Math.ceil(remaining / 2);
+  return `${value.slice(0, leading)}${notice}${value.slice(-(remaining - leading))}`;
+}
+
+function jsonRpcIdFromProtocolPrefix(prefix: string): JsonRpcId | undefined {
+  const match =
+    /^\s*\{\s*"id"\s*:\s*("(?:\\.|[^"\\])*"|-?\d+(?:\.\d+)?)/.exec(
+      prefix,
+    );
+  if (!match) return undefined;
+  try {
+    const value = JSON.parse(match[1]) as unknown;
+    return typeof value === "string" || typeof value === "number"
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isMethodNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\(-32601\)|method not found/i.test(message);
 }
 
 /**
@@ -515,21 +701,43 @@ function renderThreadTranscript(result: ThreadReadResult): string {
 export class CodexAppServer extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | null = null;
   private stdoutBuffer = "";
+  private discardedProtocolLine:
+    | { length: number; requestId?: JsonRpcId }
+    | null = null;
   private nextRequestId = 1;
   private readonly pending = new Map<JsonRpcId, PendingRequest>();
+  private readonly notificationWaiters = new Set<NotificationWaiter>();
   private operationQueue: Promise<void> = Promise.resolve();
+  /** Recovery operations bypass the normal lifecycle queue but remain ordered. */
+  private controlQueue: Promise<void> = Promise.resolve();
+  /** Queued normal work from an old session must never run on its replacement. */
+  private operationEpoch = 0;
   private stopping = false;
   private restarting = false;
   private initialized = false;
   private processGeneration = 0;
   private threadId: string | null = null;
   private activeTurnId: string | null = null;
+  private goalActive = false;
+  /** Monotonic terminal-goal notification fence within the current thread. */
+  private goalTerminalRevision = 0;
+  /** Advances when no immediate automatic goal turn is guaranteed. */
+  private goalBarrierReleaseRevision = 0;
+  /** Active turn that must finish before the accepted goal can start a turn. */
+  private goalPendingAfterTurnId: string | null = null;
+  private readonly completedTurnIds = new Set<string>();
+  private readonly activeServerRequests = new Map<
+    JsonRpcId,
+    ActiveServerRequest
+  >();
   private cwd: string;
   private model: string;
   private effort: string;
   private supportedReasoningEfforts: string[] = [];
   private readonly reasoningEffortsByModel = new Map<string, string[]>();
   private readonly recentEvents: string[] = [];
+  /** Bounded notification-derived transcript used by ordinary `/capture`. */
+  private readonly recentCaptureLines: string[] = [];
   private readonly liveCaptureItems = new Map<
     string,
     { label: string; text: string }
@@ -548,6 +756,10 @@ export class CodexAppServer extends EventEmitter {
 
   get currentTurnId(): string | null {
     return this.activeTurnId;
+  }
+
+  get hasActiveGoal(): boolean {
+    return this.goalActive;
   }
 
   get currentCwd(): string {
@@ -576,6 +788,7 @@ export class CodexAppServer extends EventEmitter {
 
     this.stopping = false;
     this.stdoutBuffer = "";
+    this.discardedProtocolLine = null;
     const generation = ++this.processGeneration;
     const child = spawn(this.options.executable, args, {
       cwd: this.cwd,
@@ -611,7 +824,12 @@ export class CodexAppServer extends EventEmitter {
       this.initialized = false;
       this.threadId = null;
       this.activeTurnId = null;
+      this.goalActive = false;
+      this.goalPendingAfterTurnId = null;
+      this.completedTurnIds.clear();
+      this.abortActiveServerRequests();
       this.liveCaptureItems.clear();
+      this.recentCaptureLines.length = 0;
       const error = new Error(
         `Codex app-server exited (code=${code ?? "null"}, signal=${signal ?? "null"})`,
       );
@@ -620,6 +838,7 @@ export class CodexAppServer extends EventEmitter {
         request.reject(error);
       }
       this.pending.clear();
+      this.rejectNotificationWaiters(error);
       if (!this.restarting) {
         this.emit("exit", { code, signal, expected: this.stopping });
       }
@@ -634,7 +853,7 @@ export class CodexAppServer extends EventEmitter {
       clientInfo: {
         name: "compact_bot",
         title: "Compact Bot",
-        version: "1.4.1",
+        version: COMPACT_BOT_VERSION,
       },
       capabilities: {
         experimentalApi: true,
@@ -652,23 +871,18 @@ export class CodexAppServer extends EventEmitter {
     this.stopping = true;
 
     if (process.platform === "win32" || !child.pid) {
-      await new Promise<void>((resolve) => {
-        let settled = false;
-        const finish = (): void => {
-          if (settled) return;
-          settled = true;
-          resolve();
-        };
-        const forceTimer = setTimeout(() => {
-          this.terminateProcessTree(child, "SIGKILL");
-          finish();
-        }, STOP_TIMEOUT_MS);
-        child.once("exit", () => {
-          clearTimeout(forceTimer);
-          finish();
-        });
-        this.terminateProcessTree(child, "SIGTERM");
-      });
+      const exited = await waitForDirectChildExit(
+        child,
+        (signal) => this.terminateProcessTree(child, signal),
+      );
+      if (!exited) {
+        this.detachUnresponsiveChild(
+          child,
+          new Error(
+            "Codex app-server did not exit after forced termination",
+          ),
+        );
+      }
       return;
     }
 
@@ -711,6 +925,14 @@ export class CodexAppServer extends EventEmitter {
         if (!forceSent) {
           this.terminateProcessTree(child, "SIGKILL");
         }
+        if (this.child === child && (!leaderExited || !groupGone())) {
+          this.detachUnresponsiveChild(
+            child,
+            new Error(
+              "Codex app-server process group did not exit after forced termination",
+            ),
+          );
+        }
         finish();
       }, STOP_TIMEOUT_MS + 1_000);
 
@@ -726,8 +948,18 @@ export class CodexAppServer extends EventEmitter {
    * protocol cleanup step is best-effort, but the app-server process group is
    * always stopped so per-thread MCP children cannot retain realtime locks.
    */
-  async closeSession(): Promise<void> {
-    await this.enqueue(async () => {
+  closeSession(): Promise<void> {
+    this.emit("closing", { reason: "session closed" });
+    this.operationEpoch += 1;
+    return this.enqueueControl(async () => {
+      this.abandonInFlightOperations(
+        new CodexControlInterruptionError(
+          "Codex session closed while an operation was pending",
+          true,
+        ),
+        true,
+        SESSION_REPLACEMENT_ABANDON_METHODS,
+      );
       try {
         await this.cleanupCurrentThread();
       } finally {
@@ -736,12 +968,22 @@ export class CodexAppServer extends EventEmitter {
     });
   }
 
-  async newSession(updates?: {
+  newSession(updates?: {
     model?: string;
     cwd?: string;
     effort?: string;
   }): Promise<void> {
-    await this.enqueue(async () => {
+    this.emit("resetting", { reason: "new session" });
+    this.operationEpoch += 1;
+    return this.enqueueControl(async () => {
+      this.abandonInFlightOperations(
+        new CodexControlInterruptionError(
+          "Codex session restarted while an operation was pending",
+          true,
+        ),
+        true,
+        SESSION_REPLACEMENT_ABANDON_METHODS,
+      );
       const nextModel = updates?.model ?? this.model;
       const nextCwd = updates?.cwd ?? this.cwd;
       const requestedEffort = updates?.effort ?? this.effort;
@@ -764,6 +1006,7 @@ export class CodexAppServer extends EventEmitter {
         // releases the old MCP process group before a new thread is created.
         await this.stop();
         await this.start();
+        this.emit("reset", { reason: "new session" });
       } catch (error) {
         await this.stop().catch(() => {});
         this.restarting = false;
@@ -779,80 +1022,264 @@ export class CodexAppServer extends EventEmitter {
     source: "discord" | "slack",
     content: string,
     meta: Record<string, string>,
+    onAccepted?: (submission: CodexSubmissionResult) => void,
   ): Promise<CodexSubmissionResult> {
-    return await this.submitText(formatChannelMessage(source, content, meta));
+    return await this.submitText(
+      formatChannelMessage(source, content, meta),
+      onAccepted,
+    );
   }
 
-  async submitText(text: string): Promise<CodexSubmissionResult> {
-    return await this.enqueue(async () => {
-      if (!this.threadId) throw new Error("Codex thread is not ready");
-      const input = [{ type: "text", text }];
-      if (this.activeTurnId) {
-        const expectedTurnId = this.activeTurnId;
-        try {
-          await this.request("turn/steer", {
+  async submitText(
+    text: string,
+    onAccepted?: (submission: CodexSubmissionResult) => void,
+  ): Promise<CodexSubmissionResult> {
+    try {
+      return await this.enqueue(async () => {
+        if (!this.threadId) throw new Error("Codex thread is not ready");
+        await this.awaitDeferredGoalStartIfNeeded();
+        const input = [{ type: "text", text }];
+        if (this.activeTurnId) {
+          const expectedTurnId = this.activeTurnId;
+          try {
+            await this.request(
+              "turn/steer",
+              {
+                threadId: this.threadId,
+                input,
+                expectedTurnId,
+              },
+              REQUEST_TIMEOUT_MS,
+              () => {
+                onAccepted?.({ turnId: expectedTurnId, steered: true });
+              },
+            );
+            return { turnId: expectedTurnId, steered: true };
+          } catch (error) {
+            if (!isStaleTurnError(error)) throw error;
+            // A completion notification can race an inbound message. If the
+            // cached turn id is stale, retry once as a fresh turn instead of
+            // silently dropping the user's message.
+            this.options.onDebug?.(
+              `Could not steer Codex turn ${this.activeTurnId}; retrying with turn/start: ${String(error)}`,
+            );
+            this.activeTurnId = null;
+            await this.awaitDeferredGoalStartIfNeeded();
+            if (this.activeTurnId) {
+              const recoveredTurnId = this.activeTurnId;
+              try {
+                await this.request(
+                  "turn/steer",
+                  {
+                    threadId: this.threadId,
+                    input,
+                    expectedTurnId: recoveredTurnId,
+                  },
+                  REQUEST_TIMEOUT_MS,
+                  () => {
+                    onAccepted?.({
+                      turnId: recoveredTurnId,
+                      steered: true,
+                    });
+                  },
+                );
+                return { turnId: recoveredTurnId, steered: true };
+              } catch (recoveredError) {
+                if (!isStaleTurnError(recoveredError)) throw recoveredError;
+                this.activeTurnId = null;
+              }
+            }
+          }
+        }
+
+        const result = (await this.request(
+          "turn/start",
+          {
             threadId: this.threadId,
             input,
-            expectedTurnId,
-          });
-          return { turnId: expectedTurnId, steered: true };
-        } catch (error) {
-          if (!isStaleTurnError(error)) throw error;
-          // A completion notification can race an inbound message. If the
-          // cached turn id is stale, retry once as a fresh turn instead of
-          // silently dropping the user's message.
+            cwd: this.cwd,
+            ...(this.model ? { model: this.model } : {}),
+            ...(this.effort ? { effort: this.effort } : {}),
+          },
+          REQUEST_TIMEOUT_MS,
+          (value) => {
+            const acceptedTurnId = (value as TurnStartResult).turn?.id;
+            if (acceptedTurnId) {
+              onAccepted?.({ turnId: acceptedTurnId, steered: false });
+            }
+          },
+        )) as TurnStartResult;
+        const turnId = result.turn?.id;
+        if (!turnId) throw new Error("turn/start returned no turn id");
+        if (this.completedTurnIds.has(turnId)) {
+          // The completion notification can be delivered before the response to
+          // turn/start. Never resurrect a turn that app-server already finished.
+          if (this.activeTurnId === turnId) this.activeTurnId = null;
           this.options.onDebug?.(
-            `Could not steer Codex turn ${this.activeTurnId}; retrying with turn/start: ${String(error)}`,
+            `Codex turn ${turnId} completed before turn/start returned`,
           );
-          this.activeTurnId = null;
+        } else {
+          this.activeTurnId = turnId;
         }
+        return { turnId, steered: false };
+      });
+    } catch (error) {
+      const timedOutTurnMutation =
+        error instanceof CodexRequestTimeoutError &&
+        ["turn/start", "turn/steer"].includes(error.method);
+      const timedOutDeferredGoal =
+        (
+          error instanceof Error &&
+          error.message ===
+            "Timed out waiting for Codex first automatic goal turn"
+        );
+      if (timedOutTurnMutation || timedOutDeferredGoal) {
+        this.operationEpoch += 1;
+        await this.enqueueControl(
+          () =>
+            this.replaceRuntimeAfterUnsafeControl(
+              timedOutTurnMutation
+                ? `timed-out ${
+                  (error as CodexRequestTimeoutError).method
+                }`
+                : "timed-out deferred goal turn",
+            ),
+        );
       }
-
-      const result = (await this.request("turn/start", {
-        threadId: this.threadId,
-        input,
-        cwd: this.cwd,
-        ...(this.model ? { model: this.model } : {}),
-        ...(this.effort ? { effort: this.effort } : {}),
-      })) as TurnStartResult;
-      const turnId = result.turn?.id;
-      if (!turnId) throw new Error("turn/start returned no turn id");
-      this.activeTurnId = turnId;
-      return { turnId, steered: false };
-    });
+      throw error;
+    }
   }
 
   async compact(hint?: string): Promise<void> {
-    await this.enqueue(async () => {
-      if (!this.threadId) throw new Error("Codex thread is not ready");
-      const normalizedHint = hint?.trim();
-      if (normalizedHint) {
-        // The app-server compact method has no native hint parameter. Inject
-        // the hint into model-visible history first so the compactor can honor
-        // the same intent as Claude Code's `/compact <hint>`.
-        await this.request("thread/inject_items", {
-          threadId: this.threadId,
-          items: [{
-            type: "message",
-            role: "user",
-            content: [{
-              type: "input_text",
-              text: `[Compact Bot compaction hint]\n${normalizedHint}`,
+    try {
+      await this.enqueue(async () => {
+        if (!this.threadId) throw new Error("Codex thread is not ready");
+        if (this.goalActive || this.goalPendingAfterTurnId) {
+          throw new Error(
+            "활성 Codex goal이 있는 동안에는 context compaction을 시작할 수 없습니다",
+          );
+        }
+        const normalizedHint = hint?.trim();
+        if (normalizedHint) {
+          // The app-server compact method has no native hint parameter. Inject
+          // the hint into model-visible history first so the compactor can honor
+          // the same intent as Claude Code's `/compact <hint>`.
+          await this.request("thread/inject_items", {
+            threadId: this.threadId,
+            items: [{
+              type: "message",
+              role: "user",
+              content: [{
+                type: "input_text",
+                text: `[Compact Bot compaction hint]\n${normalizedHint}`,
+              }],
             }],
-          }],
-        });
+          });
+        }
+        const barrier = this.createCompactionBarrier(this.threadId);
+        try {
+          await Promise.all([
+            this.request("thread/compact/start", { threadId: this.threadId }),
+            barrier.promise,
+          ]);
+          // The empty response only acknowledges that compaction was scheduled.
+          // 0.146 interrupts the current turn and runs a separate, non-steerable
+          // contextCompaction turn afterwards. Keep later chat input queued until
+          // that lifecycle is fully complete.
+        } catch (error) {
+          barrier.cancel();
+          throw error;
+        }
+      });
+    } catch (error) {
+      if (
+        (
+          error instanceof CodexRequestTimeoutError &&
+          (
+            error.method === "thread/compact/start" ||
+            error.method === "thread/inject_items"
+          )
+        ) ||
+        (
+          error instanceof Error &&
+          error.message ===
+            "Timed out waiting for Codex context compaction turn"
+        )
+      ) {
+        this.operationEpoch += 1;
+        await this.enqueueControl(
+          () =>
+            this.replaceRuntimeAfterUnsafeControl(
+              "timed-out context compaction",
+            ),
+        );
       }
-      await this.request("thread/compact/start", { threadId: this.threadId });
-    });
+      throw error;
+    }
   }
 
-  async interrupt(): Promise<void> {
-    await this.enqueue(async () => {
-      if (!this.threadId || !this.activeTurnId) return;
-      await this.request("turn/interrupt", {
-        threadId: this.threadId,
-        turnId: this.activeTurnId,
-      });
+  interrupt(): Promise<void> {
+    return this.enqueueControl(async () => {
+      const threadId = this.threadId;
+      const turnId = this.activeTurnId;
+      let requiresRuntimeReset =
+        this.hasCompactionBarrier() ||
+        this.hasGoalStartBarrier() ||
+        this.goalPendingAfterTurnId !== null ||
+        this.activeServerRequests.size > 0 ||
+        this.hasPendingMethod([
+          "turn/start",
+          "turn/steer",
+          "thread/inject_items",
+          "thread/compact/start",
+          "thread/goal/set",
+        ]);
+      const resetPlannedBeforeInterrupt = requiresRuntimeReset;
+      if (requiresRuntimeReset) this.operationEpoch += 1;
+      this.abandonInFlightOperations(
+        new CodexControlInterruptionError(
+          "Codex operation interrupted by control command",
+        ),
+        false,
+        INTERRUPT_ABANDON_METHODS,
+      );
+      let interruptError: unknown = null;
+      const completionBarrier =
+        threadId && turnId
+          ? this.createTurnCompletionBarrier(threadId, turnId)
+          : null;
+      if (threadId && turnId) {
+        try {
+          await Promise.all([
+            this.request(
+              "turn/interrupt",
+              {
+                threadId,
+                turnId,
+              },
+              SESSION_CLEANUP_TIMEOUT_MS,
+            ),
+            completionBarrier?.promise ?? Promise.resolve(),
+          ]);
+        } catch (error) {
+          completionBarrier?.cancel();
+          interruptError = error;
+          requiresRuntimeReset = true;
+        }
+      }
+      if (requiresRuntimeReset && !resetPlannedBeforeInterrupt) {
+        // The reset became necessary only after interrupt/completion failed.
+        this.operationEpoch += 1;
+      }
+      if (requiresRuntimeReset) {
+        // App-server has no cancellation API for an accepted compaction or a
+        // request whose turn/goal id never arrived. Replacing the process is
+        // the only way to prove that a late mutation cannot cross the control
+        // boundary and race newly queued input.
+        await this.replaceRuntimeAfterUnsafeControl("interrupt");
+        return;
+      }
+      if (interruptError) throw interruptError;
     });
   }
 
@@ -860,58 +1287,266 @@ export class CodexAppServer extends EventEmitter {
     args: string,
     source?: "discord" | "slack",
     meta?: Record<string, string>,
+    onAccepted?: () => void,
   ): Promise<void> {
-    await this.enqueue(async () => {
-      if (!this.threadId) throw new Error("Codex thread is not ready");
-      const objective = args.trim();
-      if (objective === "clear") {
+    const objective = args.trim();
+    if (objective === "clear") {
+      await this.enqueueControl(async () => {
+        if (!this.threadId) throw new Error("Codex thread is not ready");
+        const threadId = this.threadId;
+        let requiresRuntimeReset =
+          this.hasCompactionBarrier() ||
+          this.hasGoalStartBarrier() ||
+          this.goalPendingAfterTurnId !== null ||
+          this.activeServerRequests.size > 0 ||
+          this.hasPendingMethod([
+            "thread/inject_items",
+            "thread/compact/start",
+            "thread/goal/set",
+          ]);
+        if (requiresRuntimeReset) this.operationEpoch += 1;
+        this.abandonInFlightOperations(
+          new CodexControlInterruptionError(
+            "Codex goal cleared while an operation was pending",
+            true,
+          ),
+          false,
+          GOAL_CLEAR_ABANDON_METHODS,
+        );
         // Clearing a goal is control-plane state, not user conversation. Do
         // not leave a synthetic `/goal clear` message in model-visible history.
-        await this.request("thread/goal/clear", { threadId: this.threadId });
-        return;
-      }
-      if (source && meta) {
-        await this.request("thread/inject_items", {
-          threadId: this.threadId,
-          items: [{
-            type: "message",
-            role: "user",
-            content: [{
-              type: "input_text",
-              text: formatChannelMessage(source, `/goal ${args}`, meta),
-            }],
-          }],
-        });
-      }
-      await this.request("thread/goal/set", {
-        threadId: this.threadId,
-        objective,
+        let clearError: unknown = null;
+        try {
+          await this.request(
+            "thread/goal/clear",
+            { threadId },
+            SESSION_CLEANUP_TIMEOUT_MS,
+          );
+        } catch (error) {
+          clearError = error;
+        }
+        if (clearError && !requiresRuntimeReset) {
+          this.operationEpoch += 1;
+          requiresRuntimeReset = true;
+        }
+        if (!clearError) this.goalActive = false;
+        if (requiresRuntimeReset) {
+          await this.replaceRuntimeAfterUnsafeControl("goal clear");
+          return;
+        }
+        if (clearError) throw clearError;
       });
+      return;
+    }
+    await this.enqueue(async () => {
+      if (!this.threadId) throw new Error("Codex thread is not ready");
+      if (source && meta) {
+        try {
+          await this.request("thread/inject_items", {
+            threadId: this.threadId,
+            items: [{
+              type: "message",
+              role: "user",
+              content: [{
+                type: "input_text",
+                text: formatChannelMessage(source, `/goal ${args}`, meta),
+              }],
+            }],
+          });
+        } catch (error) {
+          if (
+            error instanceof CodexRequestTimeoutError &&
+            error.method === "thread/inject_items"
+          ) {
+            this.operationEpoch += 1;
+            await this.enqueueControl(
+              () =>
+                this.replaceRuntimeAfterUnsafeControl(
+                  "timed-out goal context injection",
+                ),
+            );
+          }
+          throw error;
+        }
+      }
+      // An idle thread starts its first automatic goal turn asynchronously.
+      // The goal/set response can arrive before turn/started, so keep the
+      // operation queue closed until that authoritative id is installed.
+      const previousTurnId = this.activeTurnId;
+      const goalTerminalRevision = this.goalTerminalRevision;
+      const goalBarrierReleaseRevision = this.goalBarrierReleaseRevision;
+      this.goalPendingAfterTurnId = null;
+      const barrier = this.createGoalStartBarrier(
+        this.threadId,
+        previousTurnId,
+      );
+      let goalAccepted = false;
+      try {
+        await this.request(
+          "thread/goal/set",
+          {
+            threadId: this.threadId,
+            objective,
+          },
+          REQUEST_TIMEOUT_MS,
+          () => {
+            goalAccepted = true;
+            // A cleared/complete notification can precede the response in the
+            // same stdout chunk. Do not resurrect that goal or its wrapper
+            // owner after the terminal lifecycle is already authoritative.
+            if (this.goalTerminalRevision === goalTerminalRevision) {
+              this.goalActive = true;
+              onAccepted?.();
+            }
+          },
+        );
+        if (
+          goalAccepted &&
+          this.goalActive &&
+          previousTurnId &&
+          this.activeTurnId === previousTurnId &&
+          this.goalBarrierReleaseRevision === goalBarrierReleaseRevision
+        ) {
+          // The existing turn may legitimately keep running for much longer
+          // than the idle-start timeout. Let same-owner input continue steering
+          // it, then gate the first post-completion input until the automatic
+          // goal turn (or a stable no-turn goal status) becomes authoritative.
+          barrier.cancel();
+          this.goalPendingAfterTurnId = previousTurnId;
+          return;
+        }
+        await barrier.promise;
+      } catch (error) {
+        barrier?.cancel();
+        if (
+          !goalAccepted &&
+          error instanceof CodexRequestTimeoutError &&
+          error.method === "thread/goal/set"
+        ) {
+          // A timed-out mutation has an unknown server-side outcome. Clear it
+          // best-effort, then replace the process. A clear acknowledgement is
+          // not a sufficient ordering proof if the timed-out goal/set handler
+          // can still commit afterwards.
+          let rollbackError: unknown = null;
+          try {
+            await this.request(
+              "thread/goal/clear",
+              { threadId: this.threadId },
+              SESSION_CLEANUP_TIMEOUT_MS,
+            );
+            this.goalActive = false;
+          } catch (caught) {
+            rollbackError = caught;
+          }
+          this.operationEpoch += 1;
+          await this.enqueueControl(
+            () =>
+              this.replaceRuntimeAfterUnsafeControl(
+                "timed-out goal mutation",
+              ),
+          );
+          if (rollbackError) {
+            throw new Error(
+              `${error.message}; Codex goal timeout recovery required a runtime reset: ${
+                rollbackError instanceof Error
+                  ? rollbackError.message
+                  : String(rollbackError)
+              }`,
+              { cause: error },
+            );
+          }
+        }
+        if (
+          goalAccepted &&
+          !(
+            error instanceof CodexControlInterruptionError &&
+            error.skipGoalRollback
+          )
+        ) {
+          let rollbackError: unknown = null;
+          try {
+            await this.request(
+              "thread/goal/clear",
+              { threadId: this.threadId },
+              SESSION_CLEANUP_TIMEOUT_MS,
+            );
+            this.goalActive = false;
+          } catch (caught) {
+            rollbackError = caught;
+          }
+          const goalStartTimedOut =
+            error instanceof Error &&
+            error.message ===
+              "Timed out waiting for Codex first automatic goal turn";
+          if (rollbackError || goalStartTimedOut) {
+            this.operationEpoch += 1;
+            await this.enqueueControl(
+              () =>
+                this.replaceRuntimeAfterUnsafeControl(
+                  goalStartTimedOut
+                    ? "timed-out automatic goal start"
+                    : "failed goal rollback",
+                ),
+            );
+          }
+          if (rollbackError) {
+            throw new Error(
+              `${error instanceof Error ? error.message : String(error)}; ` +
+                `Codex goal rollback failed: ${
+                  rollbackError instanceof Error
+                    ? rollbackError.message
+                    : String(rollbackError)
+                }`,
+              { cause: error },
+            );
+          }
+        }
+        throw error;
+      }
     });
   }
 
-  /**
-   * Change the reasoning effort used for the next new turn.
-   *
-   * `turn/start.effort` becomes the thread default for later turns. An active
-   * turn cannot be mutated, so a change made while Codex is working applies
-   * after that turn completes.
-   */
-  setEffort(value: string): void {
+  /** Persist the reasoning effort used by subsequent explicit and goal turns. */
+  async setEffort(value: string): Promise<void> {
     const normalized = normalizeReasoningEffort(value);
     if (!normalized) {
       throw new Error(`지원하지 않는 reasoning effort: ${value}`);
     }
-    if (
-      this.supportedReasoningEfforts.length > 0 &&
-      !this.supportedReasoningEfforts.includes(normalized)
-    ) {
-      throw new Error(
-        `${this.model || "현재 모델"}은 ${normalized} effort를 지원하지 않습니다`,
-      );
+    try {
+      await this.enqueue(async () => {
+        if (!this.threadId) throw new Error("Codex thread is not ready");
+        if (
+          this.reasoningEffortsByModel.has(this.model) &&
+          !this.supportedReasoningEfforts.includes(normalized)
+        ) {
+          throw new Error(
+            `${this.model || "현재 모델"}은 ${normalized} effort를 지원하지 않습니다`,
+          );
+        }
+        await this.request("thread/settings/update", {
+          threadId: this.threadId,
+          effort: normalized,
+        });
+        // Update only after Codex accepts the mutation. A matching
+        // thread/settings/updated notification may have already done this.
+        this.effort = normalized;
+        this.recordEvent(`reasoning effort changed: ${normalized}`);
+      });
+    } catch (error) {
+      if (
+        error instanceof CodexRequestTimeoutError &&
+        error.method === "thread/settings/update"
+      ) {
+        this.operationEpoch += 1;
+        await this.enqueueControl(
+          () =>
+            this.replaceRuntimeAfterUnsafeControl(
+              "timed-out thread settings mutation",
+            ),
+        );
+      }
+      throw error;
     }
-    this.effort = normalized;
-    this.recordEvent(`reasoning effort changed: ${normalized}`);
   }
 
   /**
@@ -921,13 +1556,14 @@ export class CodexAppServer extends EventEmitter {
    */
   effortForModel(model: string, requested: string): string {
     const supported = this.reasoningEffortsByModel.get(model);
-    if (!requested || !supported || supported.length === 0) return requested;
-    return supported.includes(requested) ? requested : "";
+    if (!requested || !this.reasoningEffortsByModel.has(model)) return requested;
+    return supported?.includes(requested) ? requested : "";
   }
 
   /**
    * Capture the current Codex transcript. The default mirrors Claude's
-   * 50-line viewport; `all` returns the complete current-thread transcript.
+   * 50-line viewport; `all` reads the newest available current-thread history
+   * through Codex's paginated experimental API, bounded to the capture budget.
    */
   async captureStatus(all = false): Promise<string> {
     const header = [
@@ -941,41 +1577,136 @@ export class CodexAppServer extends EventEmitter {
     const threadId = this.threadId;
     if (!threadId) return header;
 
-    try {
-      const result = (await this.request("thread/read", {
-        threadId,
-        includeTurns: true,
-      })) as ThreadReadResult;
-      const transcript = renderThreadTranscript(result);
+    if (!all) {
       const live = this.renderLiveCapture();
-      const body = [
+      const recent = this.recentCaptureLines
+        .slice(-CAPTURE_VIEWPORT_LINES)
+        .join("\n");
+      const body = appendBoundedCaptureText(
+        recent,
+        live,
+        MAX_CAPTURE_BODY_CHARS,
+      ) || "(no recent transcript items)";
+      return `${header}\n\n${body}`.trimEnd();
+    }
+
+    try {
+      const transcript = await this.readPaginatedThreadTranscript(threadId);
+      const live = this.renderLiveCapture();
+      const body = appendBoundedCaptureText(
         transcript === "(no transcript yet)" && live ? "" : transcript,
         live,
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-      const visible = all
-        ? body
-        : body.split("\n").slice(-CAPTURE_VIEWPORT_LINES).join("\n");
-      return `${header}\n\n${visible}`.trimEnd();
+        MAX_CAPTURE_BODY_CHARS,
+      );
+      return `${header}\n\n${body}`.trimEnd();
     } catch (error) {
-      this.options.onError?.("Could not read Codex transcript", error);
-      const events = all ? this.recentEvents : this.recentEvents.slice(-12);
-      const live = this.renderLiveCapture();
-      return [
-        header,
-        "",
-        "(transcript unavailable; showing lifecycle events)",
-        ...events,
-        ...(live ? ["", live] : []),
-      ].join("\n").trimEnd();
+      if (isMethodNotFoundError(error)) {
+        this.options.onDebug?.(
+          "Codex thread/turns/list is unavailable; using the bounded notification cache",
+        );
+      } else {
+        this.options.onError?.("Could not read Codex transcript", error);
+      }
+      return this.renderCaptureFallback(header);
     }
+  }
+
+  private async readPaginatedThreadTranscript(
+    threadId: string,
+  ): Promise<string> {
+    let cursor: string | undefined;
+    let transcript = "";
+    const seenCursors = new Set<string>();
+
+    for (let page = 0; page < MAX_CAPTURE_PAGE_COUNT; page++) {
+      const result = (await this.request("thread/turns/list", {
+        threadId,
+        ...(cursor ? { cursor } : {}),
+        limit: THREAD_TURNS_PAGE_LIMIT,
+        sortDirection: "desc",
+        itemsView: "full",
+      })) as ThreadTurnsListResult;
+      const turns = Array.isArray(result.data) ? result.data : [];
+      let reachedBudget = false;
+
+      // The API returns newest-first. Prepending each successively older turn
+      // preserves terminal transcript order while keeping the newest suffix
+      // when the bounded helper has to truncate.
+      for (const turn of turns) {
+        if (!turn || typeof turn !== "object") continue;
+        const section = renderThreadTurn(turn, MAX_CAPTURE_BODY_CHARS);
+        if (!section) continue;
+        const wouldExceed =
+          section.length +
+            (transcript ? 2 : 0) +
+            transcript.length >
+          MAX_CAPTURE_BODY_CHARS;
+        transcript = appendBoundedCaptureText(
+          section,
+          transcript,
+          MAX_CAPTURE_BODY_CHARS,
+        );
+        if (wouldExceed || transcript.length >= MAX_CAPTURE_BODY_CHARS) {
+          reachedBudget = true;
+          break;
+        }
+      }
+      if (reachedBudget) break;
+
+      const nextCursor =
+        typeof result.nextCursor === "string" && result.nextCursor
+          ? result.nextCursor
+          : null;
+      if (!nextCursor) break;
+      if (seenCursors.has(nextCursor)) {
+        this.options.onDebug?.(
+          `Codex thread/turns/list repeated cursor ${nextCursor}; stopping capture pagination`,
+        );
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+
+    return transcript || "(no transcript yet)";
+  }
+
+  private renderCaptureFallback(header: string): string {
+    const marker =
+      "(transcript unavailable; showing bounded notification history)";
+    const cacheBudget = Math.max(
+      0,
+      MAX_CAPTURE_BODY_CHARS - marker.length - 2,
+    );
+    let cache = "";
+    cache = appendBoundedCaptureText(
+      cache,
+      this.recentEvents.join("\n"),
+      cacheBudget,
+    );
+    cache = appendBoundedCaptureText(
+      cache,
+      this.recentCaptureLines.join("\n"),
+      cacheBudget,
+    );
+    cache = appendBoundedCaptureText(
+      cache,
+      this.renderLiveCapture(),
+      cacheBudget,
+    );
+    const body = cache ? `${marker}\n\n${cache}` : marker;
+    return `${header}\n\n${body}`.trimEnd();
   }
 
   private async startThread(): Promise<void> {
     if (!this.initialized) throw new Error("Codex app-server is not initialized");
     this.activeTurnId = null;
+    this.goalActive = false;
+    this.goalPendingAfterTurnId = null;
+    this.completedTurnIds.clear();
+    this.abortActiveServerRequests();
     this.liveCaptureItems.clear();
+    this.recentCaptureLines.length = 0;
     const params: Record<string, unknown> = {
       cwd: this.cwd,
       serviceName: "compact_bot",
@@ -990,6 +1721,11 @@ export class CodexAppServer extends EventEmitter {
     if (this.options.dangerouslySkipPermissions) {
       params.approvalPolicy = "never";
       params.sandbox = "danger-full-access";
+    } else {
+      // Do not inherit a user-level full-access policy into a chat-driven
+      // agent. CONFIG_HOME is outside the workspace and contains platform
+      // credentials; the explicit sandbox keeps it unreadable by default.
+      params.sandbox = "workspace-write";
     }
 
     const result = (await this.request("thread/start", params)) as ThreadStartResult;
@@ -997,17 +1733,17 @@ export class CodexAppServer extends EventEmitter {
     if (!threadId) throw new Error("thread/start returned no thread id");
     this.threadId = threadId;
     this.recentEvents.length = 0;
-    this.model = result.model ?? this.model;
-    this.effort = result.reasoningEffort ?? this.effort;
+    if (typeof result.model === "string") this.model = result.model;
+    if (typeof result.cwd === "string") this.cwd = result.cwd;
+    if (Object.prototype.hasOwnProperty.call(result, "reasoningEffort")) {
+      this.effort =
+        typeof result.reasoningEffort === "string"
+          ? result.reasoningEffort
+          : "";
+    }
     await this.refreshModelCapabilities();
     this.recordEvent(`thread started: ${threadId}`);
-    this.emit("thread", {
-      threadId,
-      model: this.model,
-      effort: this.effort,
-      availableEfforts: this.availableEfforts,
-      cwd: this.cwd,
-    });
+    this.emit("thread", this.stateSnapshot());
   }
 
   private async cleanupCurrentThread(): Promise<void> {
@@ -1022,6 +1758,7 @@ export class CodexAppServer extends EventEmitter {
         { threadId },
         SESSION_CLEANUP_TIMEOUT_MS,
       );
+      this.goalActive = false;
     } catch (error) {
       this.options.onDebug?.(
         `Could not clear previous Codex goal: ${String(error)}`,
@@ -1057,6 +1794,7 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private async refreshModelCapabilities(): Promise<void> {
+    const generation = this.processGeneration;
     try {
       const models: NonNullable<ModelListResult["data"]> = [];
       const seenCursors = new Set<string>();
@@ -1066,6 +1804,7 @@ export class CodexAppServer extends EventEmitter {
           includeHidden: true,
           ...(cursor ? { cursor } : {}),
         })) as ModelListResult;
+        if (generation !== this.processGeneration) return;
         models.push(...(result.data ?? []));
         const nextCursor = result.nextCursor ?? null;
         if (!nextCursor || seenCursors.has(nextCursor)) {
@@ -1076,6 +1815,7 @@ export class CodexAppServer extends EventEmitter {
         }
       } while (cursor);
 
+      if (generation !== this.processGeneration) return;
       this.reasoningEffortsByModel.clear();
       for (const entry of models) {
         const efforts = [
@@ -1088,13 +1828,20 @@ export class CodexAppServer extends EventEmitter {
         if (entry.id) this.reasoningEffortsByModel.set(entry.id, efforts);
         if (entry.model) this.reasoningEffortsByModel.set(entry.model, efforts);
       }
-      this.supportedReasoningEfforts = [
-        ...(this.reasoningEffortsByModel.get(this.model) ?? []),
-      ];
+      this.updateSupportedEffortsFromCache();
     } catch (error) {
+      if (generation !== this.processGeneration) return;
+      if (error instanceof CodexControlInterruptionError) {
+        // A priority control command may abandon the background model/list
+        // request. Keep the last authoritative cache until the replacement
+        // thread refreshes it instead of treating cancellation as an old
+        // app-server that lacks model/list.
+        return;
+      }
       // Older app-server versions may not expose model/list. Effort still
       // works through turn/start; only model-specific command validation is
       // unavailable in that case.
+      this.reasoningEffortsByModel.clear();
       this.supportedReasoningEfforts = [];
       this.options.onDebug?.(
         `Could not load Codex reasoning efforts: ${String(error)}`,
@@ -1103,7 +1850,19 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
-    const run = this.operationQueue.then(operation);
+    const epoch = this.operationEpoch;
+    const run = this.operationQueue.then(async () => {
+      // A recovery command that arrived behind this work has priority. Waiting
+      // for the current control tail prevents newly-unblocked normal work from
+      // racing an interrupt or session replacement.
+      await this.controlQueue;
+      if (epoch !== this.operationEpoch) {
+        throw new Error(
+          "Codex session changed before the queued operation could run",
+        );
+      }
+      return await operation();
+    });
     this.operationQueue = run.then(
       () => undefined,
       (error) => {
@@ -1113,18 +1872,317 @@ export class CodexAppServer extends EventEmitter {
     return run;
   }
 
+  private enqueueControl<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.controlQueue.then(operation);
+    this.controlQueue = run.then(
+      () => undefined,
+      (error) => {
+        this.options.onError?.("Codex control operation failed", error);
+      },
+    );
+    return run;
+  }
+
+  private hasPendingMethod(methods: string[]): boolean {
+    const candidates = new Set(methods);
+    return [...this.pending.values()].some((request) =>
+      candidates.has(request.method)
+    );
+  }
+
+  private hasCompactionBarrier(): boolean {
+    return [...this.notificationWaiters].some(
+      (waiter) => waiter.label === "context compaction turn",
+    );
+  }
+
+  private hasGoalStartBarrier(): boolean {
+    return [...this.notificationWaiters].some(
+      (waiter) => waiter.label === "first automatic goal turn",
+    );
+  }
+
+  private async awaitDeferredGoalStartIfNeeded(): Promise<void> {
+    const previousTurnId = this.goalPendingAfterTurnId;
+    if (!previousTurnId) return;
+    if (this.activeTurnId === previousTurnId) return;
+    if (this.activeTurnId) {
+      this.goalPendingAfterTurnId = null;
+      return;
+    }
+    if (!this.threadId) throw new Error("Codex thread is not ready");
+
+    const barrier = this.createGoalStartBarrier(
+      this.threadId,
+      previousTurnId,
+    );
+    try {
+      await barrier.promise;
+    } finally {
+      if (this.goalPendingAfterTurnId === previousTurnId) {
+        this.goalPendingAfterTurnId = null;
+      }
+    }
+  }
+
+  private async replaceRuntimeAfterUnsafeControl(reason: string): Promise<void> {
+    this.options.onDebug?.(
+      `Replacing Codex app-server after unsafe ${reason} recovery`,
+    );
+    this.emit("resetting", { reason });
+    this.restarting = true;
+    try {
+      await this.stop();
+      await this.start();
+      this.emit("reset", { reason });
+    } catch (error) {
+      await this.stop().catch(() => {});
+      this.restarting = false;
+      this.emit("exit", { code: null, signal: null, expected: false });
+      throw error;
+    } finally {
+      this.restarting = false;
+    }
+  }
+
+  /**
+   * Release lifecycle barriers and request promises owned by normal work.
+   *
+   * JSON-RPC has no generic client-side cancellation for these calls. Removing
+   * them from `pending` makes a late response harmless while allowing a
+   * recovery request to use the same live app-server immediately.
+   */
+  private abandonInFlightOperations(
+    error: Error,
+    abortServerRequests = false,
+    pendingMethods: ReadonlySet<string> | "all" = "all",
+  ): void {
+    this.rejectNotificationWaiters(error);
+    for (const [id, request] of this.pending) {
+      if (
+        pendingMethods !== "all" &&
+        !pendingMethods.has(request.method)
+      ) {
+        continue;
+      }
+      clearTimeout(request.timer);
+      request.reject(error);
+      this.pending.delete(id);
+    }
+    if (abortServerRequests) this.abortActiveServerRequests();
+  }
+
+  private createGoalStartBarrier(
+    threadId: string,
+    previousTurnId: string | null,
+  ): NotificationBarrier {
+    return this.createNotificationBarrier(
+      "first automatic goal turn",
+      GOAL_START_TIMEOUT_MS,
+      (method, params) => {
+        if (params.threadId !== threadId) return false;
+        if (method === "turn/started") {
+          const turnId =
+            typeof (params.turn as { id?: unknown } | undefined)?.id === "string"
+              ? (params.turn as { id: string }).id
+              : null;
+          return (
+            turnId !== null &&
+            turnId !== previousTurnId &&
+            !this.completedTurnIds.has(turnId)
+          );
+        }
+        if (method === "thread/goal/cleared") {
+          return true;
+        }
+        if (method === "thread/goal/updated") {
+          const status =
+            typeof (params.goal as { status?: unknown } | undefined)?.status ===
+                "string"
+              ? (params.goal as { status: string }).status
+              : "";
+          if (
+            [
+              "complete",
+              "completed",
+              "paused",
+              "blocked",
+              "usageLimited",
+              "budgetLimited",
+            ]
+              .includes(status)
+          ) {
+            // These are stable goal states with no guaranteed immediate turn.
+            // Releasing the queue is safe; paused/limited goals remain owned
+            // and can later resume.
+            return true;
+          }
+          if (["failed", "cancelled", "canceled"].includes(status)) {
+            throw new Error(
+              `Codex goal ${status} before its first automatic turn`,
+            );
+          }
+        }
+        return false;
+      },
+    );
+  }
+
+  private createCompactionBarrier(threadId: string): NotificationBarrier {
+    let compactionTurnId: string | null = null;
+    return this.createNotificationBarrier(
+      "context compaction turn",
+      COMPACTION_TIMEOUT_MS,
+      (method, params) => {
+        if (params.threadId !== threadId) return false;
+        const notificationTurnId =
+          typeof params.turnId === "string" ? params.turnId : null;
+        const item =
+          params.item && typeof params.item === "object"
+            ? params.item as Record<string, unknown>
+            : null;
+        if (
+          (method === "item/started" || method === "item/completed") &&
+          item?.type === "contextCompaction" &&
+          notificationTurnId
+        ) {
+          compactionTurnId = notificationTurnId;
+          return false;
+        }
+        if (method === "thread/compacted" && notificationTurnId) {
+          compactionTurnId = notificationTurnId;
+          return false;
+        }
+        if (method !== "turn/completed" || !compactionTurnId) return false;
+        const turn =
+          params.turn && typeof params.turn === "object"
+            ? params.turn as Record<string, unknown>
+            : {};
+        if (turn.id !== compactionTurnId) return false;
+        if (turn.status !== "completed") {
+          const detail =
+            turn.error && typeof turn.error === "object" &&
+                typeof (turn.error as Record<string, unknown>).message === "string"
+              ? `: ${(turn.error as Record<string, unknown>).message}`
+              : "";
+          throw new Error(
+            `Codex context compaction ${String(turn.status ?? "failed")}${detail}`,
+          );
+        }
+        return true;
+      },
+    );
+  }
+
+  private createTurnCompletionBarrier(
+    threadId: string,
+    turnId: string,
+  ): NotificationBarrier {
+    return this.createNotificationBarrier(
+      `turn ${turnId} completion after interrupt`,
+      SESSION_CLEANUP_TIMEOUT_MS,
+      (method, params) => {
+        if (method !== "turn/completed" || params.threadId !== threadId) {
+          return false;
+        }
+        const completedTurn =
+          params.turn && typeof params.turn === "object"
+            ? params.turn as Record<string, unknown>
+            : {};
+        return completedTurn.id === turnId;
+      },
+    );
+  }
+
+  private createNotificationBarrier(
+    label: string,
+    timeoutMs: number,
+    predicate: NotificationWaiter["predicate"],
+  ): NotificationBarrier {
+    const generation = this.processGeneration;
+    let settled = false;
+    let waiter: NotificationWaiter;
+    let resolvePromise!: () => void;
+    let rejectPromise!: (error: Error) => void;
+    const promise = new Promise<void>((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    // Goal setup intentionally awaits the request response before deciding
+    // whether a failed barrier needs a server-side rollback. Mark the barrier
+    // handled immediately so a simultaneous app-server exit cannot surface as
+    // an unhandled rejection while the request promise is still unwinding.
+    void promise.catch(() => {});
+    const cleanup = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(waiter.timer);
+      this.notificationWaiters.delete(waiter);
+    };
+    waiter = {
+      generation,
+      label,
+      predicate,
+      resolve: () => {
+        cleanup();
+        resolvePromise();
+      },
+      reject: (error) => {
+        cleanup();
+        rejectPromise(error);
+      },
+      timer: setTimeout(() => {
+        waiter.reject(new Error(`Timed out waiting for Codex ${label}`));
+      }, timeoutMs),
+    };
+    this.notificationWaiters.add(waiter);
+    return {
+      promise,
+      cancel: () => {
+        cleanup();
+        resolvePromise();
+      },
+    };
+  }
+
+  private resolveNotificationWaiters(
+    method: string,
+    params: Record<string, unknown>,
+  ): void {
+    for (const waiter of [...this.notificationWaiters]) {
+      if (waiter.generation !== this.processGeneration) {
+        waiter.reject(new Error("Codex app-server generation changed"));
+        continue;
+      }
+      try {
+        if (waiter.predicate(method, params)) waiter.resolve(true);
+      } catch (error) {
+        waiter.reject(
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+    }
+  }
+
+  private rejectNotificationWaiters(error: Error): void {
+    for (const waiter of [...this.notificationWaiters]) {
+      waiter.reject(error);
+    }
+  }
+
   private request(
     method: string,
     params: Record<string, unknown>,
     timeoutMs = REQUEST_TIMEOUT_MS,
+    onSuccess?: (value: unknown) => void,
   ): Promise<unknown> {
     const id = this.nextRequestId++;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`Codex request timed out: ${method}`));
+        reject(new CodexRequestTimeoutError(method));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer, onSuccess });
       try {
         this.send({ method, id, params });
       } catch (error) {
@@ -1133,6 +2191,60 @@ export class CodexAppServer extends EventEmitter {
         reject(error);
       }
     });
+  }
+
+  private abortActiveServerRequests(): void {
+    for (const request of this.activeServerRequests.values()) {
+      request.controller.abort();
+    }
+    this.activeServerRequests.clear();
+  }
+
+  private async askServerQuestion(
+    requestId: JsonRpcId,
+    generation: number,
+    question: CodexQuestion,
+    timeoutMs: number | null = null,
+  ): Promise<string | null | typeof SERVER_REQUEST_RESOLVED> {
+    const active = this.activeServerRequests.get(requestId);
+    if (
+      !active ||
+      active.generation !== generation ||
+      active.controller.signal.aborted
+    ) {
+      return SERVER_REQUEST_RESOLVED;
+    }
+    if (timeoutMs !== null && timeoutMs <= 0) return null;
+
+    const signal = active.controller.signal;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let abortListener: (() => void) | null = null;
+    const resolved = new Promise<typeof SERVER_REQUEST_RESOLVED>((resolve) => {
+      abortListener = () => resolve(SERVER_REQUEST_RESOLVED);
+      signal.addEventListener("abort", abortListener, { once: true });
+      if (signal.aborted) resolve(SERVER_REQUEST_RESOLVED);
+    });
+    const answer = Promise.resolve().then(() =>
+      this.options.onQuestion({
+        ...question,
+        requestId,
+        signal,
+      })
+    );
+    const timeout = timeoutMs === null
+      ? null
+      : new Promise<null>((resolve) => {
+          timer = setTimeout(() => resolve(null), timeoutMs);
+        });
+
+    try {
+      return await Promise.race(
+        timeout ? [answer, resolved, timeout] : [answer, resolved],
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (abortListener) signal.removeEventListener("abort", abortListener);
+    }
   }
 
   private notify(method: string, params: Record<string, unknown>): void {
@@ -1162,6 +2274,27 @@ export class CodexAppServer extends EventEmitter {
       throw new Error("Codex app-server stdin is not writable");
     }
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private detachUnresponsiveChild(
+    child: ChildProcessWithoutNullStreams,
+    error: Error,
+  ): void {
+    if (this.child !== child) return;
+    // Fence every late stdout/exit callback from the hung generation before a
+    // replacement is allowed to start.
+    this.processGeneration += 1;
+    child.stdout.removeAllListeners("data");
+    this.child = null;
+    this.initialized = false;
+    this.threadId = null;
+    this.activeTurnId = null;
+    this.goalActive = false;
+    this.goalPendingAfterTurnId = null;
+    this.completedTurnIds.clear();
+    this.liveCaptureItems.clear();
+    this.recentCaptureLines.length = 0;
+    this.abandonInFlightOperations(error, true);
   }
 
   private terminateProcessTree(
@@ -1203,11 +2336,68 @@ export class CodexAppServer extends EventEmitter {
 
   private handleStdout(chunk: string, generation: number): void {
     if (generation !== this.processGeneration) return;
-    this.stdoutBuffer += chunk;
-    let newline: number;
-    while ((newline = this.stdoutBuffer.indexOf("\n")) !== -1) {
-      const line = this.stdoutBuffer.slice(0, newline);
-      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+    let offset = 0;
+
+    while (offset < chunk.length) {
+      if (this.discardedProtocolLine) {
+        const newline = chunk.indexOf("\n", offset);
+        if (newline === -1) {
+          this.discardedProtocolLine.length += chunk.length - offset;
+          return;
+        }
+        this.discardedProtocolLine.length += newline - offset;
+        this.discardedProtocolLine = null;
+        offset = newline + 1;
+        continue;
+      }
+
+      const newline = chunk.indexOf("\n", offset);
+      if (newline === -1) {
+        const additionLength = chunk.length - offset;
+        const lineLength = this.stdoutBuffer.length + additionLength;
+        if (lineLength > MAX_APP_SERVER_JSON_LINE_CHARS) {
+          const bufferedPrefix = this.stdoutBuffer.slice(
+            0,
+            MAX_PROTOCOL_ID_PREFIX_CHARS,
+          );
+          const prefixRoom = Math.max(
+            0,
+            MAX_PROTOCOL_ID_PREFIX_CHARS - bufferedPrefix.length,
+          );
+          const prefix = `${bufferedPrefix}${
+            chunk.slice(offset, offset + prefixRoom)
+          }`;
+          this.beginDiscardingOversizedProtocolLine(prefix, lineLength);
+          this.stdoutBuffer = "";
+        } else {
+          this.stdoutBuffer += chunk.slice(offset);
+        }
+        return;
+      }
+
+      const fragmentLength = newline - offset;
+      const lineLength = this.stdoutBuffer.length + fragmentLength;
+      if (lineLength > MAX_APP_SERVER_JSON_LINE_CHARS) {
+        const bufferedPrefix = this.stdoutBuffer.slice(
+          0,
+          MAX_PROTOCOL_ID_PREFIX_CHARS,
+        );
+        const prefixRoom = Math.max(
+          0,
+          MAX_PROTOCOL_ID_PREFIX_CHARS - bufferedPrefix.length,
+        );
+        const prefix = `${bufferedPrefix}${
+          chunk.slice(offset, Math.min(newline, offset + prefixRoom))
+        }`;
+        this.rejectOversizedProtocolLine(prefix, lineLength);
+        this.stdoutBuffer = "";
+        offset = newline + 1;
+        continue;
+      }
+
+      const line = `${this.stdoutBuffer}${chunk.slice(offset, newline)}`;
+      this.stdoutBuffer = "";
+      offset = newline + 1;
       if (!line.trim()) continue;
       try {
         this.handleMessage(JSON.parse(line) as JsonRpcMessage, generation);
@@ -1215,6 +2405,36 @@ export class CodexAppServer extends EventEmitter {
         this.options.onError?.(`Invalid Codex app-server JSON: ${line.slice(0, 300)}`, error);
       }
     }
+  }
+
+  private beginDiscardingOversizedProtocolLine(
+    prefix: string,
+    length: number,
+  ): void {
+    const requestId = this.rejectOversizedProtocolLine(prefix, length);
+    this.discardedProtocolLine = { length, requestId };
+  }
+
+  private rejectOversizedProtocolLine(
+    prefix: string,
+    length: number,
+  ): JsonRpcId | undefined {
+    const error = new Error(
+      `Codex app-server JSON line exceeded ${
+        MAX_APP_SERVER_JSON_LINE_CHARS
+      } characters (${length})`,
+    );
+    this.options.onError?.("Codex app-server protocol line was too large", error);
+    const requestId = jsonRpcIdFromProtocolPrefix(prefix);
+    if (requestId !== undefined) {
+      const pending = this.pending.get(requestId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        this.pending.delete(requestId);
+        pending.reject(error);
+      }
+    }
+    return requestId;
   }
 
   private handleMessage(message: JsonRpcMessage, generation: number): void {
@@ -1233,6 +2453,13 @@ export class CodexAppServer extends EventEmitter {
           ),
         );
       } else {
+        try {
+          pending.onSuccess?.(message.result);
+        } catch (error) {
+          // The server already accepted the operation. Do not retry the user
+          // input and create a duplicate turn because a local observer failed.
+          this.options.onError?.("Codex response observer failed", error);
+        }
         pending.resolve(message.result);
       }
       return;
@@ -1253,9 +2480,100 @@ export class CodexAppServer extends EventEmitter {
       typeof params.threadId === "string" ? params.threadId : null;
     if (notificationThreadId && notificationThreadId !== this.threadId) return;
 
-    if (method === "turn/started") {
+    if (method === "serverRequest/resolved") {
+      const requestId =
+        typeof params.requestId === "string" ||
+          typeof params.requestId === "number"
+          ? params.requestId
+          : undefined;
+      const active = requestId === undefined
+        ? undefined
+        : this.activeServerRequests.get(requestId);
+      active?.controller.abort();
+      this.recordEvent(
+        `server request resolved: ${requestId ?? "unknown"}`,
+      );
+      this.emit("serverRequestResolved", {
+        requestId,
+        threadId: notificationThreadId ?? active?.threadId,
+        method: active?.method,
+      });
+    } else if (method === "thread/goal/cleared") {
+      this.goalTerminalRevision += 1;
+      this.goalBarrierReleaseRevision += 1;
+      this.goalActive = false;
+      this.goalPendingAfterTurnId = null;
+      this.recordEvent("goal cleared");
+    } else if (method === "thread/goal/updated") {
+      const goal =
+        params.goal && typeof params.goal === "object"
+          ? params.goal as Record<string, unknown>
+          : {};
+      if (
+        ["complete", "completed", "failed", "cancelled", "canceled"]
+          .includes(String(goal.status ?? ""))
+      ) {
+        this.goalTerminalRevision += 1;
+        this.goalBarrierReleaseRevision += 1;
+        this.goalActive = false;
+        this.goalPendingAfterTurnId = null;
+      } else if (
+        ["active", "paused", "blocked", "usageLimited", "budgetLimited"]
+          .includes(String(goal.status ?? ""))
+      ) {
+        this.goalActive = true;
+        if (
+          ["paused", "blocked", "usageLimited", "budgetLimited"]
+            .includes(String(goal.status ?? ""))
+        ) {
+          this.goalBarrierReleaseRevision += 1;
+          this.goalPendingAfterTurnId = null;
+        }
+      }
+      this.recordEvent(
+        `goal ${typeof goal.status === "string" ? goal.status : "updated"}`,
+      );
+    } else if (method === "model/rerouted") {
+      const fromModel =
+        typeof params.fromModel === "string" ? params.fromModel : this.model;
+      const toModel =
+        typeof params.toModel === "string" ? params.toModel : "";
+      if (toModel) {
+        // A reroute reports the model that served this turn (for example after
+        // a cyber-safety fallback). It does not mutate the thread's requested
+        // model; sticky changes arrive separately as thread/settings/updated.
+        this.recordEvent(`model rerouted: ${fromModel} -> ${toModel}`);
+      }
+    } else if (method === "thread/settings/updated") {
+      const settings =
+        params.threadSettings && typeof params.threadSettings === "object"
+          ? params.threadSettings as Record<string, unknown>
+          : {};
+      if (typeof settings.model === "string") this.model = settings.model;
+      if (typeof settings.cwd === "string") this.cwd = settings.cwd;
+      if (Object.prototype.hasOwnProperty.call(settings, "effort")) {
+        this.effort =
+          typeof settings.effort === "string" ? settings.effort : "";
+      }
+      this.updateSupportedEffortsFromCache();
+      this.recordEvent(
+        `thread settings updated: model=${this.model || "default"}, effort=${this.effort || "default"}, cwd=${this.cwd}`,
+      );
+      this.refreshCapabilitiesAfterStateChange(this.model);
+    } else if (method === "turn/started") {
       const turn = params.turn as { id?: string } | undefined;
       if (
+        turn?.id &&
+        this.goalPendingAfterTurnId &&
+        turn.id !== this.goalPendingAfterTurnId
+      ) {
+        this.goalPendingAfterTurnId = null;
+      }
+      if (turn?.id && this.completedTurnIds.has(turn.id)) {
+        this.options.onDebug?.(
+          `Ignoring completed start for Codex turn ${turn.id}`,
+        );
+      } else if (
         turn?.id &&
         this.activeTurnId &&
         turn.id !== this.activeTurnId
@@ -1270,6 +2588,9 @@ export class CodexAppServer extends EventEmitter {
       } else {
         this.activeTurnId = turn?.id ?? this.activeTurnId;
         this.liveCaptureItems.clear();
+        this.appendRecentCaptureText(
+          `── TURN ${this.activeTurnId ?? "unknown"} ──`,
+        );
         this.recordEvent(`turn started: ${this.activeTurnId ?? "unknown"}`);
       }
     } else if (method === "turn/completed") {
@@ -1278,16 +2599,24 @@ export class CodexAppServer extends EventEmitter {
         status?: string;
         error?: { message?: string } | null;
       } | undefined;
+      if (turn?.id) this.rememberCompletedTurn(turn.id);
       this.recordEvent(
         `turn ${turn?.status ?? "completed"}: ${turn?.id ?? this.activeTurnId ?? "unknown"}`,
       );
-      if (turn?.error?.message) this.recordEvent(`error: ${turn.error.message}`);
+      if (turn?.error?.message) {
+        this.recordEvent(`error: ${turn.error.message}`);
+        this.appendRecentCaptureText(`ERROR\n${turn.error.message}`);
+      }
       if (!turn?.id || turn.id === this.activeTurnId) {
         this.activeTurnId = null;
         this.liveCaptureItems.clear();
-      } else {
+      } else if (this.activeTurnId) {
         this.options.onDebug?.(
           `Ignoring stale completion for Codex turn ${turn.id}; active turn is ${this.activeTurnId ?? "none"}`,
+        );
+      } else {
+        this.options.onDebug?.(
+          `Codex turn ${turn.id} completed before it became active locally`,
         );
       }
     } else if (method === "item/completed") {
@@ -1298,6 +2627,11 @@ export class CodexAppServer extends EventEmitter {
         status?: string;
       } | undefined;
       if (item?.id) this.clearLiveCaptureItem(item.id);
+      if (item) {
+        this.appendRecentCaptureText(
+          renderThreadItem(item as Record<string, unknown>),
+        );
+      }
       if (item?.type && item.type !== "reasoning") {
         const detail = item.tool ? ` ${item.tool}` : "";
         this.recordEvent(`${item.type}${detail}${item.status ? `: ${item.status}` : ""}`);
@@ -1335,7 +2669,92 @@ export class CodexAppServer extends EventEmitter {
       this.recordEvent(`${method}: ${text}`);
       this.options.onError?.(`Codex ${method}: ${text}`);
     }
+    this.resolveNotificationWaiters(method, params);
     this.emit("notification", { method, params });
+  }
+
+  private rememberCompletedTurn(turnId: string): void {
+    this.completedTurnIds.add(turnId);
+    while (this.completedTurnIds.size > MAX_COMPLETED_TURN_IDS) {
+      const oldest = this.completedTurnIds.values().next().value;
+      if (typeof oldest !== "string") break;
+      this.completedTurnIds.delete(oldest);
+    }
+  }
+
+  private updateSupportedEffortsFromCache(): void {
+    this.supportedReasoningEfforts = [
+      ...(this.reasoningEffortsByModel.get(this.model) ?? []),
+    ];
+  }
+
+  private refreshCapabilitiesAfterStateChange(
+    expectedModel: string,
+  ): void {
+    // Model/cwd/effort are already authoritative at notification time. Publish
+    // them immediately, then publish once more after the model catalog refresh
+    // so clients also receive the final effort capability list.
+    this.emit("state", this.stateSnapshot());
+    void this.refreshModelCapabilities().then(() => {
+      if (this.model !== expectedModel) return;
+      this.emit("state", this.stateSnapshot());
+    });
+  }
+
+  private stateSnapshot(): {
+    threadId: string | null;
+    model: string;
+    effort: string;
+    availableEfforts: string[];
+    cwd: string;
+  } {
+    return {
+      threadId: this.threadId,
+      model: this.model,
+      effort: this.effort,
+      availableEfforts: this.availableEfforts,
+      cwd: this.cwd,
+    };
+  }
+
+  private appendRecentCaptureText(text: string): void {
+    if (!text) return;
+    for (const rawLine of text.split("\n")) {
+      const prefix = `${CAPTURE_TRUNCATION_NOTICE} `;
+      const line = rawLine.length < MAX_CAPTURE_BODY_CHARS
+        ? rawLine
+        : `${prefix}${
+          rawLine.slice(
+            -(MAX_CAPTURE_BODY_CHARS - prefix.length - 1),
+          )
+        }`;
+      this.recentCaptureLines.push(line);
+    }
+    while (this.recentCaptureLines.length > MAX_CAPTURE_HISTORY_LINES) {
+      this.recentCaptureLines.shift();
+    }
+    let totalChars = this.recentCaptureLines.reduce(
+      (total, line) => total + line.length + 1,
+      0,
+    );
+    while (
+      totalChars > MAX_CAPTURE_BODY_CHARS &&
+      this.recentCaptureLines.length > 1
+    ) {
+      const removed = this.recentCaptureLines.shift();
+      totalChars -= (removed?.length ?? 0) + 1;
+    }
+    if (
+      totalChars > MAX_CAPTURE_BODY_CHARS &&
+      this.recentCaptureLines.length === 1
+    ) {
+      const prefix = `${CAPTURE_TRUNCATION_NOTICE} `;
+      this.recentCaptureLines[0] = `${prefix}${
+        this.recentCaptureLines[0].slice(
+          -(MAX_CAPTURE_BODY_CHARS - prefix.length - 1),
+        )
+      }`;
+    }
   }
 
   private recordLiveCaptureDelta(
@@ -1401,6 +2820,13 @@ export class CodexAppServer extends EventEmitter {
       turnId: typeof params.turnId === "string" ? params.turnId : undefined,
       itemId: typeof params.itemId === "string" ? params.itemId : undefined,
     };
+    const activeRequest: ActiveServerRequest = {
+      generation,
+      method,
+      threadId: requestThreadId,
+      controller: new AbortController(),
+    };
+    this.activeServerRequests.set(id, activeRequest);
 
     try {
       switch (method) {
@@ -1453,26 +2879,13 @@ export class CodexAppServer extends EventEmitter {
               question: question.question ?? "",
               options,
             };
-            let rawAnswer: string | null;
-            if (remainingMs === null) {
-              rawAnswer = await this.options.onQuestion(uiQuestion);
-            } else if (remainingMs <= 0) {
-              rawAnswer = null;
-            } else {
-              rawAnswer = await new Promise<string | null>((resolve, reject) => {
-                const timer = setTimeout(() => resolve(null), remainingMs);
-                this.options.onQuestion(uiQuestion).then(
-                  (answer) => {
-                    clearTimeout(timer);
-                    resolve(answer);
-                  },
-                  (error) => {
-                    clearTimeout(timer);
-                    reject(error);
-                  },
-                );
-              });
-            }
+            const rawAnswer = await this.askServerQuestion(
+              id,
+              generation,
+              uiQuestion,
+              remainingMs,
+            );
+            if (rawAnswer === SERVER_REQUEST_RESOLVED) return;
             if (rawAnswer === null) {
               // Null is a whole-request cancellation/timeout sentinel. Do not
               // return partial answers for an already-expired prompt.
@@ -1509,16 +2922,20 @@ export class CodexAppServer extends EventEmitter {
               params.proposedNetworkPolicyAmendments,
             ),
           ].filter(Boolean).join("\n\n");
-          const answer = normalizeChoice(
-            await this.options.onQuestion({
+          const rawAnswer = await this.askServerQuestion(
+            id,
+            generation,
+            {
               ...requestContext,
               isOther: false,
+              operatorOnly: true,
               header: "Codex 권한",
               question: `다음 명령 실행을 허용할까요?\n\n${details}`,
               options,
-            }) ?? "",
-            options,
+            },
           );
+          if (rawAnswer === SERVER_REQUEST_RESOLVED) return;
+          const answer = normalizeChoice(rawAnswer ?? "", options);
           const decision =
             choices.find(({ option }) => option.label === answer)?.decision ??
             fallbackDecision;
@@ -1534,16 +2951,20 @@ export class CodexAppServer extends EventEmitter {
             { label: "세션 동안 허용", description: "이 세션의 파일 변경을 계속 허용합니다." },
             { label: "거부", description: "파일을 변경하지 않습니다." },
           ];
-          const answer = normalizeChoice(
-            await this.options.onQuestion({
+          const rawAnswer = await this.askServerQuestion(
+            id,
+            generation,
+            {
               ...requestContext,
               isOther: false,
+              operatorOnly: true,
               header: "Codex 권한",
               question: `${reason}${root}`,
               options,
-            }) ?? "",
-            options,
+            },
           );
+          if (rawAnswer === SERVER_REQUEST_RESOLVED) return;
+          const answer = normalizeChoice(rawAnswer ?? "", options);
           const decision = answer === options[0].label
             ? "accept"
             : answer === options[1].label
@@ -1560,10 +2981,13 @@ export class CodexAppServer extends EventEmitter {
             { label: "세션 동안 허용", description: "요청한 권한을 현재 세션에 부여합니다." },
             { label: "거부", description: "추가 권한을 부여하지 않습니다." },
           ];
-          const answer = normalizeChoice(
-            await this.options.onQuestion({
+          const rawAnswer = await this.askServerQuestion(
+            id,
+            generation,
+            {
               ...requestContext,
               isOther: false,
+              operatorOnly: true,
               header: "Codex 권한",
               question: [
                 String(params.reason ?? "추가 권한 요청"),
@@ -1572,9 +2996,10 @@ export class CodexAppServer extends EventEmitter {
                 approvalDetail("요청 권한", requested),
               ].filter(Boolean).join("\n\n"),
               options,
-            }) ?? "",
-            options,
+            },
           );
+          if (rawAnswer === SERVER_REQUEST_RESOLVED) return;
+          const answer = normalizeChoice(rawAnswer ?? "", options);
           const accepted = answer === options[0].label || answer === options[1].label;
           const requestedProfile =
             requested && typeof requested === "object"
@@ -1614,7 +3039,12 @@ export class CodexAppServer extends EventEmitter {
       }
     } catch (error) {
       this.options.onError?.(`Failed to handle Codex server request: ${method}`, error);
-      if (generation !== this.processGeneration) return;
+      if (
+        generation !== this.processGeneration ||
+        activeRequest.controller.signal.aborted
+      ) {
+        return;
+      }
       if (method === "item/commandExecution/requestApproval" ||
           method === "item/fileChange/requestApproval") {
         this.respond(id, { decision: "decline" }, generation);
@@ -1632,6 +3062,10 @@ export class CodexAppServer extends EventEmitter {
           `Compact Bot could not handle ${method}`,
           generation,
         );
+      }
+    } finally {
+      if (this.activeServerRequests.get(id) === activeRequest) {
+        this.activeServerRequests.delete(id);
       }
     }
   }
@@ -1666,7 +3100,34 @@ export class CodexAppServer extends EventEmitter {
   }
 
   private recordEvent(event: string): void {
-    this.recentEvents.push(`[${new Date().toISOString()}] ${event}`);
-    if (this.recentEvents.length > 200) this.recentEvents.splice(0, 50);
+    this.recentEvents.push(
+      boundCaptureEntry(
+        `[${new Date().toISOString()}] ${event}`,
+        MAX_CAPTURE_EVENT_CHARS,
+      ),
+    );
+    while (this.recentEvents.length > MAX_CAPTURE_HISTORY_LINES) {
+      this.recentEvents.shift();
+    }
+    let totalChars = this.recentEvents.reduce(
+      (total, entry) => total + entry.length + 1,
+      0,
+    );
+    while (
+      totalChars > MAX_CAPTURE_BODY_CHARS &&
+      this.recentEvents.length > 1
+    ) {
+      const removed = this.recentEvents.shift();
+      totalChars -= (removed?.length ?? 0) + 1;
+    }
+    if (
+      totalChars > MAX_CAPTURE_BODY_CHARS &&
+      this.recentEvents.length === 1
+    ) {
+      this.recentEvents[0] = boundCaptureEntry(
+        this.recentEvents[0],
+        MAX_CAPTURE_BODY_CHARS,
+      );
+    }
   }
 }

@@ -116,7 +116,10 @@ describe("hook-runner", () => {
       },
     };
 
-    const result = await runHook(event, { COMPACT_BOT_WRAPPER_SOCKET: socketPath });
+    const result = await runHook(event, {
+      COMPACT_BOT_WRAPPER_SOCKET: socketPath,
+      COMPACT_BOT_HOOK_IPC_AUTH_TOKEN: "hook-secret",
+    });
 
     // Empty-object decision = allow.
     expect(result.stdout.trim()).toBe("{}");
@@ -124,6 +127,7 @@ describe("hook-runner", () => {
     expect(captured[0].lines.length).toBe(1);
     const payload = JSON.parse(captured[0].lines[0]);
     expect(payload.type).toBe("pre_ask_user_question");
+    expect(payload.__compact_bot_ipc_auth).toBe("hook-secret");
     expect(payload.tool_input.questions).toHaveLength(1);
     expect(payload.tool_input.questions[0].question).toBe("어디까지 진행할까요?");
     expect(payload.tool_input.questions[0].options[0].label).toBe("최소");

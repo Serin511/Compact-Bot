@@ -17,6 +17,7 @@ import xtermHeadless from "@xterm/headless";
 const { Terminal } = xtermHeadless;
 import {
   accessSync,
+  chmodSync,
   constants as fsConstants,
   existsSync,
   mkdirSync,
@@ -46,7 +47,34 @@ import {
   type CodexMcpServerConfig,
   type CodexQuestion,
 } from "./codex-app-server.js";
-import { CodexDeliveryTracker } from "./codex-delivery.js";
+import {
+  canUseActiveCodexTurn,
+  canMutateCodexGoal,
+  CodexDeliveryTracker,
+} from "./codex-delivery.js";
+import {
+  CodexOutboundWriteGuard,
+  type CodexOutboundCall,
+} from "./codex-outbound-guard.js";
+import { isOperator } from "./access-control.js";
+import { msg } from "./messages.js";
+import {
+  executableOnPath,
+  resolveCodexExecutable,
+} from "./executable-path.js";
+import {
+  buildCodexAppServerEnvironment,
+  buildClaudePtyEnvironment,
+  InputRecipientTracker,
+  isCodexStartupSuperseded,
+  RecentOriginTracker,
+} from "./runtime-coordination.js";
+import {
+  buildCodexMcpProxyConfig,
+  buildClaudeMcpServerSpec,
+  ClaudeMcpRelayServer,
+  type ClaudeMcpPlatform,
+} from "./claude-mcp-relay.js";
 
 setVerbose(config.verbose);
 
@@ -58,8 +86,29 @@ const __dirname = dirname(__filename);
 const DIST_DIR = __dirname.endsWith("src") ? join(__dirname, "..", "dist") : __dirname;
 
 const SOCKET_PATH = join(DATA_DIR, "wrapper.sock");
+const HOOK_SOCKET_PATH = join(DATA_DIR, "wrapper-hook.sock");
+const PLATFORM_MCP_RELAY_SOCKET_PATH = join(DATA_DIR, "mcp.sock");
+const PLATFORM_MCP_PROXY_PATH = join(DIST_DIR, "claude-mcp-proxy.js");
+/**
+ * Capability shared only with this wrapper's platform MCP children.
+ *
+ * Codex's process-local shell policy filters TOKEN/SECRET/KEY names from
+ * model-spawned commands. This token separately prevents a subprocess that
+ * merely discovers the Unix-socket path from speaking the control protocol.
+ */
+const PLATFORM_IPC_AUTH_TOKEN =
+  process.env.COMPACT_BOT_IPC_AUTH_TOKEN || randomUUID();
+/**
+ * Claude's hook runner necessarily inherits its credential from the PTY host.
+ * Give it a separate least-privilege socket that accepts only hook events, so
+ * shell code cannot turn that credential into mutable wrapper commands.
+ */
+const HOOK_IPC_AUTH_TOKEN =
+  process.env.COMPACT_BOT_HOOK_IPC_AUTH_TOKEN || randomUUID();
+let platformMcpRelay: ClaudeMcpRelayServer | null = null;
 
-if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+chmodSync(DATA_DIR, 0o700);
 
 // ── state ─────────────────────────────────────────────────────────────
 
@@ -79,6 +128,7 @@ const PTY_COLS = 75;
 const PTY_ROWS = 50;
 
 let claudeProcess: pty.IPty | null = null;
+let claudeProcessGeneration = 0;
 let codexBackend: CodexAppServer | null = null;
 let codexStartPromise: Promise<void> | null = null;
 let codexSessionChanging = false;
@@ -86,18 +136,77 @@ let codexSessionChanging = false;
 const mcpClients = new Map<JsonLineSocket, IpcOrigin["source"] | null>();
 /** Serialize ingress and lifecycle operations across app-server generations. */
 let codexOperationQueue: Promise<void> = Promise.resolve();
+/** Recovery commands bypass normal work while remaining ordered with each other. */
+let codexControlQueue: Promise<void> = Promise.resolve();
+/** Invalidates normal work queued before a session-replacing control command. */
+let codexSessionEpoch = 0;
+/** Includes queued session changes, not just the command currently executing. */
+let codexPendingSessionChanges = 0;
 /** One delayed unexpected-exit recovery at a time. */
 let codexRespawnTimer: ReturnType<typeof setTimeout> | null = null;
 let expectedExit = false;
 let spawnGrace = false;
 
 function enqueueCodexOperation<T>(operation: () => Promise<T>): Promise<T> {
-  const run = codexOperationQueue.then(operation);
+  if (codexSessionChanging) {
+    return Promise.reject(
+      new Error("Codex session이 전환 중이어서 요청을 처리하지 않았습니다"),
+    );
+  }
+  const epoch = codexSessionEpoch;
+  const run = codexOperationQueue.then(async () => {
+    // Controls arriving behind a blocked normal operation have priority.
+    await codexControlQueue;
+    if (codexSessionChanging || epoch !== codexSessionEpoch) {
+      throw new Error(
+        "Codex session이 전환되어 대기 중이던 요청을 처리하지 않았습니다",
+      );
+    }
+    return await operation();
+  });
   codexOperationQueue = run.then(
     () => undefined,
     () => undefined,
   );
   return run;
+}
+
+function enqueueCodexControlOperation<T>(
+  operation: () => Promise<T>,
+  changesSession = false,
+): Promise<T> {
+  if (changesSession) {
+    codexSessionEpoch += 1;
+    codexPendingSessionChanges += 1;
+    codexSessionChanging = true;
+  }
+  let run = codexControlQueue.then(operation);
+  if (changesSession) {
+    run = run.finally(() => {
+      codexPendingSessionChanges -= 1;
+      codexSessionChanging = codexPendingSessionChanges > 0;
+    });
+  }
+  codexControlQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+function isCodexSessionChangeCommand(command: IpcCommandRequest): boolean {
+  return ["restart", "clear", "model", "cwd"].includes(command.type);
+}
+
+function isCodexRecoveryCommand(command: IpcCommandRequest): boolean {
+  return (
+    isCodexSessionChangeCommand(command) ||
+    command.type === "esc" ||
+    (
+      command.type === "goal" &&
+      command.args.replace(/[\r\n]+/g, " ").trim() === "clear"
+    )
+  );
 }
 
 function cancelScheduledCodexRespawn(): void {
@@ -124,7 +233,7 @@ interface PendingQuestion {
   total: number;
   /** Present only for Codex app-server questions. */
   resolve?: (answer: string | null) => void;
-  /** Exact channel/user that owns a Codex question or approval. */
+  /** Exact channel/user that owns this question or approval. */
   origin?: IpcOrigin;
   /** Codex-provided auto-resolution window for this request. */
   autoResolutionMs?: number | null;
@@ -136,16 +245,28 @@ interface ActiveInputRequest {
   id: string;
   /** Snapshot of the question we relayed (used to compute key sequences). */
   pending: PendingQuestion;
-  /** How many MCP clients we broadcast the request to. */
-  recipientCount: number;
-  /** How many of those have reported failure. */
-  failCount: number;
+  /** Exact ready peers that received the request and have not failed. */
+  recipients: InputRecipientTracker<JsonLineSocket>;
+  /**
+   * Realtime peers that temporarily lost ownership while their rendered
+   * prompt may still exist. A same-socket reconnect resumes that prompt
+   * without posting a duplicate; a replacement peer receives a replay.
+   */
+  suspendedRecipients: Set<JsonLineSocket>;
 }
 
 let activeInputRequest: ActiveInputRequest | null = null;
+/** Bound stale origins so later PTY commands cannot leak questions to old users. */
+const CLAUDE_ORIGIN_MAX_AGE_MS = 10 * 60 * 1000;
+const recentClaudeOrigin = new RecentOriginTracker<JsonLineSocket>(
+  CLAUDE_ORIGIN_MAX_AGE_MS,
+);
 let inputRequestExpiry: ReturnType<typeof setTimeout> | null = null;
 /** How long to hold an active input request before giving up. */
 const INPUT_REQUEST_TTL_MS = 10 * 60 * 1000;
+/** Bounded handoff window for a Codex prompt whose realtime owner vanished. */
+const CODEX_INPUT_FAILOVER_GRACE_MS = 5_000;
+let inputRequestFailoverExpiry: ReturnType<typeof setTimeout> | null = null;
 /** Questions remaining in the current AskUserQuestion call (drained as the user answers). */
 const questionQueue: PendingQuestion[] = [];
 /** Pacing between answering question N and presenting question N+1 — gives Ink time to advance. */
@@ -169,6 +290,12 @@ const SUBMIT_DETECT_TIMEOUT_MS = 1500;
 
 /** Delivery state is keyed by turn so a final fallback is never duplicated. */
 const codexDeliveryTracker = new CodexDeliveryTracker();
+/** One-shot, turn-owned permits for platform write tools. */
+const codexOutboundWriteGuard = new CodexOutboundWriteGuard(
+  (turnId) => codexDeliveryTracker.authorizationOriginForTurn(turnId),
+);
+/** A goal/set response has not yet established the new goal owner. */
+let codexGoalOwnershipPending = false;
 /** Routed output can briefly outlive an MCP child during a runtime restart. */
 const pendingRoutedOutput: WrapperToMcp[] = [];
 
@@ -227,18 +354,35 @@ async function captureScreen(all = false): Promise<string> {
  * Clear the active input request and cancel any pending TTL timer.
  */
 function clearActiveInputRequest(reason: string): void {
+  if (inputRequestFailoverExpiry) {
+    clearTimeout(inputRequestFailoverExpiry);
+    inputRequestFailoverExpiry = null;
+  }
   if (activeInputRequest === null) return;
-  const requestId = activeInputRequest.id;
+  const active = activeInputRequest;
+  const requestId = active.id;
   log.debug(`Clearing active input request ${requestId}: ${reason}`);
   activeInputRequest = null;
   if (inputRequestExpiry) {
     clearTimeout(inputRequestExpiry);
     inputRequestExpiry = null;
   }
-  sendRoutedOutput({
+  const cancellation = {
     type: "input_request_cancel",
     request_id: requestId,
-  });
+  } satisfies WrapperToMcp;
+  // A realtime `not_ready` peer stays on IPC and may retain its local prompt.
+  // Deactivate it directly even though it is no longer a routed ready owner.
+  for (const suspended of active.suspendedRecipients) {
+    try {
+      suspended.send(cancellation);
+    } catch (error) {
+      log.debug(
+        `Could not cancel suspended input request ${requestId}: ${String(error)}`,
+      );
+    }
+  }
+  sendRoutedOutput(cancellation);
 }
 
 function cancelQuestionRelay(reason: string): void {
@@ -248,6 +392,30 @@ function cancelQuestionRelay(reason: string): void {
   for (const pending of questionQueue.splice(0)) {
     pending.resolve?.(null);
   }
+}
+
+function buildInputRequestMessage(
+  requestId: string,
+  pending: PendingQuestion,
+): WrapperToMcp {
+  return {
+    type: "input_request",
+    request_id: requestId,
+    question: renderQuestionText(pending),
+    widget: {
+      header: pending.question.header ?? null,
+      question: pending.question.question,
+      options: pending.question.options.map((option) => ({
+        label: option.label,
+        description: option.description ?? null,
+      })),
+      questionIndex: pending.index,
+      questionTotal: pending.total,
+      allowOther: pending.isOther ?? true,
+      isSecret: false,
+    },
+    ...(pending.origin ? { origin: pending.origin } : {}),
+  };
 }
 
 /**
@@ -287,14 +455,129 @@ function originFromMeta(
   };
 }
 
-function rememberCodexOrigin(origin: IpcOrigin | null): void {
-  codexDeliveryTracker.setOrigin(origin, codexBackend?.currentTurnId);
+function isReadyPeerForOrigin(
+  peer: JsonLineSocket,
+  origin: IpcOrigin,
+): boolean {
+  if (!mcpClients.has(peer)) return false;
+  const registeredSource = mcpClients.get(peer);
+  return registeredSource === null || registeredSource === origin.source;
+}
+
+function rememberClaudeOrigin(
+  origin: IpcOrigin | undefined,
+  peer: JsonLineSocket,
+): void {
+  if (!origin || !isReadyPeerForOrigin(peer, origin)) return;
+  recentClaudeOrigin.remember(origin, peer);
+}
+
+function currentClaudeOrigin(): IpcOrigin | null {
+  return recentClaudeOrigin.current(isReadyPeerForOrigin);
+}
+
+async function submitCodexChannelMessage(
+  backend: CodexAppServer,
+  origin: IpcOrigin,
+  content: string,
+  meta: Record<string, string>,
+): Promise<void> {
+  const activeTurnId = backend.currentTurnId;
+  if (
+    activeTurnId &&
+    !canUseActiveCodexTurn(
+      codexDeliveryTracker.authorizationOriginForTurn(activeTurnId),
+      origin,
+    )
+  ) {
+    throw new Error(
+      "활성 Codex turn은 시작한 채널/스레드/사용자만 이어서 사용할 수 있습니다",
+    );
+  }
+  const deliverFallbacks = (
+    fallbacks: ReturnType<
+      CodexDeliveryTracker["acceptExplicitSubmission"]
+    >,
+  ): void => {
+    for (const fallback of fallbacks) {
+      sendRoutedOutput({
+        type: "agent_reply",
+        origin: fallback.origin,
+        text: fallback.text,
+      });
+    }
+  };
+  const ambiguityToken = codexOutboundWriteGuard.beginAmbiguity();
+  const submission = codexDeliveryTracker.beginExplicitSubmission(origin);
+  const acceptSubmission = (turnId: string): void => {
+    deliverFallbacks(
+      codexDeliveryTracker.acceptExplicitSubmission(submission, turnId),
+    );
+    codexOutboundWriteGuard.endAmbiguity(ambiguityToken);
+  };
+  try {
+    const accepted = await backend.submitChannelMessage(
+      origin.source,
+      content,
+      meta,
+      ({ turnId }) => {
+        acceptSubmission(turnId);
+      },
+    );
+    // The response observer normally commits first. Repeating the binding here
+    // is intentional and keeps the helper correct if an older backend skips it.
+    acceptSubmission(accepted.turnId);
+  } catch (error) {
+    deliverFallbacks(
+      codexDeliveryTracker.cancelExplicitSubmission(submission),
+    );
+    codexOutboundWriteGuard.endAmbiguity(ambiguityToken);
+    throw error;
+  }
 }
 
 function routedMessageOrigin(message: WrapperToMcp): IpcOrigin | undefined {
-  return message.type === "command_result" || message.type === "agent_reply"
-    ? message.origin
-    : undefined;
+  switch (message.type) {
+    case "command_result":
+    case "agent_reply":
+    case "capture_result":
+    case "effort_result":
+      return message.origin;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Accept a routed command origin only from the ready peer that owns its
+ * platform. An unregistered/legacy peer still receives a direct response on
+ * its own socket, but cannot make the wrapper post into another platform.
+ */
+function routedRequestOrigin(
+  sender: JsonLineSocket,
+  origin: IpcOrigin | undefined,
+): IpcOrigin | undefined {
+  if (!origin) return undefined;
+  if (mcpClients.get(sender) === origin.source) return origin;
+  log.debug(
+    `Ignoring unroutable ${origin.source} origin from non-owning MCP peer`,
+  );
+  return undefined;
+}
+
+function sendCorrelatedResult(
+  message: WrapperToMcp,
+  sender: JsonLineSocket,
+): void {
+  if (routedMessageOrigin(message)) {
+    sendRoutedOutput(message);
+    return;
+  }
+  try {
+    sender.send(message);
+  } catch (error) {
+    log.debug(`Could not return direct IPC result: ${String(error)}`);
+  }
 }
 
 function clientsForOrigin(origin: IpcOrigin): JsonLineSocket[] {
@@ -307,16 +590,30 @@ function clientsForOrigin(origin: IpcOrigin): JsonLineSocket[] {
     .map(([client]) => client);
 }
 
+function requiresExactRoutedSource(message: WrapperToMcp): boolean {
+  return message.type === "capture_result" || message.type === "effort_result";
+}
+
 function sendRoutedOutput(message: WrapperToMcp): void {
   const origin = routedMessageOrigin(message);
   if (origin) {
-    const targets = clientsForOrigin(origin);
-    if (targets.length > 0) {
-      // Only one process should own a platform realtime connection. Choosing
-      // the newest matching ready peer also avoids duplicate ACKs during the
-      // brief overlap of a runtime replacement.
-      targets[targets.length - 1].send(message);
-      return;
+    const targets = requiresExactRoutedSource(message)
+      ? [...mcpClients.entries()]
+        .filter(([, source]) => source === origin.source)
+        .map(([client]) => client)
+      : clientsForOrigin(origin);
+    // Only one process should own a platform realtime connection. Prefer the
+    // newest matching peer, but tolerate a close/write race by trying an older
+    // still-ready peer before retaining the result for a replacement.
+    for (let index = targets.length - 1; index >= 0; index--) {
+      try {
+        targets[index].send(message);
+        return;
+      } catch (error) {
+        log.debug(
+          `Could not route ${message.type} to a ready MCP peer: ${String(error)}`,
+        );
+      }
     }
     pendingRoutedOutput.push(message);
     if (pendingRoutedOutput.length > 100) pendingRoutedOutput.shift();
@@ -335,13 +632,144 @@ function flushRoutedOutput(
   const retained: WrapperToMcp[] = [];
   for (const message of pendingRoutedOutput.splice(0)) {
     const origin = routedMessageOrigin(message);
-    if (origin && source !== null && origin.source !== source) {
-      retained.push(message);
-      continue;
+    if (origin) {
+      if (
+        origin.source !== source &&
+        (source !== null || requiresExactRoutedSource(message))
+      ) {
+        retained.push(message);
+        continue;
+      }
     }
-    client.send(message);
+    try {
+      client.send(message);
+    } catch (error) {
+      log.debug(
+        `Could not flush ${message.type} to MCP peer: ${String(error)}`,
+      );
+      retained.push(message);
+    }
   }
   pendingRoutedOutput.push(...retained);
+}
+
+function holdCodexInputRequestForFailover(
+  active: ActiveInputRequest,
+  reason: string,
+): void {
+  if (inputRequestFailoverExpiry) {
+    clearTimeout(inputRequestFailoverExpiry);
+  }
+  const requestId = active.id;
+  inputRequestFailoverExpiry = setTimeout(() => {
+    inputRequestFailoverExpiry = null;
+    if (
+      activeInputRequest !== active ||
+      activeInputRequest.id !== requestId ||
+      activeInputRequest.recipients.size > 0
+    ) {
+      return;
+    }
+    log.debug(
+      `Codex input request ${requestId} failover grace expired`,
+    );
+    cancelQuestionRelay(`${reason}; replacement grace expired`);
+  }, CODEX_INPUT_FAILOVER_GRACE_MS);
+  inputRequestFailoverExpiry.unref();
+  log.debug(
+    `Holding Codex input request ${requestId} for ${CODEX_INPUT_FAILOVER_GRACE_MS}ms failover grace`,
+  );
+}
+
+/**
+ * Remove a peer from realtime routing and settle any prompt that only that
+ * peer could answer.
+ *
+ * Codex app-server awaits ``onQuestion`` indefinitely when no auto-resolution
+ * window is supplied. Give a replacement realtime process a short opportunity
+ * to resume the exact request, then resolve it with a safe cancellation.
+ * Claude's PTY prompt cannot be programmatically declined; keep it queued for
+ * the next owner instead.
+ */
+function handleRealtimePeerUnavailable(
+  client: JsonLineSocket,
+  reason: string,
+): void {
+  if (!mcpClients.has(client)) return;
+
+  recentClaudeOrigin.forgetPeer(client);
+  mcpClients.delete(client);
+
+  const active = activeInputRequest;
+  if (active?.recipients.remove(client)) {
+    if (active.recipients.size === 0) {
+      const pending = active.pending;
+      if (pending.resolve) {
+        active.suspendedRecipients.add(client);
+        const readyReplacements = pending.origin
+          ? clientsForOrigin(pending.origin)
+          : [...mcpClients.keys()];
+        const replacement =
+          readyReplacements[readyReplacements.length - 1];
+        if (replacement) {
+          resumeCodexInputRequest(replacement);
+        } else {
+          holdCodexInputRequestForFailover(active, reason);
+        }
+      } else {
+        clearActiveInputRequest(reason);
+        questionQueue.unshift(pending);
+      }
+    }
+  }
+}
+
+/**
+ * Reattach an active Codex prompt to a realtime owner.
+ *
+ * A same-socket `not_ready` → `ready` cycle retains the adapter's local
+ * prompt, so only its response eligibility is restored. A fresh process has
+ * no local state and receives the original request payload with the same ID.
+ */
+function resumeCodexInputRequest(client: JsonLineSocket): void {
+  const active = activeInputRequest;
+  if (!active?.pending.resolve || active.recipients.has(client)) return;
+  if (
+    active.pending.origin &&
+    !isReadyPeerForOrigin(client, active.pending.origin)
+  ) {
+    return;
+  }
+
+  const samePeer = active.suspendedRecipients.delete(client);
+  if (active.recipients.size > 0) {
+    // Another peer already completed the handoff. Deactivate a stale prompt
+    // retained by a late reconnect instead of making it eligible again.
+    if (samePeer) {
+      client.send({
+        type: "input_request_cancel",
+        request_id: active.id,
+      });
+    }
+    return;
+  }
+
+  if (inputRequestFailoverExpiry) {
+    clearTimeout(inputRequestFailoverExpiry);
+    inputRequestFailoverExpiry = null;
+  }
+  active.recipients.add(client);
+  if (samePeer) {
+    log.debug(
+      `Resumed Codex input request ${active.id} on its original realtime peer`,
+    );
+    return;
+  }
+
+  log.debug(
+    `Replaying Codex input request ${active.id} to a replacement realtime peer`,
+  );
+  client.send(buildInputRequestMessage(active.id, active.pending));
 }
 
 /**
@@ -366,9 +794,8 @@ function presentNextQuestion(): void {
       ? [matchingClients[matchingClients.length - 1]]
       : matchingClients;
   if (clients.length === 0) {
-    // Nothing connected — drop the question and warn loudly. Without this
-    // guard the wrapper would silently swallow the AskUserQuestion call,
-    // leaving Claude Code stuck on the (un-rendered-to-channel) Ink widget.
+    // Codex can be safely declined. Claude's hook cannot answer its Ink widget,
+    // so preserve that question for the next realtime owner instead.
     if (next.resolve) {
       log.error(
         "Codex requested user input but no platform MCP server is connected",
@@ -378,9 +805,12 @@ function presentNextQuestion(): void {
       setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
     } else {
       log.error(
-        "AskUserQuestion fired but no MCP server is connected — Claude Code is now waiting on the Ink widget with no relay path",
+        "AskUserQuestion is waiting for a realtime MCP owner",
         new Error("no MCP client"),
       );
+      // Claude's Ink widget cannot be declined through this hook. Preserve the
+      // question so the next owner to announce `ready` can present it.
+      questionQueue.unshift(next);
     }
     return;
   }
@@ -389,8 +819,8 @@ function presentNextQuestion(): void {
   activeInputRequest = {
     id: requestId,
     pending: next,
-    recipientCount: clients.length,
-    failCount: 0,
+    recipients: new InputRecipientTracker(clients),
+    suspendedRecipients: new Set(),
   };
   const requestTtl = next.resolve
     ? (
@@ -409,24 +839,7 @@ function presentNextQuestion(): void {
     }, requestTtl);
   }
 
-  const message: WrapperToMcp = {
-    type: "input_request",
-    request_id: requestId,
-    question: renderQuestionText(next),
-    widget: {
-      header: next.question.header ?? null,
-      question: next.question.question,
-      options: next.question.options.map((o) => ({
-        label: o.label,
-        description: o.description ?? null,
-      })),
-      questionIndex: next.index,
-      questionTotal: next.total,
-      allowOther: next.isOther ?? true,
-      isSecret: false,
-    },
-    ...(next.origin ? { origin: next.origin } : {}),
-  };
+  const message = buildInputRequestMessage(requestId, next);
   log.debug(
     `Presenting AskUserQuestion (id=${requestId}, q=${next.index}/${next.total}, options=${next.question.options.length})`,
   );
@@ -442,7 +855,10 @@ function presentNextQuestion(): void {
  * Subsequent questions wait for the previous answer to be driven into the
  * Ink widget.
  */
-function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
+function handlePreAskUserQuestion(
+  input: AskUserQuestionInput,
+  hookOrigin?: IpcOrigin,
+): void {
   const questions = Array.isArray(input?.questions) ? input.questions : [];
   if (questions.length === 0) {
     log.debug("Ignoring pre_ask_user_question with empty questions array");
@@ -459,11 +875,16 @@ function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
     questionQueue.length = 0;
   }
 
+  // Hook transcript ancestry is causal and therefore wins over the realtime
+  // "last message" fallback, which can move while Claude is still handling an
+  // earlier user's turn.
+  const origin = hookOrigin ?? currentClaudeOrigin();
   for (let i = 0; i < questions.length; i++) {
     questionQueue.push({
       question: questions[i],
       index: i + 1,
       total: questions.length,
+      ...(origin ? { origin } : {}),
     });
   }
   log.debug(`Queued AskUserQuestion call (${questions.length} question(s))`);
@@ -475,7 +896,17 @@ function handlePreAskUserQuestion(input: AskUserQuestionInput): void {
  * question UI and resolve with the user's selected label or free-form answer.
  */
 function askCodexQuestion(question: CodexQuestion): Promise<string | null> {
-  const origin = codexDeliveryTracker.originForTurn(question.turnId);
+  const origin =
+    question.turnId && !codexGoalOwnershipPending
+      ? codexDeliveryTracker.authorizationOriginForTurn(question.turnId)
+      : null;
+  if (!origin) {
+    log.error(
+      "Declining Codex question because its exact turn owner is unresolved",
+      new Error(`turn=${question.turnId ?? "unknown"}`),
+    );
+    return Promise.resolve(null);
+  }
   if (
     typeof question.autoResolutionMs === "number" &&
     question.autoResolutionMs <= 0
@@ -497,8 +928,40 @@ function askCodexQuestion(question: CodexQuestion): Promise<string | null> {
     }
     return Promise.resolve(null);
   }
+  if (question.operatorOnly) {
+    const operatorIds =
+      origin?.source === "slack"
+        ? config.slackOperatorUserIds
+        : origin?.source === "discord"
+          ? config.discordOperatorUserIds
+          : [
+              ...config.discordOperatorUserIds,
+              ...config.slackOperatorUserIds,
+            ];
+    if (!isOperator(origin?.user, operatorIds)) {
+      log.error(
+        "Declining Codex approval from a non-operator conversation",
+        new Error("operator authorization required"),
+      );
+      if (origin) {
+        sendRoutedOutput({
+          type: "agent_reply",
+          origin,
+          text: msg("operatorOnly"),
+        });
+      }
+      return Promise.resolve(null);
+    }
+  }
   return new Promise((resolve) => {
-    questionQueue.push({
+    let settled = false;
+    const finish = (answer: string | null): void => {
+      if (settled) return;
+      settled = true;
+      question.signal?.removeEventListener("abort", handleAbort);
+      resolve(answer);
+    };
+    const pending: PendingQuestion = {
       question: {
         question: question.question,
         header: question.header,
@@ -506,11 +969,33 @@ function askCodexQuestion(question: CodexQuestion): Promise<string | null> {
       },
       index: 1,
       total: 1,
-      resolve,
+      resolve: finish,
       origin: origin ?? undefined,
       autoResolutionMs: question.autoResolutionMs,
       isOther: question.isOther,
-    });
+    };
+    const handleAbort = (): void => {
+      const requestLabel = String(question.requestId ?? "unknown");
+      const queuedIndex = questionQueue.indexOf(pending);
+      if (queuedIndex !== -1) {
+        questionQueue.splice(queuedIndex, 1);
+        finish(null);
+        return;
+      }
+      if (activeInputRequest?.pending === pending) {
+        clearActiveInputRequest(
+          `Codex server request ${requestLabel} resolved`,
+        );
+        finish(null);
+        setTimeout(presentNextQuestion, NEXT_QUESTION_DELAY_MS);
+      }
+    };
+    if (question.signal?.aborted) {
+      finish(null);
+      return;
+    }
+    question.signal?.addEventListener("abort", handleAbort, { once: true });
+    questionQueue.push(pending);
     presentNextQuestion();
   });
 }
@@ -562,12 +1047,17 @@ async function waitForSubmitConfirmPage(): Promise<boolean> {
 function handleInputResponse(
   requestId: string,
   answer: string,
+  sender: JsonLineSocket,
   origin?: IpcOrigin,
 ): void {
   if (!activeInputRequest || activeInputRequest.id !== requestId) {
     log.debug(
       `Ignoring stale input response (expected=${activeInputRequest?.id}, got=${requestId})`,
     );
+    return;
+  }
+  if (!activeInputRequest.recipients.has(sender)) {
+    log.debug(`Ignoring input response from a peer that did not receive ${requestId}`);
     return;
   }
 
@@ -666,18 +1156,27 @@ function handleInputResponse(
  * left the slot set until the TTL expired — blocking every subsequent
  * AskUserQuestion call for 10 minutes.
  */
-function handleInputRequestFailed(requestId: string, reason: string): void {
+function handleInputRequestFailed(
+  requestId: string,
+  reason: string,
+  sender: JsonLineSocket,
+): void {
   if (!activeInputRequest || activeInputRequest.id !== requestId) {
     log.debug(
       `Ignoring stale failure notice (expected=${activeInputRequest?.id}, got=${requestId})`,
     );
     return;
   }
-  activeInputRequest.failCount++;
+  if (!activeInputRequest.recipients.remove(sender)) {
+    log.debug(
+      `Ignoring duplicate or non-recipient failure for ${requestId}: ${reason}`,
+    );
+    return;
+  }
   log.debug(
-    `Input request ${requestId} partial failure (${activeInputRequest.failCount}/${activeInputRequest.recipientCount}): ${reason}`,
+    `Input request ${requestId} recipient failed (${activeInputRequest.recipients.size} remaining): ${reason}`,
   );
-  if (activeInputRequest.failCount >= activeInputRequest.recipientCount) {
+  if (activeInputRequest.recipients.size === 0) {
     log.debug(`All recipients failed for ${requestId} — dropping request`);
     cancelQuestionRelay("all recipients failed");
   }
@@ -705,77 +1204,94 @@ function getMcpServerSpecs(): McpServerSpec[] {
   const specs: McpServerSpec[] = [];
 
   if (config.discordBotToken) {
-    specs.push({
-      name: "discord-bot",
-      json: JSON.stringify({
-        command: "node",
-        args: [join(DIST_DIR, "mcp-server.js")],
-        env: {
-          DISCORD_BOT_TOKEN: config.discordBotToken,
-          WRAPPER_SOCKET: SOCKET_PATH,
-          AGENT_PROVIDER: config.agentProvider,
-          ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
-          FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
-          VERBOSE: String(config.verbose),
-        },
-      }),
-    });
+    specs.push(
+      buildClaudeMcpServerSpec(
+        "discord",
+        process.execPath,
+        PLATFORM_MCP_PROXY_PATH,
+        PLATFORM_MCP_RELAY_SOCKET_PATH,
+      ),
+    );
   }
 
   if (config.slackBotToken) {
-    specs.push({
-      name: "slack-bot",
-      json: JSON.stringify({
-        command: "node",
-        args: [join(DIST_DIR, "slack-mcp-server.js")],
-        env: {
-          SLACK_BOT_TOKEN: config.slackBotToken,
-          SLACK_APP_TOKEN: config.slackAppToken,
-          WRAPPER_SOCKET: SOCKET_PATH,
-          AGENT_PROVIDER: config.agentProvider,
-          SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
-          FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
-          VERBOSE: String(config.verbose),
-        },
-      }),
-    });
+    specs.push(
+      buildClaudeMcpServerSpec(
+        "slack",
+        process.execPath,
+        PLATFORM_MCP_PROXY_PATH,
+        PLATFORM_MCP_RELAY_SOCKET_PATH,
+      ),
+    );
   }
 
   return specs;
 }
 
+/**
+ * Secrets injected into wrapper-owned platform MCP children over fd 3.
+ *
+ * This object is held only by the wrapper/relay. It is never serialized into
+ * either host's MCP settings, sent over the relay, or inherited by the
+ * model-facing PTY/app-server/proxy.
+ */
+function getPlatformMcpRuntimePayloads(
+  provider: "claude" | "codex",
+): Partial<
+  Record<ClaudeMcpPlatform, Record<string, string>>
+> {
+  const payloads: Partial<
+    Record<ClaudeMcpPlatform, Record<string, string>>
+  > = {};
+  if (config.discordBotToken) {
+    payloads.discord = {
+      DISCORD_BOT_TOKEN: config.discordBotToken,
+      WRAPPER_SOCKET: SOCKET_PATH,
+      COMPACT_BOT_IPC_AUTH_TOKEN: PLATFORM_IPC_AUTH_TOKEN,
+      AGENT_PROVIDER: provider,
+      ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
+      DISCORD_OPERATOR_USER_IDS: config.discordOperatorUserIds.join(","),
+      FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
+      VERBOSE: String(config.verbose),
+    };
+  }
+  if (config.slackBotToken) {
+    payloads.slack = {
+      SLACK_BOT_TOKEN: config.slackBotToken,
+      SLACK_APP_TOKEN: config.slackAppToken,
+      WRAPPER_SOCKET: SOCKET_PATH,
+      COMPACT_BOT_IPC_AUTH_TOKEN: PLATFORM_IPC_AUTH_TOKEN,
+      AGENT_PROVIDER: provider,
+      SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
+      SLACK_OPERATOR_USER_IDS: config.slackOperatorUserIds.join(","),
+      FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
+      VERBOSE: String(config.verbose),
+    };
+  }
+  return payloads;
+}
+
 function getCodexMcpServerConfigs(): CodexMcpServerConfig[] {
   const servers: CodexMcpServerConfig[] = [];
   if (config.discordBotToken) {
-    servers.push({
-      name: "compact_bot_discord",
-      command: "node",
-      args: [join(DIST_DIR, "mcp-server.js")],
-      envVars: [
-        "DISCORD_BOT_TOKEN",
-        "WRAPPER_SOCKET",
-        "AGENT_PROVIDER",
-        "ALLOWED_CHANNEL_IDS",
-        "FETCH_MESSAGE_LIMIT",
-        "VERBOSE",
-      ],
-    });
+    servers.push(
+      buildCodexMcpProxyConfig(
+        "discord",
+        process.execPath,
+        PLATFORM_MCP_PROXY_PATH,
+        PLATFORM_MCP_RELAY_SOCKET_PATH,
+      ),
+    );
   }
   if (config.slackBotToken) {
-    servers.push({
-      name: "compact_bot_slack",
-      command: "node",
-      args: [join(DIST_DIR, "slack-mcp-server.js")],
-      envVars: [
-        "SLACK_BOT_TOKEN",
-        "SLACK_APP_TOKEN",
-        "WRAPPER_SOCKET",
-        "AGENT_PROVIDER",
-        "SLACK_ALLOWED_CHANNEL_IDS",
-        "FETCH_MESSAGE_LIMIT",
-        "VERBOSE",
-      ],
-    });
+    servers.push(
+      buildCodexMcpProxyConfig(
+        "slack",
+        process.execPath,
+        PLATFORM_MCP_PROXY_PATH,
+        PLATFORM_MCP_RELAY_SOCKET_PATH,
+      ),
+    );
   }
   return servers;
 }
@@ -840,7 +1356,7 @@ function killStaleMcpServers(): void {
 
   const distMcp = join(DIST_DIR, "mcp-server.js");
   const distSlack = join(DIST_DIR, "slack-mcp-server.js");
-  for (const target of [distMcp, distSlack]) {
+  for (const target of [distMcp, distSlack, PLATFORM_MCP_PROXY_PATH]) {
     try {
       execSync(`pkill -9 -f ${shellEscape(target)}`, {
         stdio: ["ignore", "ignore", "ignore"],
@@ -1032,13 +1548,8 @@ function resolveClaudePath(): string | null {
     return null;
   }
 
-  // Command name — try to resolve via `which`
-  try {
-    const resolved = execSync(`which ${p}`, { encoding: "utf-8" }).trim();
-    if (resolved && resolved.startsWith("/") && isExecutable(resolved)) {
-      return resolved;
-    }
-  } catch { /* which failed — fall through */ }
+  const resolved = executableOnPath(p);
+  if (resolved && isExecutable(resolved)) return resolved;
 
   log.debug(`Could not resolve "${p}" to executable path, will try shell spawn`);
   return null;
@@ -1052,47 +1563,7 @@ const resolvedClaudePath = resolveClaudePath();
  * desktop app already ships a working Codex binary.
  */
 function resolveCodexPath(): string | null {
-  const works = (candidate: string): boolean => {
-    if (!isExecutable(candidate)) return false;
-    try {
-      execFileSync(candidate, ["--version"], {
-        stdio: ["ignore", "ignore", "ignore"],
-        timeout: 5000,
-      });
-      // Some npm shims can print their JavaScript wrapper version even when
-      // the platform-native binary they delegate `app-server` to is missing.
-      // Verify the exact subcommand Compact Bot needs before selecting it.
-      execFileSync(candidate, ["app-server", "--help"], {
-        stdio: ["ignore", "ignore", "ignore"],
-        timeout: 5000,
-      });
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
-  const configured = config.codexPath;
-  if (configured.includes("/") || configured.includes("\\")) {
-    return works(configured) ? configured : null;
-  }
-
-  try {
-    const resolved = execSync(`which ${configured}`, { encoding: "utf-8" }).trim();
-    if (resolved && resolved.startsWith("/") && works(resolved)) {
-      return resolved;
-    }
-  } catch {
-    // Try application-bundled paths below.
-  }
-
-  for (const candidate of [
-    "/Applications/Codex.app/Contents/Resources/codex",
-    "/Applications/ChatGPT.app/Contents/Resources/codex",
-  ]) {
-    if (works(candidate)) return candidate;
-  }
-  return null;
+  return resolveCodexExecutable(config.codexPath);
 }
 
 const resolvedCodexPath =
@@ -1116,6 +1587,7 @@ function observeCodexNotification(
   params: Record<string, unknown>,
 ): void {
   const fallback = codexDeliveryTracker.observe(method, params);
+  codexOutboundWriteGuard.observe(method, params);
   if (fallback) {
     sendRoutedOutput({
       type: "agent_reply",
@@ -1158,20 +1630,16 @@ async function spawnCodex(exitOnFailure = true): Promise<void> {
   }
 
   killStaleMcpServers();
-
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) env[key] = value;
+  if (!platformMcpRelay) {
+    throw new Error("Platform MCP relay is unavailable");
   }
+  await platformMcpRelay.startGeneration(
+    getPlatformMcpRuntimePayloads("codex"),
+  );
+
+  const env = buildCodexAppServerEnvironment(process.env);
   Object.assign(env, {
     AGENT_PROVIDER: "codex",
-    WRAPPER_SOCKET: SOCKET_PATH,
-    DISCORD_BOT_TOKEN: config.discordBotToken,
-    SLACK_BOT_TOKEN: config.slackBotToken,
-    SLACK_APP_TOKEN: config.slackAppToken,
-    ALLOWED_CHANNEL_IDS: config.allowedChannelIds.join(","),
-    SLACK_ALLOWED_CHANNEL_IDS: config.slackAllowedChannelIds.join(","),
-    FETCH_MESSAGE_LIMIT: String(config.fetchMessageLimit),
     VERBOSE: String(config.verbose),
   });
 
@@ -1189,20 +1657,53 @@ async function spawnCodex(exitOnFailure = true): Promise<void> {
     onError: (message, error) => log.error(message, error),
   });
   codexBackend = backend;
-  backend.on(
-    "thread",
-    ({
-      model,
-      effort,
-    }: {
-      model: string;
-      effort: string;
-    }) => {
-      state.model = model;
-      state.effort = effort;
-      broadcastConfig();
-    },
-  );
+  let acceptBackendEvents = true;
+  const syncCodexState = ({
+    model,
+    effort,
+    cwd,
+  }: {
+    model: string;
+    effort: string;
+    cwd: string;
+  }): void => {
+    // Ignore late settings notifications from a generation being replaced.
+    if (!acceptBackendEvents || codexBackend !== backend) return;
+    state.model = model;
+    state.effort = effort;
+    state.cwd = cwd;
+    broadcastConfig();
+  };
+  backend.on("thread", syncCodexState);
+  backend.on("state", syncCodexState);
+  const suppressBackendEvents = (reason: string): void => {
+    if (codexBackend !== backend) return;
+    acceptBackendEvents = false;
+    // The backend can replace its own process after an unknown-outcome
+    // mutation timeout. Invalidate work already waiting in the wrapper queue;
+    // it was submitted against the old thread and must not cross into the
+    // context-free replacement.
+    codexSessionEpoch += 1;
+    cancelQuestionRelay(reason);
+    codexOutboundWriteGuard.clear(reason);
+    codexDeliveryTracker.clearTurns();
+    mcpClients.clear();
+  };
+  backend.on("closing", () => {
+    suppressBackendEvents("Codex app-server session closing");
+  });
+  backend.on("resetting", () => {
+    suppressBackendEvents("Codex app-server recovery reset");
+  });
+  backend.on("reset", () => {
+    if (codexBackend !== backend) return;
+    acceptBackendEvents = true;
+    syncCodexState({
+      model: backend.currentModel,
+      effort: backend.currentEffort,
+      cwd: backend.currentCwd,
+    });
+  });
   backend.on(
     "notification",
     ({
@@ -1212,6 +1713,7 @@ async function spawnCodex(exitOnFailure = true): Promise<void> {
       method: string;
       params: Record<string, unknown>;
     }) => {
+      if (!acceptBackendEvents || codexBackend !== backend) return;
       observeCodexNotification(method, params);
     },
   );
@@ -1221,6 +1723,12 @@ async function spawnCodex(exitOnFailure = true): Promise<void> {
       const wasCurrent = codexBackend === backend;
       if (wasCurrent) codexBackend = null;
       log.debug(`Codex app-server exited (code ${code ?? "null"})`);
+      if (wasCurrent) {
+        codexOutboundWriteGuard.clear("Codex app-server generation exited");
+        void platformMcpRelay?.stopGeneration().catch((error) => {
+          log.error("Failed to stop Codex MCP relay generation", error);
+        });
+      }
       if (expected || expectedExit) {
         expectedExit = false;
         return;
@@ -1253,8 +1761,23 @@ async function spawnCodex(exitOnFailure = true): Promise<void> {
     codexStartPromise = startPromise;
     await startPromise;
   } catch (error) {
+    const ownedRelayGeneration = codexBackend === backend;
+    const intentionallySuperseded = isCodexStartupSuperseded(
+      backend,
+      codexBackend,
+      acceptBackendEvents,
+    );
     if (codexBackend === backend) codexBackend = null;
     await backend.stop().catch(() => {});
+    if (ownedRelayGeneration) {
+      await platformMcpRelay?.stopGeneration().catch(() => {});
+    }
+    if (intentionallySuperseded) {
+      log.debug(
+        `Ignoring Codex startup rejection from a retiring runtime: ${String(error)}`,
+      );
+      return;
+    }
     log.error("Failed to start Codex app-server", error);
     const message =
       `\n  Codex app-server 시작에 실패했습니다.\n` +
@@ -1271,8 +1794,21 @@ async function spawnCodex(exitOnFailure = true): Promise<void> {
   }
 }
 
-function spawnClaude(): void {
+async function spawnClaude(): Promise<void> {
   registerMcpServers(state.cwd);
+  if (!platformMcpRelay) {
+    log.error(
+      "Claude MCP relay is unavailable",
+      new Error("relay not initialized"),
+    );
+    process.exit(1);
+  }
+  // Start a fresh relay generation immediately before PTY spawn. Claude sees
+  // only the MCP byte stream; the relay starts the real platform process and
+  // injects its credentials through a wrapper-owned inherited fd.
+  await platformMcpRelay.startGeneration(
+    getPlatformMcpRuntimePayloads("claude"),
+  );
   const args = buildArgs();
 
   const channels =
@@ -1286,11 +1822,11 @@ function spawnClaude(): void {
     cols: PTY_COLS,
     rows: PTY_ROWS,
     cwd: state.cwd,
-    env: {
-      ...process.env,
-      // Exposed so the PreToolUse hook can reach the wrapper's IPC socket.
-      COMPACT_BOT_WRAPPER_SOCKET: SOCKET_PATH,
-    } as Record<string, string>,
+    env: buildClaudePtyEnvironment(
+      process.env,
+      HOOK_SOCKET_PATH,
+      HOOK_IPC_AUTH_TOKEN,
+    ),
   };
 
   // Strategy 1: Spawn via user's shell (handles aliases, scripts, PATH)
@@ -1326,7 +1862,16 @@ function spawnClaude(): void {
     }
   }
 
-  claudeProcess.onData((data) => {
+  const spawnedClaude = claudeProcess;
+  const spawnedGeneration = ++claudeProcessGeneration;
+
+  spawnedClaude.onData((data) => {
+    if (
+      claudeProcess !== spawnedClaude ||
+      claudeProcessGeneration !== spawnedGeneration
+    ) {
+      return;
+    }
     // Feed raw data to virtual terminal for accurate screen capture
     vterm.write(data);
 
@@ -1334,7 +1879,7 @@ function spawnClaude(): void {
 
     // Auto-confirm development channels prompt
     if (clean.includes("local development") || clean.includes("Enter to confirm")) {
-      claudeProcess!.write("\r");
+      spawnedClaude.write("\r");
     }
 
     // AskUserQuestion is captured via a PreToolUse hook (see
@@ -1348,7 +1893,23 @@ function spawnClaude(): void {
     }
   });
 
-  claudeProcess.onExit(({ exitCode }) => {
+  spawnedClaude.onExit(({ exitCode }) => {
+    // node-pty creates a new session. Remove background descendants as well
+    // as the foreground CLI so an old model process cannot occupy the next
+    // generation's secretless MCP relay.
+    signalClaudeSession(spawnedClaude.pid, "SIGKILL");
+    if (
+      claudeProcess !== spawnedClaude ||
+      claudeProcessGeneration !== spawnedGeneration
+    ) {
+      log.debug(
+        `Ignoring stale Claude exit (generation ${spawnedGeneration})`,
+      );
+      return;
+    }
+    void platformMcpRelay?.stopGeneration().catch((error) => {
+      log.error("Failed to stop Claude MCP relay generation", error);
+    });
     log.debug(`Claude Code exited (code ${exitCode})`);
     claudeProcess = null;
 
@@ -1359,7 +1920,9 @@ function spawnClaude(): void {
         spawnGrace = false;
         setTimeout(() => {
           log.debug("Auto-respawning Claude Code...");
-          spawnClaude();
+          void spawnClaude().catch((error) => {
+            log.error("Claude Code respawn failed", error);
+          });
         }, 2000);
       }
       expectedExit = false;
@@ -1369,7 +1932,9 @@ function spawnClaude(): void {
     log.error("Claude Code exited unexpectedly", new Error(`exit ${exitCode}`));
     setTimeout(() => {
       log.debug("Auto-respawning Claude Code...");
-      spawnClaude();
+      void spawnClaude().catch((error) => {
+        log.error("Claude Code respawn failed", error);
+      });
     }, 2000);
   });
 }
@@ -1378,7 +1943,50 @@ function spawnAgent(): void {
   if (config.agentProvider === "codex") {
     void spawnCodex();
   } else {
-    spawnClaude();
+    void spawnClaude().catch((error) => {
+      log.error("Failed to start Claude Code", error);
+      process.exit(1);
+    });
+  }
+}
+
+function signalClaudeSession(
+  sessionPid: number,
+  signal: NodeJS.Signals,
+): void {
+  if (!Number.isSafeInteger(sessionPid) || sessionPid < 1) return;
+  if (process.platform !== "win32") {
+    try {
+      const rows = execFileSync("ps", ["-axo", "pid=,sid="], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2_000,
+      });
+      for (const row of rows.split("\n")) {
+        const match = row.trim().match(/^(\d+)\s+(\d+)$/);
+        if (!match || Number(match[2]) !== sessionPid) continue;
+        const pid = Number(match[1]);
+        if (pid === process.pid) continue;
+        try {
+          process.kill(pid, signal);
+        } catch {
+          // A process may exit between the snapshot and signal.
+        }
+      }
+      return;
+    } catch {
+      try {
+        process.kill(-sessionPid, signal);
+        return;
+      } catch {
+        // The session may already be empty.
+      }
+    }
+  }
+  try {
+    process.kill(sessionPid, signal);
+  } catch {
+    // The process may already have exited.
   }
 }
 
@@ -1389,21 +1997,28 @@ function killClaude(): Promise<void> {
       return;
     }
     expectedExit = true;
-    const onExit = claudeProcess.onExit(() => {
+    const processToKill = claudeProcess;
+    const sessionPid = processToKill.pid;
+    let settled = false;
+    let forceKill: NodeJS.Timeout | null = null;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (forceKill) clearTimeout(forceKill);
+      if (claudeProcess === processToKill) claudeProcess = null;
+      expectedExit = false;
+      resolve();
+    };
+    const onExit = processToKill.onExit(() => {
       onExit.dispose();
-      resolve();
+      signalClaudeSession(sessionPid, "SIGKILL");
+      finish();
     });
-    claudeProcess.kill();
+    signalClaudeSession(sessionPid, "SIGHUP");
     // Force kill after 5 seconds
-    setTimeout(() => {
-      if (claudeProcess) {
-        try {
-          process.kill(claudeProcess.pid, "SIGKILL");
-        } catch {
-          // already dead
-        }
-      }
-      resolve();
+    forceKill = setTimeout(() => {
+      signalClaudeSession(sessionPid, "SIGKILL");
+      finish();
     }, 5000);
   });
 }
@@ -1429,8 +2044,8 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   if (config.agentProvider === "codex") {
     cancelScheduledCodexRespawn();
     cancelQuestionRelay("Codex session restart");
+    codexOutboundWriteGuard.clear("Codex session restart");
     codexDeliveryTracker.clearTurns();
-    codexSessionChanging = true;
     const previousBackend = codexBackend;
     try {
       // Codex starts configured MCP servers per loaded thread. Merely creating
@@ -1458,8 +2073,6 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
         }
       }
       throw error;
-    } finally {
-      codexSessionChanging = false;
     }
     broadcastConfig();
     return;
@@ -1478,7 +2091,7 @@ async function restart(updates?: Partial<WrapperState>): Promise<void> {
   await new Promise((r) => setTimeout(r, 1000));
 
   spawnGrace = true;
-  spawnClaude();
+  await spawnClaude();
   // Clear grace period after process has had time to initialize
   setTimeout(() => { spawnGrace = false; }, 5000);
 }
@@ -1613,17 +2226,18 @@ async function executeMutableCommand(
         log.debug(`Raw Codex turn input: ${command.text.slice(0, 80)}`);
         if (!codexBackend) throw new Error("Codex backend가 준비되지 않았습니다");
         if (command.origin) {
-          rememberCodexOrigin(command.origin);
-          const submitted = await codexBackend.submitChannelMessage(
-            command.origin.source,
+          await submitCodexChannelMessage(
+            codexBackend,
+            command.origin,
             command.text,
             originMeta(command.origin),
           );
-          codexDeliveryTracker.setOriginForTurn(
-            submitted.turnId,
-            command.origin,
-          );
         } else {
+          if (codexBackend.currentTurnId) {
+            throw new Error(
+              "origin이 없는 입력은 활성 Codex turn에 전달할 수 없습니다",
+            );
+          }
           await codexBackend.submitText(command.text);
         }
       } else {
@@ -1636,16 +2250,83 @@ async function executeMutableCommand(
       if (config.agentProvider === "codex") {
         log.debug(`Goal via Codex app-server: ${args.slice(0, 80)}`);
         if (!codexBackend) throw new Error("Codex backend가 준비되지 않았습니다");
-        if (command.origin && args !== "clear") {
-          // Goal creation can schedule an automatic turn. Remember its
-          // destination without reassigning any turn already in progress.
-          codexDeliveryTracker.setCurrentOrigin(command.origin);
+        const previousGoalOrigin =
+          codexDeliveryTracker.snapshotGoalOrigin();
+        const previousTurnId = codexBackend.currentTurnId;
+        if (
+          args !== "clear" &&
+          previousTurnId &&
+          !canUseActiveCodexTurn(
+            codexDeliveryTracker.authorizationOriginForTurn(previousTurnId),
+            command.origin,
+          )
+        ) {
+          throw new Error(
+            "활성 Codex turn은 시작한 채널/스레드/사용자만 goal을 설정할 수 있습니다",
+          );
         }
-        await codexBackend.setGoal(
-          args,
-          command.origin?.source,
-          command.origin ? originMeta(command.origin) : undefined,
-        );
+        if (!canMutateCodexGoal(previousGoalOrigin, command.origin)) {
+          throw new Error(
+            "활성 Codex goal은 생성한 채널/스레드/사용자만 변경하거나 해제할 수 있습니다",
+          );
+        }
+        let goalAccepted = false;
+        codexGoalOwnershipPending = true;
+        const goalAmbiguityToken =
+          codexOutboundWriteGuard.beginAmbiguity();
+        try {
+          await codexBackend.setGoal(
+            args,
+            command.origin?.source,
+            command.origin ? originMeta(command.origin) : undefined,
+            () => {
+              goalAccepted = true;
+              if (command.origin && args !== "clear") {
+                // The response observer runs before later notification lines
+                // in the same stdout chunk, so a replacement goal only takes
+                // ownership after Codex has actually accepted it.
+                codexDeliveryTracker.setGoalOrigin(command.origin);
+                // Be version-tolerant if app-server emitted the first native
+                // goal turn before the goal/set response. The backend's active
+                // id is authoritative at this point.
+                if (
+                  codexBackend?.currentTurnId &&
+                  codexBackend.currentTurnId !== previousTurnId
+                ) {
+                  codexDeliveryTracker.setOriginForTurn(
+                    codexBackend.currentTurnId,
+                    command.origin,
+                  );
+                }
+              }
+              codexGoalOwnershipPending = false;
+              codexOutboundWriteGuard.endAmbiguity(goalAmbiguityToken);
+            },
+          );
+        } catch (error) {
+          if (command.origin && args !== "clear") {
+            if (!goalAccepted) {
+              // A rejected replacement must leave the previous goal owner
+              // intact; otherwise another conversation could capture A's
+              // continuing automatic turns.
+              if (codexBackend.hasActiveGoal) {
+                codexDeliveryTracker.restoreGoalOrigin(previousGoalOrigin);
+              } else {
+                codexDeliveryTracker.setGoalOrigin(null);
+              }
+            } else if (!codexBackend.hasActiveGoal) {
+              // Codex accepted the replacement but the startup barrier failed
+              // and the backend successfully rolled it back.
+              codexDeliveryTracker.setGoalOrigin(null);
+            }
+          }
+          codexGoalOwnershipPending = false;
+          codexOutboundWriteGuard.endAmbiguity(goalAmbiguityToken);
+          throw error;
+        }
+        if (args === "clear") codexDeliveryTracker.setGoalOrigin(null);
+        codexGoalOwnershipPending = false;
+        codexOutboundWriteGuard.endAmbiguity(goalAmbiguityToken);
       } else {
         log.debug(`Goal via PTY: /goal ${args.slice(0, 80)}`);
         writeToPtyAndEnter(`/goal ${args}`);
@@ -1669,15 +2350,25 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
           if (!codexBackend) {
             throw new Error("Codex backend가 준비되지 않았습니다");
           }
-          rememberCodexOrigin(origin);
-          const submitted = await codexBackend.submitChannelMessage(
-            msg.source,
+          if (!origin) {
+            if (codexBackend.currentTurnId) {
+              throw new Error(
+                "origin을 확인할 수 없는 메시지는 활성 Codex turn에 전달하지 않았습니다",
+              );
+            }
+            await codexBackend.submitChannelMessage(
+              msg.source,
+              msg.content,
+              msg.meta,
+            );
+            return;
+          }
+          await submitCodexChannelMessage(
+            codexBackend,
+            origin,
             msg.content,
             msg.meta,
           );
-          if (origin) {
-            codexDeliveryTracker.setOriginForTurn(submitted.turnId, origin);
-          }
         }).catch((error) => {
           log.error("Failed to deliver message to Codex", error);
           if (origin) {
@@ -1700,9 +2391,19 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
     case "esc":
     case "raw":
     case "goal":
+      if (config.agentProvider === "claude") {
+        rememberClaudeOrigin(msg.origin, sender);
+      }
       void (
         config.agentProvider === "codex"
-          ? enqueueCodexOperation(() => executeMutableCommand(msg))
+          ? (
+            isCodexRecoveryCommand(msg)
+              ? enqueueCodexControlOperation(
+                () => executeMutableCommand(msg),
+                isCodexSessionChangeCommand(msg),
+              )
+              : enqueueCodexOperation(() => executeMutableCommand(msg))
+          )
           : executeMutableCommand(msg)
       ).then(() => {
         completeMutableCommand(msg, true);
@@ -1715,9 +2416,13 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
       log.debug(
         `pre_ask_user_question received (${msg.tool_input?.questions?.length ?? 0} question(s))`,
       );
-      handlePreAskUserQuestion(msg.tool_input);
+      handlePreAskUserQuestion(msg.tool_input, msg.origin);
+      break;
+    case "channel_activity":
+      rememberClaudeOrigin(msg.origin, sender);
       break;
     case "effort": {
+      const origin = routedRequestOrigin(sender, msg.origin);
       void enqueueCodexOperation(async () => {
         try {
           if (config.agentProvider !== "codex") {
@@ -1729,32 +2434,35 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
           if (!codexBackend.currentThreadId || codexSessionChanging) {
             throw new Error("Codex thread가 전환 중입니다. 잠시 후 다시 시도해주세요");
           }
-          codexBackend.setEffort(msg.effort);
+          await codexBackend.setEffort(msg.effort);
           state.effort = codexBackend.currentEffort;
           log.debug(`Reasoning effort change: ${state.effort}`);
           broadcastConfig();
-          sender.send({
+          sendCorrelatedResult({
             type: "effort_result",
             request_id: msg.request_id,
             ok: true,
             effort: state.effort,
             availableEfforts: codexBackend.availableEfforts,
-          } satisfies WrapperToMcp);
+            ...(origin ? { origin } : {}),
+          } satisfies WrapperToMcp, sender);
         } catch (error) {
           log.error("Reasoning effort change failed", error);
-          sender.send({
+          sendCorrelatedResult({
             type: "effort_result",
             request_id: msg.request_id,
             ok: false,
             effort: state.effort,
             availableEfforts: codexBackend?.availableEfforts ?? [],
             error: error instanceof Error ? error.message : String(error),
-          } satisfies WrapperToMcp);
+            ...(origin ? { origin } : {}),
+          } satisfies WrapperToMcp, sender);
         }
       });
       break;
     }
     case "capture": {
+      const origin = routedRequestOrigin(sender, msg.origin);
       const capture = async (): Promise<void> => {
         let screen: string;
         if (config.agentProvider === "codex") {
@@ -1766,24 +2474,28 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
           screen = await captureScreen(msg.all === true);
         }
         log.debug(`Screen capture requested (all=${msg.all === true}, ${screen.length} chars)`);
-        sender.send({
+        sendCorrelatedResult({
           type: "capture_result",
           text: screen,
           ...(msg.request_id ? { request_id: msg.request_id } : {}),
-        } satisfies WrapperToMcp);
+          ...(origin ? { origin } : {}),
+          all: msg.all === true,
+        } satisfies WrapperToMcp, sender);
       };
       const operation = config.agentProvider === "codex"
         ? enqueueCodexOperation(capture)
         : capture();
       void operation.catch((error) => {
         log.error("Capture failed", error);
-        sender.send({
+        sendCorrelatedResult({
           type: "capture_result",
           text: `capture failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
           ...(msg.request_id ? { request_id: msg.request_id } : {}),
-        } satisfies WrapperToMcp);
+          ...(origin ? { origin } : {}),
+          all: msg.all === true,
+        } satisfies WrapperToMcp, sender);
       });
       break;
     }
@@ -1803,30 +2515,121 @@ function handleIpcMessage(msg: PeerToWrapper, sender: JsonLineSocket): void {
         cwd: state.cwd,
       } satisfies WrapperToMcp);
       flushRoutedOutput(sender, source);
+      resumeCodexInputRequest(sender);
+      presentNextQuestion();
+      break;
+    }
+    case "not_ready": {
+      if (mcpClients.get(sender) !== msg.source) {
+        log.debug(
+          `Ignoring mismatched not_ready from MCP peer (${msg.source})`,
+        );
+        break;
+      }
+      log.debug(`MCP realtime disconnected (${msg.source})`);
+      handleRealtimePeerUnavailable(
+        sender,
+        `${msg.source} realtime connection lost`,
+      );
       break;
     }
     case "input_response":
-      handleInputResponse(msg.request_id, msg.answer, msg.origin);
+      handleInputResponse(msg.request_id, msg.answer, sender, msg.origin);
       break;
     case "input_request_failed":
-      handleInputRequestFailed(msg.request_id, msg.reason);
+      handleInputRequestFailed(msg.request_id, msg.reason, sender);
       break;
+    case "authorize_outbound": {
+      const call: CodexOutboundCall = {
+        source: msg.source,
+        server: msg.server,
+        tool: msg.tool,
+        arguments: msg.arguments,
+      };
+      const decision =
+        config.agentProvider === "codex"
+          ? codexOutboundWriteGuard.authorize(call)
+          : Promise.resolve({
+            ok: false,
+            error: "outbound authorization is only available in Codex mode",
+          });
+      void decision.then((result) => {
+        // Reply to the requesting socket itself. An MCP child that serves
+        // tools but lost the realtime instance lock never announces `ready`
+        // and therefore is intentionally absent from mcpClients.
+        try {
+          sender.send({
+            type: "outbound_authorization_result",
+            request_id: msg.request_id,
+            ...result,
+          });
+        } catch (error) {
+          log.debug(
+            `Could not return outbound authorization ${msg.request_id}: ${String(error)}`,
+          );
+        }
+      });
+      break;
+    }
   }
 }
 
 // ── IPC server ────────────────────────────────────────────────────────
 
-createIpcServer(SOCKET_PATH, (client) => {
-  client.on("message", (msg: PeerToWrapper) => handleIpcMessage(msg, client));
-  client.on("close", () => {
-    mcpClients.delete(client);
-  });
-  client.on("error", () => {
-    mcpClients.delete(client);
-  });
-});
+await createIpcServer(
+  SOCKET_PATH,
+  (client) => {
+    client.on("message", (msg: PeerToWrapper) =>
+      handleIpcMessage(msg, client)
+    );
+    client.on("close", () => {
+      handleRealtimePeerUnavailable(client, "MCP peer disconnected");
+    });
+    client.on("error", () => {
+      handleRealtimePeerUnavailable(client, "MCP peer errored");
+    });
+  },
+  { authToken: PLATFORM_IPC_AUTH_TOKEN },
+);
+
+await createIpcServer(
+  HOOK_SOCKET_PATH,
+  (client) => {
+    client.on("message", (message: PeerToWrapper) => {
+      if (message.type !== "pre_ask_user_question") {
+        log.error(
+          "Rejected a non-hook command on the Claude hook IPC socket",
+          new Error(`unexpected IPC message: ${message.type}`),
+        );
+        client.destroy();
+        return;
+      }
+      handleIpcMessage(message, client);
+    });
+    // A one-shot hook may close while the kernel is flushing its line. Never
+    // let an ordinary peer reset surface as an unhandled EventEmitter error.
+    client.on("error", (error) => {
+      log.debug(`Claude hook IPC peer error: ${String(error)}`);
+    });
+  },
+  { authToken: HOOK_IPC_AUTH_TOKEN },
+);
 
 // ── main ──────────────────────────────────────────────────────────────
+
+platformMcpRelay = await ClaudeMcpRelayServer.create(
+  PLATFORM_MCP_RELAY_SOCKET_PATH,
+  {
+    nodeExecutable: process.execPath,
+    entrypoints: {
+      discord: join(DIST_DIR, "mcp-server.js"),
+      slack: join(DIST_DIR, "slack-mcp-server.js"),
+    },
+    baseEnvironment: process.env,
+    onDebug: (message) => log.debug(message),
+    onError: (message, error) => log.error(message, error),
+  },
+);
 
 spawnAgent();
 
@@ -1836,14 +2639,20 @@ async function cleanup(): Promise<void> {
   expectedExit = true;
   cancelScheduledCodexRespawn();
   if (claudeProcess) {
-    claudeProcess.kill();
+    await killClaude();
   }
   if (codexBackend) {
-    await codexBackend.stop().catch(() => {});
+    await codexBackend.closeSession().catch(() => {});
   }
+  await platformMcpRelay?.close().catch(() => {});
   if (config.agentProvider === "claude") unregisterAllMcpServers();
   try {
     unlinkSync(SOCKET_PATH);
+  } catch {
+    // ignore
+  }
+  try {
+    unlinkSync(HOOK_SOCKET_PATH);
   } catch {
     // ignore
   }

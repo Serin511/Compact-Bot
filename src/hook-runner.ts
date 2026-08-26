@@ -26,14 +26,19 @@
  */
 
 import { createConnection } from "node:net";
+import { findClaudeHookOrigin } from "./claude-transcript-origin.js";
+import { IPC_AUTH_FIELD, type IpcOrigin } from "./ipc.js";
 
 const SOCKET_PATH = process.env.COMPACT_BOT_WRAPPER_SOCKET || "";
+const IPC_AUTH_TOKEN = process.env.COMPACT_BOT_HOOK_IPC_AUTH_TOKEN || "";
 /** Hard upper bound on how long we'll wait for the IPC handoff to complete. */
 const FORWARD_TIMEOUT_MS = 2000;
 
 type HookEvent = {
+  transcript_path?: string;
   tool_name?: string;
   tool_input?: unknown;
+  tool_use_id?: string;
 };
 
 async function readStdinAsJson(): Promise<HookEvent | null> {
@@ -58,7 +63,10 @@ async function readStdinAsJson(): Promise<HookEvent | null> {
   });
 }
 
-function forwardToWrapper(toolInput: unknown): Promise<void> {
+function forwardToWrapper(
+  toolInput: unknown,
+  origin: IpcOrigin | null,
+): Promise<void> {
   return new Promise((resolve) => {
     if (!SOCKET_PATH) {
       resolve();
@@ -83,7 +91,12 @@ function forwardToWrapper(toolInput: unknown): Promise<void> {
 
     sock.on("connect", () => {
       const payload =
-        JSON.stringify({ type: "pre_ask_user_question", tool_input: toolInput }) + "\n";
+        JSON.stringify({
+          type: "pre_ask_user_question",
+          tool_input: toolInput,
+          ...(origin ? { origin } : {}),
+          ...(IPC_AUTH_TOKEN ? { [IPC_AUTH_FIELD]: IPC_AUTH_TOKEN } : {}),
+        }) + "\n";
       sock.write(payload, () => {
         // Give the kernel a moment to flush before we close — some socket
         // implementations drop unflushed bytes when the writer ends abruptly.
@@ -118,7 +131,11 @@ async function main(): Promise<void> {
   }
 
   if (event && event.tool_name === "AskUserQuestion" && event.tool_input) {
-    await forwardToWrapper(event.tool_input);
+    const origin = findClaudeHookOrigin(
+      event.transcript_path,
+      event.tool_use_id,
+    );
+    await forwardToWrapper(event.tool_input, origin);
   }
   // Empty object = no decision, default behaviour (allow). We never block.
   process.stdout.write("{}");
